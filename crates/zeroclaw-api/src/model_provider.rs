@@ -1518,6 +1518,48 @@ mod thinking_display_tests {
     use super::{NativeThinkingParams, ThinkingDisplay};
 
     #[test]
+    fn tokens_round_trip_ignoring_case() {
+        for display in [
+            ThinkingDisplay::Omitted,
+            ThinkingDisplay::Summarized,
+            ThinkingDisplay::Updates,
+        ] {
+            assert_eq!(
+                ThinkingDisplay::from_str_insensitive(display.as_str()),
+                Some(display)
+            );
+            assert_eq!(
+                ThinkingDisplay::from_str_insensitive(&format!(
+                    " {} ",
+                    display.as_str().to_uppercase()
+                )),
+                Some(display)
+            );
+        }
+        assert_eq!(ThinkingDisplay::from_str_insensitive("verbose"), None);
+        assert_eq!(ThinkingDisplay::from_str_insensitive(""), None);
+    }
+
+    #[test]
+    fn omitted_is_the_api_default_and_needs_no_wire_value() {
+        assert_eq!(ThinkingDisplay::Omitted.wire_value(), None);
+        assert_eq!(ThinkingDisplay::Summarized.wire_value(), Some("summarized"));
+        assert_eq!(ThinkingDisplay::Updates.wire_value(), Some("updates"));
+    }
+
+    #[test]
+    fn serializes_as_the_lowercase_token() {
+        assert_eq!(
+            serde_json::to_string(&ThinkingDisplay::Summarized).unwrap(),
+            "\"summarized\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ThinkingDisplay>("\"updates\"").unwrap(),
+            ThinkingDisplay::Updates
+        );
+    }
+
+    #[test]
     fn as_str_maps_updates_variant() {
         assert_eq!(ThinkingDisplay::Updates.as_str(), "updates");
     }

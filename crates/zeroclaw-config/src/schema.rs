@@ -33452,6 +33452,50 @@ reasoning_enabled = false
     }
 
     #[test]
+    async fn anthropic_thinking_display_round_trips_through_toml() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+thinking_display = "summarized"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config
+            .providers
+            .models
+            .anthropic
+            .get("fable")
+            .expect("alias should exist");
+        assert_eq!(
+            entry.thinking_display,
+            Some(AnthropicThinkingDisplay::Summarized)
+        );
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(rendered.contains("thinking_display = \"summarized\""));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_is_absent_when_unset() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config.providers.models.anthropic.get("fable").unwrap();
+        assert_eq!(entry.thinking_display, None);
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(!rendered.contains("thinking_display"));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_rejects_an_unknown_value() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+thinking_display = "verbose"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
     async fn runtime_reasoning_effort_deserializes() {
         let raw = r#"
 default_temperature = 0.7
@@ -33790,6 +33834,105 @@ runtime_profile = "long_turn"
             50
         );
     }
+    #[test]
+    async fn default_history_trim_low_water_is_seven_tenths() {
+        let raw = r#"
+[runtime_profiles.plain]
+
+[agents.default]
+runtime_profile = "plain"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.7);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.7);
+    }
+
+    #[test]
+    async fn runtime_profile_history_trim_low_water_is_honored() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.9
+
+[agents.default]
+runtime_profile = "mem_saver"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.9);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.9);
+    }
+
+    #[test]
+    async fn validate_accepts_history_trim_low_water_of_one() {
+        let raw = r#"
+[runtime_profiles.no_hysteresis]
+history_trim_low_water = 1.0
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed
+                .runtime_profiles
+                .get("no_hysteresis")
+                .and_then(|p| p.history_trim_low_water),
+            Some(1.0)
+        );
+        parsed
+            .validate()
+            .expect("history_trim_low_water = 1.0 must be accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_zero_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water = 0.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_history_trim_low_water_above_one() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 1.5
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water above 1.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_non_finite_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = nan
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("non-finite history_trim_low_water must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
     #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {
         let cfg = PacingConfig::default();

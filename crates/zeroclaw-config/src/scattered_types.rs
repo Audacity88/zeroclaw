@@ -969,6 +969,56 @@ mod tests {
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
     }
 
+    #[test]
+    fn thinking_level_effort_leaves_the_default_level_unset() {
+        assert_eq!(
+            ThinkingLevel::Off.native_effort(),
+            Some(ThinkingEffort::Low)
+        );
+        assert_eq!(
+            ThinkingLevel::Minimal.native_effort(),
+            Some(ThinkingEffort::Low)
+        );
+        assert_eq!(
+            ThinkingLevel::Low.native_effort(),
+            Some(ThinkingEffort::Low)
+        );
+        assert_eq!(ThinkingLevel::Medium.native_effort(), None);
+        assert_eq!(
+            ThinkingLevel::High.native_effort(),
+            Some(ThinkingEffort::High)
+        );
+        assert_eq!(
+            ThinkingLevel::XHigh.native_effort(),
+            Some(ThinkingEffort::XHigh)
+        );
+        assert_eq!(
+            ThinkingLevel::Max.native_effort(),
+            Some(ThinkingEffort::Max)
+        );
+    }
+
+    #[test]
+    fn xhigh_is_a_depth_only_level() {
+        for spelling in ["xhigh", "XHigh", "x-high", "extra"] {
+            assert_eq!(
+                ThinkingLevel::from_str_insensitive(spelling),
+                Some(ThinkingLevel::XHigh),
+                "{spelling}"
+            );
+        }
+        assert_eq!(ThinkingLevel::XHigh.as_str(), "xhigh");
+        assert_eq!(
+            ThinkingLevel::XHigh.default_budget_tokens(),
+            None,
+            "the budget generations have no budget for it"
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingLevel::XHigh).unwrap(),
+            "\"xhigh\""
+        );
+    }
+
     // The runtime context compressor was removed; nothing reads
     // `context_compression` at runtime anymore, so the default must be
     // `false` (a `true` default would mislead users into thinking the

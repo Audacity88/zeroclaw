@@ -2372,6 +2372,172 @@ mod tests {
         assert_eq!(max_tokens, 10_001);
     }
 
+    /// Two finished tool rounds, each with a signed reasoning block, plus the
+    /// round still in flight. Shared by the replay-policy tests.
+    fn thinking_replay_messages() -> Vec<ChatMessage> {
+        let envelope = |thinking: &str, signature: &str, call_id: &str| {
+            serde_json::json!({
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "name": "shell",
+                    "arguments": "{}",
+                }],
+                "reasoning_content": serde_json::json!({
+                    "text": thinking,
+                    "signature": signature,
+                })
+                .to_string(),
+            })
+            .to_string()
+        };
+        vec![
+            ChatMessage::user("first ask"),
+            ChatMessage::assistant(envelope("earlier", "sig_old", "call_1")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+            ChatMessage::assistant("finished the first ask"),
+            ChatMessage::user("second ask"),
+            ChatMessage::assistant(envelope("current", "sig_new", "call_2")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
+                    .to_string(),
+            },
+        ]
+    }
+
+    fn replayed_signatures(msgs: &[ConverseMessage]) -> Vec<String> {
+        msgs.iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|block| match block {
+                ContentBlock::ReasoningContent(wrapper) => {
+                    wrapper.reasoning_content.reasoning_text.signature.clone()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thinking_replays_every_turn_on_models_that_keep_it() {
+        let messages = thinking_replay_messages();
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-opus-4-5");
+        assert_eq!(
+            replayed_signatures(&msgs),
+            vec!["sig_old", "sig_new"],
+            "a model that keeps prior turns' thinking replays every signed block"
+        );
+        for (position, msg) in msgs.iter().enumerate() {
+            if msg.role == "assistant" {
+                let has_reasoning = msg
+                    .content
+                    .first()
+                    .is_some_and(|block| matches!(block, ContentBlock::ReasoningContent(_)));
+                let carries_any_reasoning = msg
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ReasoningContent(_)));
+                if carries_any_reasoning {
+                    assert!(
+                        has_reasoning,
+                        "an assistant turn carrying reasoning must start with it (turn {position})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_replays_only_the_in_flight_round_on_models_that_strip_old_thinking() {
+        let messages = thinking_replay_messages();
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-haiku-4-5");
+        assert_eq!(
+            replayed_signatures(&msgs),
+            vec!["sig_new"],
+            "only the in-flight round replays its reasoning"
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_keeps_supported_depths_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: None,
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_fits_xhigh_to_high_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::XHigh),
+            display: None,
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-sonnet-4-6-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("high")
+        );
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-8-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_ignores_the_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "anthropic.claude-fable-5-1");
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            })),
+            "this adapter has no display field to carry the choice"
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_sends_nothing_without_a_chosen_depth() {
+        let provider = BedrockModelProvider::builder("test").build();
+        let (temperature, fields, _) =
+            provider.resolve_thinking(None, Some(0.5_f64), "anthropic.claude-fable-5-1");
+        assert!(temperature.is_none());
+        assert!(fields.is_none());
+    }
+
     #[test]
     fn prompt_caching_supported_for_claude_and_nova() {
         for model in [

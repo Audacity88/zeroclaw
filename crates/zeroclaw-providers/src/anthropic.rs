@@ -4861,6 +4861,342 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn resolve_thinking_sends_adaptive_shape_with_effort() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .max_tokens(32_000)
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: Some(ThinkingEffort::High),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen depth should carry the thinking object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(
+            thinking.budget_tokens, None,
+            "the budget must not reach this generation"
+        );
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high")
+        );
+        assert!(tuning.temperature.is_none());
+        assert_eq!(tuning.max_tokens, 32_000);
+    }
+
+    #[test]
+    fn thinking_display_is_sent_even_without_a_chosen_depth() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .expect("asking to see the reasoning must send the object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert!(
+            tuning.output_config.is_none(),
+            "visibility is not a depth setting"
+        );
+    }
+
+    #[test]
+    fn thinking_display_omitted_sends_no_display_value() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        assert!(
+            tuning.thinking.is_none(),
+            "the API default needs no request field"
+        );
+    }
+
+    #[test]
+    fn request_display_beats_the_alias_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        // The alias asks for the API default, which sends nothing; the
+        // request asks for a summary and gets it.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Summarized),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen display sends the object");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn request_omitted_display_silences_the_alias_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Omitted),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        assert!(
+            tuning.thinking.is_none(),
+            "the request chose the API default, so the alias summary must not leak in"
+        );
+        assert_eq!(tuning.display, None);
+    }
+
+    #[test]
+    fn alias_display_applies_when_the_request_names_none() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen depth sends the object");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn resolve_thinking_drops_the_display_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("the chosen depth still sends the object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(
+            thinking.display, None,
+            "this generation takes no display, whichever side asked"
+        );
+        assert_eq!(tuning.display, None);
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn progress_notes_are_sent_as_summaries_until_a_model_takes_them() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        for model in ["claude-opus-4-7", "claude-fable-5-1"] {
+            let tuning = provider.resolve_thinking(Some(params), None, model);
+            assert_eq!(
+                tuning
+                    .thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.display),
+                Some(ThinkingDisplay::Summarized),
+                "{model} gets a summary in place of progress notes"
+            );
+            assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+        }
+
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        assert!(
+            tuning.thinking.is_none(),
+            "a generation that takes no display sends nothing"
+        );
+        assert_eq!(tuning.display, None);
+    }
+
+    #[test]
+    fn resolve_thinking_sends_nothing_without_a_chosen_depth() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        assert!(tuning.thinking.is_none());
+        assert!(tuning.output_config.is_none());
+        assert!(tuning.temperature.is_none());
+    }
+
+    #[test]
+    fn resolve_thinking_maps_every_depth_to_its_wire_value() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        for (effort, expected) in [
+            (ThinkingEffort::Low, "low"),
+            (ThinkingEffort::High, "high"),
+            (ThinkingEffort::XHigh, "xhigh"),
+            (ThinkingEffort::Max, "max"),
+        ] {
+            let params = NativeThinkingParams {
+                budget_tokens: None,
+                effort: Some(effort),
+                display: None,
+            };
+            let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-5");
+            assert_eq!(
+                tuning.output_config.as_ref().map(|output| output.effort),
+                Some(expected),
+                "wire value for {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_thinking_fits_xhigh_to_high_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::XHigh),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high"),
+            "the depth just below stands in for one the generation lacks"
+        );
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_ignores_depth_on_older_generations() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), Some(0.3_f64), "claude-haiku-4-5");
+        assert!(tuning.thinking.is_none());
+        assert!(
+            tuning.output_config.is_none(),
+            "older generations have no depth setting"
+        );
+        assert!(
+            (tuning.temperature.unwrap() - 0.3_f64).abs() < f64::EPSILON,
+            "older generations still accept sampling parameters"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_serializes_adaptive_thinking_and_effort() {
+        let req = NativeChatRequest {
+            model: "claude-fable-5-1".to_string(),
+            max_tokens: 32_000,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: Some(true),
+            thinking: Some(NativeThinkingConfig {
+                kind: "adaptive",
+                budget_tokens: None,
+                display: Some(ThinkingDisplay::Summarized),
+            }),
+            output_config: Some(OutputConfig { effort: "max" }),
+            fallbacks: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"adaptive","display":"summarized"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""output_config":{"effort":"max"}"#),
+            "{json}"
+        );
+        assert!(!json.contains("budget_tokens"), "{json}");
+        assert!(!json.contains("temperature"), "{json}");
+    }
+
+    #[test]
+    fn native_chat_request_serializes_the_budget_shape_unchanged() {
+        let req = NativeChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 11_000,
+            system: None,
+            messages: vec![],
+            temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(10_000),
+                display: None,
+            }),
+            output_config: None,
+            fallbacks: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"enabled","budget_tokens":10000}"#),
+            "{json}"
+        );
+        assert!(!json.contains("output_config"), "{json}");
+        assert!(!json.contains("display"), "{json}");
+    }
+
+    #[test]
     fn native_chat_request_serializes_without_temperature_when_none() {
         let req = NativeChatRequest {
             model: "claude-opus-4-7".to_string(),
@@ -4998,7 +5334,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     /// D2 + D5 mock pin: with the 1h lifetime configured, every marker the
     /// native provider places in one request (system block, last tool,
-    /// rolling last message) carries `"ttl":"1h"`; with the default, the
+    /// prior turn, rolling last message) carries `"ttl":"1h"`; with the default, the
     /// body contains no `ttl` key at all.
     #[tokio::test]
     async fn native_cache_ttl_marks_every_marker_per_request() {
@@ -5078,8 +5414,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         collect_cache_controls(&one_hour, &mut controls);
         assert_eq!(
             controls.len(),
-            3,
-            "system + tools + rolling last message markers expected: {one_hour}"
+            4,
+            "system + tools + prior-turn + rolling last message markers expected: {one_hour}"
         );
         for control in &controls {
             assert_eq!(
@@ -5099,7 +5435,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         let mut controls = Vec::new();
         collect_cache_controls(&default, &mut controls);
-        assert_eq!(controls.len(), 3, "marker placement unchanged by the field");
+        assert_eq!(controls.len(), 4, "marker placement unchanged by the field");
         for control in &controls {
             assert_eq!(
                 serde_json::to_string(control).unwrap(),
@@ -5562,6 +5898,567 @@ data: {\"type\":\"message_stop\"}\n\n";
             breakpoints, 1,
             "exactly one rolling breakpoint per request, got {breakpoints}"
         );
+    }
+
+    /// Native text message with one unmarked text block.
+    fn native_text_message(role: &str, text: &str) -> NativeMessage {
+        NativeMessage {
+            role: role.to_string(),
+            content: vec![NativeContentOut::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// Native assistant message whose trailing block is a tool call, the
+    /// shape `parse_assistant_tool_call_message` always produces (text
+    /// precedes the calls).
+    fn native_tool_call_carrier() -> NativeMessage {
+        NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![NativeContentOut::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// Native user message carrying one tool result, the wire shape of
+    /// `tool_result_message`.
+    fn native_tool_result_carrier() -> NativeMessage {
+        NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: ToolResultContent::Text("result".to_string()),
+                cache_control: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_lands_on_previous_assistant_text() {
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(1),
+            "the message before the last user message is the previous turn's last message"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_is_none_without_a_previous_turn() {
+        let single_exchange = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&single_exchange),
+            None,
+            "the only user message opens the turn, so nothing sits before it"
+        );
+        let single_message = vec![native_text_message("user", "q1")];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&single_message),
+            None
+        );
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&[]),
+            None,
+            "empty history has no placement"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_lands_on_tool_result() {
+        // The previous turn was cut short after its tool result.
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_tool_call_carrier(),
+            native_tool_result_carrier(),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(2),
+            "a trailing tool_result block is cacheable, the same gate the rolling marker uses"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_walks_back_over_tool_call_carrier() {
+        // Mid-loop: the last user-role message is the tool-result carrier, so
+        // the first candidate is the tool-call carrier; the rule steps back
+        // onto the turn's opening user message.
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+            native_tool_call_carrier(),
+            native_tool_result_carrier(),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_gives_up_after_two_walk_back_steps() {
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_tool_call_carrier(),
+            native_tool_call_carrier(),
+            native_tool_call_carrier(),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            None,
+            "candidates three, two, and one are all carriers; the search stops after two \
+             walk-back steps instead of landing further back"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_skips_trailing_image() {
+        let image_only = NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![NativeContentOut::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+            }],
+        };
+        let messages = vec![
+            native_text_message("user", "q1"),
+            image_only,
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            None,
+            "a message ending on an image block is breakpoint-transparent; walking back \
+             reaches index zero, which is out of bounds"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_places_marker_for_plain_keys() {
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            false,
+            true,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_skips_oauth_tool_requests() {
+        // OAuth prefix (1) + system text (1) + last tool definition (1) +
+        // rolling marker (1) = 4: the cap is already spent, so the marker
+        // must be skipped rather than 400 the request.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            true,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_allows_oauth_without_tools() {
+        // OAuth prefix (1) + system text (1) + rolling marker (1) = 3: one
+        // slot left, so the marker lands.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            false,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_without_rolling_marker() {
+        // No rolling pass has run: OAuth prefix (1) + system text (1) +
+        // tools (1) = 3, leaving one slot for the prior-turn marker.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+            native_tool_call_carrier(),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            true,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_budget_with_rolling_fallback_preserves_cap_and_ttl() {
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            // Exercise both a same-message backward scan and a fallback to
+            // an earlier message, distinct from the prior-turn anchor.
+            for earlier_message in [false, true] {
+                for has_tools in [false, true] {
+                    let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                        block_type: "text".to_string(),
+                        text: "be brief".to_string(),
+                        cache_control: Some(CacheControl::ephemeral_with_ttl(ttl)),
+                    }]));
+                    let mut messages = vec![
+                        native_text_message("user", "q1"),
+                        native_text_message("assistant", "a1"),
+                        native_text_message("user", "q2"),
+                    ];
+                    if earlier_message {
+                        messages.push(native_tool_call_carrier());
+                    } else {
+                        messages[2]
+                            .content
+                            .extend(native_tool_call_carrier().content);
+                    }
+                    assert_eq!(
+                        AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+                        Some(1)
+                    );
+                    AnthropicModelProvider::apply_cache_to_last_message(&mut messages, ttl);
+                    AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+                        system.as_ref(),
+                        true,
+                        has_tools,
+                        &mut messages,
+                        ttl,
+                    );
+                    let wire = serde_json::json!({
+                        "system": AnthropicModelProvider::apply_oauth_system_prompt(system, ttl),
+                        "tools": if has_tools { vec![NativeToolSpec {
+                            name: "get_weather".to_string(),
+                            description: "Get weather".to_string(),
+                            input_schema: std::sync::Arc::new(serde_json::json!({"type": "object"})),
+                            cache_control: Some(CacheControl::ephemeral_with_ttl(ttl)),
+                        }] } else { vec![] },
+                        "messages": messages,
+                    });
+                    let mut controls = Vec::new();
+                    collect_cache_controls(&wire, &mut controls);
+                    assert_eq!(controls.len(), 4, "{wire}");
+                    let expected =
+                        serde_json::to_value(CacheControl::ephemeral_with_ttl(ttl)).unwrap();
+                    assert!(
+                        controls.iter().all(|control| control == &expected),
+                        "{wire}"
+                    );
+                    assert_eq!(
+                        wire["messages"][1]["content"][0]
+                            .get("cache_control")
+                            .is_some(),
+                        !has_tools,
+                        "a distinct prior anchor needs a free slot: {wire}"
+                    );
+                    assert_eq!(wire["messages"][2]["content"][0]["cache_control"], expected);
+                    let last = wire["messages"].as_array().unwrap().last().unwrap();
+                    assert!(
+                        last["content"]
+                            .as_array()
+                            .unwrap()
+                            .last()
+                            .unwrap()
+                            .get("cache_control")
+                            .is_none(),
+                        "{wire}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prior_turn_budget_colocated_with_rolling_fallback_uses_one_slot() {
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "be brief".to_string(),
+                cache_control: Some(CacheControl::ephemeral_with_ttl(ttl)),
+            }]));
+            let mut messages = vec![
+                native_text_message("user", "q1"),
+                native_text_message("assistant", "a1"),
+                NativeMessage {
+                    role: "user".to_string(),
+                    content: vec![NativeContentOut::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: CANONICAL_PNG_B64.to_string(),
+                        },
+                    }],
+                },
+            ];
+            AnthropicModelProvider::apply_cache_to_last_message(&mut messages, ttl);
+            let before = serde_json::to_value(&messages).unwrap();
+            AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+                system.as_ref(),
+                true,
+                true,
+                &mut messages,
+                ttl,
+            );
+            let after = serde_json::to_value(&messages).unwrap();
+            assert_eq!(
+                before, after,
+                "co-location must preserve the existing marker"
+            );
+            let mut controls = Vec::new();
+            collect_cache_controls(&after, &mut controls);
+            assert_eq!(
+                controls,
+                vec![serde_json::to_value(CacheControl::ephemeral_with_ttl(ttl)).unwrap()]
+            );
+            assert_eq!(
+                AnthropicModelProvider::marked_system_block_count(system.as_ref())
+                    + 1
+                    + 1
+                    + controls.len(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn prior_turn_selector_does_not_adopt_rolling_block_scan() {
+        let mut carrier = native_text_message("assistant", "incidental text");
+        carrier.content.extend(native_tool_call_carrier().content);
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "stable anchor"),
+            carrier,
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(1),
+            "the prior-turn selector must skip a text-plus-tool-use carrier"
+        );
+    }
+
+    #[test]
+    fn marked_system_block_count_reads_block_markers() {
+        assert_eq!(AnthropicModelProvider::marked_system_block_count(None), 0);
+        assert_eq!(
+            AnthropicModelProvider::marked_system_block_count(Some(&SystemPrompt::String(
+                "be brief".to_string()
+            ))),
+            0
+        );
+        let marked = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        assert_eq!(
+            AnthropicModelProvider::marked_system_block_count(marked.as_ref()),
+            1
+        );
+    }
+
+    /// OAuth setup token, tools, and multi-turn history: the request already
+    /// spends all four breakpoint slots (identity prefix, system text, last
+    /// tool definition, rolling marker), so the prior-turn marker must be
+    /// skipped rather than exceed the API's four-block cap and 400 every
+    /// request.
+    #[tokio::test]
+    async fn oauth_tool_request_stays_inside_four_breakpoint_cap() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-opus-4-6",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 100, "output_tokens": 20}
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Setup-token shape: routes through the OAuth system prefix.
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-oat01-test"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
+
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("gen a 2 sum in golang"),
+            ChatMessage::assistant("here is the code"),
+            ChatMessage::user("what's meaning of make here?"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "claude-opus-4-6", None)
+            .await;
+        assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+
+        // Total markers: OAuth prefix + system text + last tool + rolling.
+        // The prior-turn slot is the one the budget skips.
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            4,
+            "OAuth tool request must carry exactly the four committed breakpoints: {body}"
+        );
+
+        // The system field carries both the identity prefix and the system
+        // text markers.
+        let system_blocks = body["system"].as_array().expect("system blocks");
+        assert_eq!(system_blocks.len(), 2, "OAuth prefix must be present");
+        assert!(
+            system_blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are Claude Code"),
+            "identity prefix must stay first"
+        );
+        assert_eq!(
+            system_blocks[0]["cache_control"]["type"], "ephemeral",
+            "prefix block keeps its marker"
+        );
+        assert_eq!(
+            system_blocks[1]["cache_control"]["type"], "ephemeral",
+            "system text block keeps its marker"
+        );
+
+        // The middle assistant message (the previous turn's last message)
+        // carries no marker: the budget skipped the prior-turn placement.
+        let wire_messages = body["messages"].as_array().unwrap();
+        let assistant_message = &wire_messages[1];
+        assert_eq!(assistant_message["role"], "assistant");
+        assert!(
+            !assistant_message.to_string().contains("cache_control"),
+            "prior-turn marker must be skipped on the OAuth tool path: {assistant_message}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]
@@ -6166,6 +7063,173 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         assert!(result.is_semantically_empty_terminal());
         assert!(result.reasoning_content.is_some());
+    }
+
+    #[test]
+    fn native_response_drops_thinking_blocks_with_nothing_to_replay() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": ""},
+                {"type": "text", "text": "hello"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        assert!(result.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn thinking_replays_only_the_in_flight_round_on_models_that_strip_old_thinking() {
+        let messages = thinking_replay_messages();
+        let (_, native) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-haiku-4-5",
+        );
+        let wire = serde_json::to_value(&native).unwrap();
+        let signatures: Vec<&str> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block.get("signature").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            signatures,
+            vec!["sig_new"],
+            "only the in-flight round replays its reasoning: {wire:#}"
+        );
+        let assistant_turns: Vec<&serde_json::Value> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|msg| msg["role"] == "assistant")
+            .collect();
+        let in_flight = assistant_turns
+            .last()
+            .expect("the in-flight assistant turn must survive");
+        assert_eq!(
+            in_flight["content"][0]["type"], "thinking",
+            "an assistant message must start with its thinking: {in_flight:#}"
+        );
+    }
+
+    #[test]
+    fn thinking_replays_every_turn_on_models_that_keep_it() {
+        let messages = thinking_replay_messages();
+        let (_, native) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-opus-4-5",
+        );
+        let wire = serde_json::to_value(&native).unwrap();
+        let signatures: Vec<&str> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block.get("signature").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            signatures,
+            vec!["sig_old", "sig_new"],
+            "a model that keeps prior turns' thinking replays every signed block: {wire:#}"
+        );
+        let assistant_turns: Vec<&serde_json::Value> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|msg| msg["role"] == "assistant")
+            .collect();
+        for (position, turn) in assistant_turns.iter().enumerate() {
+            let has_reasoning = turn["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking"));
+            if has_reasoning {
+                assert_eq!(
+                    turn["content"][0]["type"], "thinking",
+                    "an assistant turn carrying reasoning must start with it (turn {position}): {turn:#}"
+                );
+            }
+        }
+    }
+
+    /// Two finished tool rounds, each with a signed reasoning block, plus the
+    /// round still in flight. Shared by the replay-policy tests.
+    fn thinking_replay_messages() -> Vec<ChatMessage> {
+        let envelope = |thinking: &str, signature: &str, call_id: &str| {
+            serde_json::json!({
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "name": "shell",
+                    "arguments": "{}",
+                }],
+                "reasoning_content": serde_json::json!({
+                    "thinking": thinking,
+                    "signature": signature,
+                })
+                .to_string(),
+            })
+            .to_string()
+        };
+        vec![
+            ChatMessage::user("first ask"),
+            ChatMessage::assistant(envelope("earlier", "sig_old", "call_1")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+            ChatMessage::assistant("finished the first ask"),
+            ChatMessage::user("second ask"),
+            ChatMessage::assistant(envelope("current", "sig_new", "call_2")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
+                    .to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn thinking_replay_boundary_ignores_internal_pruning_markers() {
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": serde_json::json!({
+                "thinking": "current",
+                "signature": "sig_new",
+            })
+            .to_string(),
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("the ask"),
+            ChatMessage::assistant(&envelope),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+        ];
+
+        let (_, native) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
+        let wire = serde_json::to_value(&native).unwrap();
+        let has_signature = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .any(|block| block.get("signature").is_some());
+        assert!(
+            has_signature,
+            "the only round present is in flight: {wire:#}"
+        );
     }
 
     #[test]
@@ -10681,6 +11745,93 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             body["thinking"].get("display").is_none(),
             "display must stay off the wire when unset: {body}"
         );
+    }
+
+    /// Two thinking blocks around text, one signature-only, to pin ordering.
+    fn fake_anthropic_thinking_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  Step \"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_a\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_b\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    async fn drain_sse(bytes: &'static [u8]) -> Vec<StreamResult<StreamEvent>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_does_not_disturb_text_or_tool_ordering() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let labels: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                Ok(StreamEvent::ThinkingDelta(_)) => "thinking_delta",
+                Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning",
+                Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ToolCall(_)) => "tool_call",
+                Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::Final) => "final",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "thinking_delta",
+                "thinking_delta",
+                "reasoning",
+                "text",
+                "reasoning",
+                "usage",
+                "final"
+            ]
+        );
+        let records: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ReasoningFinalized(payload)) => Some(payload.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(records[0]).unwrap();
+        assert_eq!(first["thinking"], "  Step one");
+        assert_eq!(first["signature"], "sig_a");
+        let second: serde_json::Value =
+            serde_json::from_str(records[1].trim_start_matches('\n')).unwrap();
+        assert_eq!(second["thinking"], "");
+        assert_eq!(second["signature"], "sig_b");
     }
 
     #[tokio::test]

@@ -2229,8 +2229,8 @@ mod tests {
         collect_cache_controls(&compat_one_hour, &mut controls);
         assert_eq!(
             controls.len(),
-            2,
-            "system + rolling breakpoints expected: {compat_one_hour}"
+            3,
+            "system + prior-turn + rolling breakpoints expected: {compat_one_hour}"
         );
         for control in &controls {
             assert_eq!(
@@ -2252,8 +2252,8 @@ mod tests {
         collect_cache_controls(&native_one_hour, &mut controls);
         assert_eq!(
             controls.len(),
-            3,
-            "system + tools + rolling markers expected: {native_one_hour}"
+            4,
+            "system + tools + prior-turn + rolling markers expected: {native_one_hour}"
         );
         for control in &controls {
             assert_eq!(
@@ -2265,7 +2265,7 @@ mod tests {
         let native_default = native_request(&ModelProviderRuntimeOptions::default()).await;
         let mut controls = Vec::new();
         collect_cache_controls(&native_default, &mut controls);
-        assert_eq!(controls.len(), 3, "marker placement is unconditional");
+        assert_eq!(controls.len(), 4, "marker placement is unconditional");
         for control in &controls {
             assert_eq!(
                 serde_json::to_string(control).unwrap(),
