@@ -3211,7 +3211,7 @@ impl ModelProvider for AnthropicModelProvider {
             max_tokens: effective_max_tokens,
             display,
         } = tuning;
-        let thinking_display_beta = display.is_some();
+        let thinking_display_beta = display == Some(ThinkingDisplay::Updates);
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -3442,12 +3442,15 @@ impl ModelProvider for AnthropicModelProvider {
             max_tokens: effective_max_tokens,
             display,
         } = tuning;
-        let thinking_display_beta = display.is_some();
+        let thinking_display_beta = display == Some(ThinkingDisplay::Updates);
 
         let uses_fixed_budget = thinking_config
             .as_ref()
             .is_some_and(|config| config.budget_tokens.is_some());
-        if uses_fixed_budget && !thinking_display_beta {
+        let display_sent = thinking_config
+            .as_ref()
+            .is_some_and(|config| config.display.is_some());
+        if uses_fixed_budget && !display_sent {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12026,17 +12029,18 @@ data: {\"type\":\"message_stop\"}\n\n";
         use futures_util::StreamExt as _;
         use zeroclaw_api::model_provider::NativeThinkingParams;
 
-        // A fitted adaptive display must use signed-capable streaming.
-        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        // A fitted summary streams without the progress-note beta.
+        let captured: std::sync::Arc<
+            std::sync::Mutex<Option<(axum::http::HeaderMap, serde_json::Value)>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_route = captured.clone();
         let app = Router::new().route(
             "/v1/messages",
-            post(move |body: axum::body::Bytes| {
+            post(move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
                 let captured = captured_for_route.clone();
                 async move {
                     if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
-                        *captured.lock().unwrap() = Some(parsed);
+                        *captured.lock().unwrap() = Some((headers, parsed));
                     }
                     let sse = "event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
@@ -12104,13 +12108,17 @@ data: {\"type\":\"message_stop\"}\n\n";
             saw_thinking_delta,
             "display-enabled requests must produce live thinking deltas from the SSE path"
         );
-        let body = captured
+        let (headers, body) = captured
             .lock()
             .unwrap()
             .clone()
             .expect("streaming request body must be captured");
         assert_eq!(body["stream"], serde_json::json!(true));
         assert_eq!(body["thinking"]["display"], serde_json::json!("summarized"));
+        assert!(
+            !headers.contains_key("anthropic-beta"),
+            "a resolved summary must not enable the progress-note beta"
+        );
         assert!(body["thinking"].get("budget_tokens").is_none());
         assert!(body.get("temperature").is_none());
     }
