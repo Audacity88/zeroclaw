@@ -1019,7 +1019,7 @@ impl App {
                 }
 
                 // Section pane click: select the clicked section, return focus to
-                // the left pane, and preview that section on the right. Display
+                // the left pane, and return that section to its starting view. Display
                 // rows resolve through the draw-time `last_section_rows` map so
                 // group headers are dead zones rather than off-by-N selections.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
@@ -1031,10 +1031,28 @@ impl App {
                     ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
                         self.section_cursor = orig;
+                        self.zeroclaw_pane = ZeroclawPane::Sections;
+                        self.deactivate_filter();
+                        // Lists have no field subtabs, even if a previous
+                        // field screen left its tab state behind.
+                        if matches!(
+                            self.screen,
+                            Screen::TypeList { .. } | Screen::AliasList { .. }
+                        ) {
+                            self.active_tab = 0;
+                        }
+                        if self.loaded_section == Some(orig) && !self.at_section_top_level() {
+                            self.load_section_content(orig).await?;
+                        } else {
+                            self.preview_section(orig).await?;
+                        }
+                        self.edit_buf.clear();
+                        self.edit_cursor = 0;
+                        self.active_tab = 0;
+                        self.alias_tab = 0;
+                        self.last_tab_area = None;
+                        self.status_msg = None;
                     }
-                    self.zeroclaw_pane = ZeroclawPane::Sections;
-                    self.preview_section(self.section_cursor).await?;
-                    self.status_msg = None;
                     return Ok(());
                 }
 
@@ -5916,7 +5934,7 @@ mod tests {
         assert!(manager.section == ConfigSection::Zeroclaw);
         assert!(matches!(manager.screen, Screen::AliasList { .. }));
         enter_alias_rename(&mut manager, &mut term, "new").await;
-        // A section-pane click may re-preview the already loaded section.
+        // Passive preview keeps the loaded drill level while cancelling rename.
         manager.preview_section(0).await.unwrap();
         assert!(matches!(manager.screen, Screen::AliasList { .. }));
         assert!(manager.edit_buf.is_empty());
@@ -5948,6 +5966,97 @@ mod tests {
         ));
         assert!(manager.edit_buf.is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_section_click_returns_to_root_without_mutation() {
+        for drill_level in 0..3 {
+            let (mut manager, outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            let breadcrumb = vec!["providers.models".into(), "openai".into(), "old".into()];
+            manager.screen = match drill_level {
+                0 => manager.screen,
+                1 => Screen::FieldList {
+                    section_idx: 0,
+                    prefix: "providers.models.openai.old".into(),
+                    breadcrumb,
+                },
+                _ => Screen::AliasRename {
+                    section_idx: 0,
+                    map_path: "providers.models.openai".into(),
+                    breadcrumb,
+                    from: "old".into(),
+                    confirming: true,
+                },
+            };
+            manager.templates = vec![ConfigTemplateEntry {
+                path: "providers.models.openai".into(),
+            }];
+            manager.filter = Some("old".into());
+            manager.edit_buf = "unsaved".into();
+            manager.edit_cursor = manager.edit_buf.len();
+            manager.active_tab = 1;
+            manager.last_tab_area = Some(Rect::new(32, 1, 40, 1));
+            manager.last_section_pane_area = Rect::new(0, 0, 30, 10);
+            manager.last_section_list_area = Rect::new(1, 1, 28, 8);
+            manager.last_section_rows = vec![None, Some(0)];
+            let mut click = MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 5,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            // Group headers and empty space must not cancel the current work.
+            for row in [2, 5] {
+                click.row = row;
+                manager
+                    .handle_mouse(click, Rect::default(), &mut term)
+                    .await
+                    .unwrap();
+                assert_eq!(manager.edit_buf, "unsaved");
+                assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+                assert!(rx.try_recv().is_err());
+            }
+            click.row = 3;
+            let reply = answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-keys",
+                serde_json::json!({"path": "providers.models.openai"}),
+                Ok(serde_json::json!({"keys": ["old", "other"]})),
+            );
+            let (result, ()) = tokio::join!(
+                manager.handle_mouse(click, Rect::default(), &mut term),
+                reply
+            );
+            result.unwrap();
+            assert!(matches!(
+                manager.screen,
+                Screen::TypeList { section_idx: 0 }
+            ));
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+            assert_eq!(manager.type_list_labels(0), vec!["openai"]);
+            assert_eq!(manager.type_alias_counts, vec![2]);
+            assert!(manager.filter.is_none());
+            assert!(manager.edit_buf.is_empty());
+            assert_eq!(manager.edit_cursor, 0);
+            assert_eq!(manager.active_tab, 0);
+            assert!(manager.last_tab_area.is_none());
+            // Reclicking the starting view keeps its selection and avoids a reload.
+            manager.types.push(ConfigTemplateEntry {
+                path: "providers.models.anthropic".into(),
+            });
+            manager.type_cursor = 1;
+            manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+            manager.active_tab = 1;
+            manager
+                .handle_mouse(click, Rect::default(), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.at_section_top_level());
+            assert_eq!(manager.type_cursor, 1);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     fn field(path: &str) -> ConfigFieldEntry {
