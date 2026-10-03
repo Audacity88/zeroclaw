@@ -2829,6 +2829,164 @@ mod tests {
         );
     }
 
+    fn thinking_overrides() -> SessionOverrides {
+        SessionOverrides {
+            thinking_level: Some(ThinkingLevel::High),
+            thinking_display: Some(ThinkingDisplay::Summarized),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merged_applies_thinking_fields_from_the_patch() {
+        let merged = SessionOverrides::default().merged(&thinking_overrides(), &[]);
+        assert_eq!(merged.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(merged.thinking_display, Some(ThinkingDisplay::Summarized));
+        // A patch without thinking fields leaves them alone.
+        let kept = merged.merged(
+            &SessionOverrides {
+                temperature: Some(0.5),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(kept.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(kept.thinking_display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(kept.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn merged_model_switch_clears_thinking_fields() {
+        let merged = thinking_overrides().merged(
+            &SessionOverrides {
+                model: Some("claude-opus-4-6".into()),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(merged.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(merged.thinking_level, None);
+        assert_eq!(merged.thinking_display, None);
+    }
+
+    #[test]
+    fn merged_provider_switch_clears_thinking_fields() {
+        let merged = thinking_overrides().merged(
+            &SessionOverrides {
+                model_provider: Some("openai.default".into()),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(merged.model_provider.as_deref(), Some("openai.default"));
+        assert_eq!(merged.thinking_level, None);
+        assert_eq!(merged.thinking_display, None);
+    }
+
+    #[test]
+    fn merged_same_patch_sets_thinking_after_a_switch_clears_it() {
+        let merged = thinking_overrides().merged(
+            &SessionOverrides {
+                model: Some("claude-opus-4-6".into()),
+                thinking_level: Some(ThinkingLevel::Max),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(merged.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(
+            merged.thinking_level,
+            Some(ThinkingLevel::Max),
+            "the patch's own level applies to the new model"
+        );
+        assert_eq!(
+            merged.thinking_display, None,
+            "the old display does not survive the switch"
+        );
+    }
+
+    #[test]
+    fn merged_reset_clears_one_thinking_field() {
+        let merged = thinking_overrides().merged(
+            &SessionOverrides::default(),
+            &[SessionOverrideField::ThinkingDisplay],
+        );
+        assert_eq!(merged.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(merged.thinking_display, None);
+        // Reset runs first, so a patch can clear and set in one call.
+        let replaced = thinking_overrides().merged(
+            &SessionOverrides {
+                thinking_level: Some(ThinkingLevel::Low),
+                ..Default::default()
+            },
+            &[SessionOverrideField::ThinkingLevel],
+        );
+        assert_eq!(replaced.thinking_level, Some(ThinkingLevel::Low));
+    }
+
+    #[test]
+    fn merged_keeps_explicit_default_choices() {
+        // Choosing the defaults by name is still a session choice: it must
+        // beat the profile and the alias until reset.
+        let merged = SessionOverrides::default().merged(
+            &SessionOverrides {
+                thinking_level: Some(ThinkingLevel::Medium),
+                thinking_display: Some(ThinkingDisplay::Omitted),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(merged.thinking_level, Some(ThinkingLevel::Medium));
+        assert_eq!(merged.thinking_display, Some(ThinkingDisplay::Omitted));
+    }
+
+    #[test]
+    fn thinking_overrides_serialize_as_lowercase_tokens_and_omit_when_unset() {
+        let json = serde_json::to_value(thinking_overrides()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"thinking_level": "high", "thinking_display": "summarized"})
+        );
+        let empty = serde_json::to_value(SessionOverrides::default()).unwrap();
+        assert_eq!(empty, serde_json::json!({}));
+        let parsed: SessionOverrides =
+            serde_json::from_value(serde_json::json!({"thinking_level": "xhigh"})).unwrap();
+        assert_eq!(parsed.thinking_level, Some(ThinkingLevel::XHigh));
+        let field: SessionOverrideField = serde_json::from_str("\"thinking_display\"").unwrap();
+        assert_eq!(field, SessionOverrideField::ThinkingDisplay);
+    }
+
+    #[tokio::test]
+    async fn set_overrides_gated_honors_reset() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let generation = store.get_generation("s").await.unwrap();
+        store
+            .set_overrides_gated_reset("s", generation, thinking_overrides(), &[])
+            .await
+            .expect("current generation is accepted");
+        let merged = store
+            .set_overrides_gated_reset(
+                "s",
+                generation,
+                SessionOverrides::default(),
+                &[SessionOverrideField::ThinkingLevel],
+            )
+            .await
+            .expect("current generation is accepted");
+        assert_eq!(merged.thinking_level, None);
+        assert_eq!(merged.thinking_display, Some(ThinkingDisplay::Summarized));
+        let stored = store.get_overrides("s").await.unwrap();
+        assert_eq!(stored.thinking_level, None);
+        assert_eq!(stored.thinking_display, Some(ThinkingDisplay::Summarized));
+    }
+
     #[tokio::test]
     async fn set_overrides_missing_session_is_none() {
         let store = make_store(4);

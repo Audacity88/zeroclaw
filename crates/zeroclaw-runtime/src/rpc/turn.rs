@@ -379,6 +379,178 @@ where
 }
 
 #[cfg(test)]
+mod thinking_scope_tests {
+    use super::*;
+    use crate::agent::agent::Agent;
+    use crate::agent::dispatcher::NativeToolDispatcher;
+    use crate::observability::{NoopObserver, Observer};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{
+        ModelProvider, NativeThinkingParams, ThinkingDisplay, ThinkingEffort,
+    };
+    use zeroclaw_memory::Memory;
+    use zeroclaw_providers::ChatRequest;
+
+    /// Records the thinking request each call carried.
+    #[derive(Default)]
+    struct ThinkingRecordingProvider {
+        seen: StdMutex<Vec<Option<NativeThinkingParams>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.seen.lock().unwrap().push(request.thinking);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for ThinkingRecordingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "recording-provider"
+        }
+    }
+
+    fn agent_with(provider: Arc<ThinkingRecordingProvider>) -> Agent {
+        struct Shared(Arc<ThinkingRecordingProvider>);
+
+        #[async_trait]
+        impl ModelProvider for Shared {
+            async fn chat_with_system(
+                &self,
+                system_prompt: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.0
+                    .chat_with_system(system_prompt, message, model, temperature)
+                    .await
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+
+        impl Attributable for Shared {
+            fn role(&self) -> Role {
+                self.0.role()
+            }
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        Agent::builder()
+            .model_provider(Box::new(Shared(provider)))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("recording-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed")
+    }
+
+    async fn noop(_event: TurnEvent) {}
+
+    #[tokio::test]
+    async fn execute_turn_scopes_native_thinking_override() {
+        let provider = Arc::new(ThinkingRecordingProvider::default());
+        let agent = Arc::new(Mutex::new(agent_with(Arc::clone(&provider))));
+        let attribution = TurnAttribution {
+            session_key: Some("s1".into()),
+            agent_alias: "rpc-agent".into(),
+            model_provider: "recording-provider".into(),
+            model: "test-model".into(),
+            channel: "rpc",
+        };
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: Some(ThinkingDisplay::Summarized),
+        };
+
+        execute_turn(
+            Arc::clone(&agent),
+            "hello".to_string(),
+            CancellationToken::new(),
+            attribution.clone(),
+            None,
+            None,
+            Some(params),
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        execute_turn(
+            agent,
+            "again".to_string(),
+            CancellationToken::new(),
+            attribution,
+            None,
+            None,
+            None,
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some(params), None],
+            "the thinking request must be scoped inside the spawned turn task, \
+             and must not leak into the next turn"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
