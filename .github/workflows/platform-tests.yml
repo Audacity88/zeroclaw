@@ -1,18 +1,7 @@
-name: Scheduled Platform Tests
+name: Windows service fixture warm-cache canary
 
 on:
-  pull_request:
-    branches: [master]
-    paths:
-      - ".github/workflows/platform-tests.yml"
-      - "crates/zeroclaw-tools/src/coding_cli.rs"
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -22,60 +11,106 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  seed:
+    name: Seed development dependency cache
+    if: github.repository == 'Audacity88/zeroclaw' && github.ref == 'refs/heads/codex/windows-service-smoke-warm-canary'
+    runs-on: windows-latest
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: Audacity88/zeroclaw
+          ref: c77622c7f532a3a62fd1cd12df728760b348dc34
+          persist-credentials: false
+      - name: Verify source revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = c77622c7f532a3a62fd1cd12df728760b348dc34
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: 1.98.0
-          components: rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        id: cache
+        with:
+          shared-key: service-fixture-canary-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-workspace-crates: false
+          cache-on-failure: false
+          save-if: true
+      - name: Require isolated cold cache
+        if: steps.cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          echo '::error::Unexpected existing cache in the isolated seed job'
+          exit 1
+      - name: Build the fixture to seed dependencies
+        shell: bash
+        run: >-
+          cargo build --profile dev --locked -p zeroclaw-runtime
+          --example windows_service_smoke_fixture
+          --target x86_64-pc-windows-msvc
 
-  platform-tests:
-    name: Platform Test (${{ matrix.name }})
-    needs: [fmt]
-    # macOS is a supported target ahead of Windows and has passed 20/20 recent
-    # runs, so its result is honest and a regression turns this workflow red.
-    # Windows stays masked ONLY because one known test is red -- see
-    # cron::scheduler::tests::agent_cron_run_keeps_workspace_through_shell_on_retry_and_concurrency,
-    # where the cron shell reports a POSIX path (/tmp/...) instead of the
-    # Windows scheduler workspace. Re-enable by deleting this expression once
-    # that test is fixed; do not widen it to hide new failures.
-    continue-on-error: ${{ matrix.name == 'Windows' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS
-            os: macos-14
-            nextest-platform: mac
-            timeout-minutes: 45
-          - name: Windows
-            os: windows-latest
-            nextest-platform: windows-tar
-            timeout-minutes: 60
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout-minutes }}
+  measure:
+    name: Measure fresh-runner warm dependency build
+    needs: seed
+    if: github.repository == 'Audacity88/zeroclaw' && github.ref == 'refs/heads/codex/windows-service-smoke-warm-canary'
+    runs-on: windows-latest
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: Audacity88/zeroclaw
+          ref: c77622c7f532a3a62fd1cd12df728760b348dc34
+          persist-credentials: false
+      - name: Verify source revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = c77622c7f532a3a62fd1cd12df728760b348dc34
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        id: cache
         with:
-          shared-key: platform-test
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Ensure web/dist placeholder exists
+          shared-key: service-fixture-canary-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-workspace-crates: false
+          cache-on-failure: false
+          save-if: false
+      - name: Require a full dependency-cache hit without a built fixture
         shell: bash
-        run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Install cargo-nextest
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          test "$CACHE_HIT" = true
+          test ! -e target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe
+      - name: Measure the warm dependency fixture build
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
-      - name: Run tests
-        shell: bash
-        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
+        run: >-
+          cargo build --profile dev --locked -p zeroclaw-runtime
+          --example windows_service_smoke_fixture
+          --target x86_64-pc-windows-msvc
+      - name: Exercise installed Windows service lifecycle
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          ./scripts/ci/windows_service_smoke.ps1 `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
+            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
+      - name: Clean up Windows service smoke
+        if: always()
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          ./scripts/ci/windows_service_smoke.ps1 `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
+            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
+            -CleanupOnly
+      - name: Upload Windows service smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-service-smoke-evidence
+          path: ${{ runner.temp }}/windows-service-smoke-evidence
+          if-no-files-found: warn
+          retention-days: 7
