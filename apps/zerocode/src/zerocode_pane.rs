@@ -366,6 +366,17 @@ impl ZerocodePane {
         self.conn_edit.is_some()
     }
 
+    /// Append normalized bracketed paste only to the active connection draft.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(edit) = self.conn_edit.as_mut() {
+            if edit.field == ConnField::SkipVerifyRoutes {
+                edit.buf.push_str(text);
+            } else {
+                edit.buf.extend(text.chars().filter(|c| *c != '\n'));
+            }
+        }
+    }
+
     // ── Draw ─────────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -745,7 +756,7 @@ impl ZerocodePane {
 
     fn draw_connection(&self, frame: &mut Frame, area: Rect) {
         if let Some(edit) = &self.conn_edit {
-            use crate::keymap::ConfigEditorAction as A;
+            use crate::keymap::{ConfigEditorAction as A, RebindableActions};
             use ratatui::layout::{Constraint, Direction, Layout};
             let keys = |action: A| {
                 action

@@ -709,11 +709,15 @@ impl App {
 
     fn editor_owns_key(&self, key: &KeyEvent) -> bool {
         use crate::keymap::ConfigEditorAction as E;
-        self.section == ConfigSection::Zeroclaw
-            && (matches!(self.screen, Screen::FieldEdit { .. })
-                || self.personality_active_file.is_some()
-                || self.skills_active.is_some())
-            && matches!(E::from_chord(key), Some(E::Save | E::Confirm | E::Cancel))
+        let editing = match self.section {
+            ConfigSection::Zeroclaw => {
+                matches!(self.screen, Screen::FieldEdit { .. })
+                    || self.personality_active_file.is_some()
+                    || self.skills_active.is_some()
+            }
+            ConfigSection::Zerocode => self.zerocode.wants_text_input(),
+        };
+        editing && matches!(E::from_chord(key), Some(E::Save | E::Confirm | E::Cancel))
     }
 
     fn discard_drafts(&mut self) {
@@ -1062,10 +1066,10 @@ impl App {
         // editor or the zerocode pane, so there is no shadowing.
         if !self.editor_owns_key(&key)
             && !(self.wants_text_input()
-                && matches!(key.code, KeyCode::Char(_))
+                && matches!(key.code, KeyCode::Char(_)) // keyguard: literal text must not trigger a list navigation binding.
                 && !key
                     .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER))
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT))
             && let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key)
         {
             use crate::keymap::ConfigTabAction;
@@ -1097,7 +1101,7 @@ impl App {
             && !self.editor_owns_key(&key)
             && self.is_composite_tab()
             && (self.personality_active_file.is_some() || self.skills_active.is_some())
-            && !matches!(key.code, KeyCode::Char(_))
+            && !matches!(key.code, KeyCode::Char(_)) // keyguard: printable characters belong to the multiline draft, not tab navigation.
             && match crate::keymap::ConfigTabAction::from_chord(&key) {
                 Some(crate::keymap::ConfigTabAction::TabLeft) => true,
                 Some(crate::keymap::ConfigTabAction::TabRight) => {
@@ -5166,6 +5170,10 @@ impl App {
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.section == ConfigSection::Zerocode {
+            self.zerocode.handle_paste(&cleaned);
+            return;
+        }
 
         // Filter active: paste goes into the filter buffer.
         if let Some(buf) = self.filter.as_mut() {
@@ -6304,6 +6312,97 @@ mod tests {
         };
         let ((), ()) = tokio::join!(save, answers);
         assert!(matches!(manager.screen, Screen::FieldList { .. }));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_connection_paste_and_resolved_actions_leave_parked_draft_untouched() {
+        let _env = crate::test_support::env_test_lock();
+        let _keys = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+            manager.handle_paste(" parked");
+            manager.zerocode = crate::zerocode_pane::ZerocodePane::new(dir.path());
+            for _ in 0..5 {
+                manager
+                    .zerocode
+                    .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            for _ in 0..2 {
+                manager
+                    .zerocode
+                    .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            manager.section = ConfigSection::Zerocode;
+            assert!(manager.wants_text_input());
+            let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+            manager.handle_paste("ws://127.0.0.1:\r\n42617");
+            assert_eq!(manager.edit_buf, "original parked");
+            assert!(rx.try_recv().is_err());
+            let action = if cancel { "cancel" } else { "save" };
+            crate::keymap::overrides::set_row(
+                "config_editor",
+                action,
+                vec![crate::keymap::Chord::key(KeyCode::Tab)],
+            );
+            config_key(&mut manager, &mut term, KeyCode::Tab).await;
+            assert!(manager.section == ConfigSection::Zerocode);
+            assert!(!manager.wants_text_input());
+            assert_eq!(manager.edit_buf, "original parked");
+            if cancel {
+                assert_eq!(
+                    std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+                    before
+                );
+            } else {
+                assert_eq!(
+                    crate::config::ensure_and_load(dir.path())
+                        .unwrap()
+                        .connection
+                        .wss
+                        .uri
+                        .as_deref(),
+                    Some("ws://127.0.0.1:42617")
+                );
+            }
+            assert!(rx.try_recv().is_err());
+            crate::keymap::overrides::reset();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_alt_section_binding_parks_scalar_draft_without_inserting_text() {
+        let _keys = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "section_next",
+            vec![crate::keymap::Chord::with(
+                KeyCode::Char('n'),
+                KeyModifiers::ALT,
+            )],
+        );
+        let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" pending");
+        manager
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert_eq!(manager.edit_buf, "original pending");
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
     }
 
     fn personality_draft_manager() -> (
@@ -7571,7 +7670,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn multiline_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
         let (mut manager, calls) = responding_manager();
         let mut first = field("a.first");
         first.tab = ConfigTab::Connection;
