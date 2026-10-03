@@ -20,6 +20,7 @@ zc-app-help-toggle-sidebar = Toggle sessions sidebar
 zc-app-help-quit = Quit
 
 zc-sidebar-title = Open sessions
+zc-sidebar-count-hint = (N) = messages
 zc-dock-header = Dock { $side }
 zc-dock-side-left = left
 zc-dock-side-right = right

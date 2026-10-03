@@ -281,11 +281,16 @@ impl AgentSidebar {
                 height: 1,
                 ..inner
             };
+            let count_hint = t("zc-sidebar-count-hint");
+            let separator = if !rows.is_empty()
+                && crate::display_width::display_width(&count_hint) <= usize::from(inner.width)
+            {
+                count_hint
+            } else {
+                "\u{2500}".repeat(inner.width as usize)
+            };
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "\u{2500}".repeat(inner.width as usize),
-                    theme::dim_style(),
-                )),
+                Paragraph::new(Span::styled(separator, theme::dim_style())).centered(),
                 sep,
             );
         }
@@ -763,6 +768,14 @@ mod tests {
         assert!(s.minus_rect.width > 0, "minus affordance recorded");
         assert!(s.plus_rect.width > 0, "plus affordance recorded");
         assert!(s.quickstart_rect.width > 0, "quickstart row recorded");
+        let count_hint_row = Rect {
+            y: s.quickstart_rect.y - 1,
+            ..s.quickstart_rect
+        };
+        assert!(
+            rendered_row(term.backend().buffer(), count_hint_row)
+                .contains(&t("zc-sidebar-count-hint"))
+        );
 
         // Click routing through the recorded rects. Every row cell, including
         // the trailing tag cells, only focuses its session.
@@ -913,56 +926,108 @@ mod tests {
     }
 
     #[test]
-    fn running_row_is_explicit_with_count_and_close_target() {
-        let mut sidebar = sidebar();
-        let area = Rect::new(0, 0, crate::config::SIDEBAR_WIDTH_MIN, 8);
-        let mut row = summary("long-agent-name", "s1", true);
-        row.status = SidebarStatus::Running;
-        row.message_count = 42;
+    fn rows_show_only_agent_ordinal_and_honest_date() {
+        let mut s = sidebar();
+        let area = Rect::new(0, 0, 40, 8);
+        let rows = vec![
+            summary_in_pane("same-agent", "chat", PaneKind::Chat, true),
+            summary_in_pane("same-agent", "code", PaneKind::Acp, false),
+        ];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
             quickstart_active: false,
             connected: true,
         };
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
-            crate::config::SIDEBAR_WIDTH_MIN + CONTENT_MIN_COLS,
-            8,
-        ))
-        .unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        term.draw(|frame| s.draw(frame, area, &rows, &ctx)).unwrap();
+        let expected_date = chrono::DateTime::parse_from_rfc3339("2026-01-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%m/%d")
+            .to_string();
+        for (_, _, rect) in &s.row_rects {
+            let row = rendered_row(term.backend().buffer(), *rect);
+            assert!(row.contains("same-agent #1"));
+            assert!(row.contains(&expected_date));
+            assert!(!row.contains(&t("zc-pane-chat")));
+            assert!(!row.contains(&t("zc-pane-code")));
+            assert!(row.contains('\u{2715}'));
+        }
+    }
 
-        term.draw(|frame| sidebar.draw(frame, area, &[row], &ctx))
+    #[test]
+    fn invalid_activity_uses_neutral_placeholder() {
+        let mut s = sidebar();
+        let area = Rect::new(0, 0, 40, 6);
+        let mut row = summary("agent", "session", true);
+        row.last_activity = Some("not-a-date".into());
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 6)).unwrap();
+        term.draw(|frame| s.draw(frame, area, &[row], &ctx))
+            .unwrap();
+        let row = rendered_row(term.backend().buffer(), s.row_rects[0].2);
+        assert!(row.contains("agent #1"));
+        assert!(row.contains(&t("zc-sidebar-date-placeholder")));
+        assert!(row.contains('\u{2715}'));
+    }
+
+    #[test]
+    fn running_row_is_explicit_with_count_and_close_target() {
+        for (message_count, count_label) in [(42, "(42)"), (12_345, "(999+)")] {
+            let mut sidebar = sidebar();
+            let area = Rect::new(0, 0, crate::config::SIDEBAR_WIDTH_MIN, 8);
+            let mut row = summary("long-agent-name", "s1", true);
+            row.status = SidebarStatus::Running;
+            row.message_count = message_count;
+            let ctx = SidebarCtx {
+                active_pane: Some(PaneKind::Chat),
+                quickstart_active: false,
+                connected: true,
+            };
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                crate::config::SIDEBAR_WIDTH_MIN + CONTENT_MIN_COLS,
+                8,
+            ))
             .unwrap();
 
-        let (_, _, rect) = sidebar.row_rects[0].clone();
-        let text: String = (rect.x..rect.right())
-            .map(|x| term.backend().buffer()[(x, rect.y)].symbol())
-            .collect();
-        assert!(
-            text.contains("\u{25b6}"),
-            "running state must not rely on color: {text}"
-        );
-        assert!(
-            text.contains("(42)"),
-            "message counts are not session identity: {text}"
-        );
-        // The trailing close affordance closes the running session; the row
-        // body still only focuses.
-        let (_, _, row) = sidebar.row_rects[0].clone();
-        let (_, _, close_rect) = sidebar.row_close_rects[0].clone();
-        assert_eq!(
-            sidebar.handle_mouse(&click(close_rect.x, close_rect.y)),
-            Some(SidebarEvent::CloseSession {
-                pane: PaneKind::Chat,
-                session_id: "s1".into(),
-            })
-        );
-        assert_eq!(
-            sidebar.handle_mouse(&click(row.x, row.y)),
-            Some(SidebarEvent::FocusSession {
-                pane: PaneKind::Chat,
-                session_id: "s1".into(),
-            })
-        );
+            term.draw(|frame| sidebar.draw(frame, area, &[row], &ctx))
+                .unwrap();
+
+            let (_, _, rect) = sidebar.row_rects[0].clone();
+            let text: String = (rect.x..rect.right())
+                .map(|x| term.backend().buffer()[(x, rect.y)].symbol())
+                .collect();
+            assert!(
+                text.contains("\u{25b6}"),
+                "running state must not rely on color: {text}"
+            );
+            assert!(
+                text.contains(count_label),
+                "message counts stay visible and width-bounded: {text}"
+            );
+            // The trailing close affordance closes the running session; the row
+            // body still only focuses.
+            let (_, _, row) = sidebar.row_rects[0].clone();
+            let (_, _, close_rect) = sidebar.row_close_rects[0].clone();
+            assert_eq!(
+                sidebar.handle_mouse(&click(close_rect.x, close_rect.y)),
+                Some(SidebarEvent::CloseSession {
+                    pane: PaneKind::Chat,
+                    session_id: "s1".into(),
+                })
+            );
+            assert_eq!(
+                sidebar.handle_mouse(&click(row.x, row.y)),
+                Some(SidebarEvent::FocusSession {
+                    pane: PaneKind::Chat,
+                    session_id: "s1".into(),
+                })
+            );
+        }
     }
 
     #[test]
@@ -1067,6 +1132,7 @@ mod tests {
             open_aliases: HashSet::from(["alpha".to_string()]),
             loading: true,
             error: None,
+            opened_at: Instant::now(),
             rx,
             double_click: mouse::DoubleClickTracker::new(),
             modal_rect: Rect::default(),
@@ -1092,6 +1158,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn picker_refresh_keeps_cached_rows_and_selection_until_current_reply() {
+        let (tx, mut requests) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut s = sidebar();
+        s.cache_rpc = Arc::downgrade(&rpc);
+        s.cached_aliases = vec!["alpha".into(), "beta".into()];
+        s.open_picker(PaneKind::Chat, HashSet::new(), &rpc);
+        let initial = s.picker.as_ref().unwrap().display_items();
+        assert_eq!(initial[0].trim(), "alpha");
+        assert_eq!(
+            s.handle_picker_key(&KeyEvent::from(crossterm::event::KeyCode::Enter)),
+            None
+        );
+        assert!(
+            s.picker_open(),
+            "pending refresh must not dismiss or launch"
+        );
+        s.handle_picker_key(&KeyEvent::from(crossterm::event::KeyCode::Down));
+
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+        assert_eq!(request["method"], crate::client::method::AGENTS_LIST);
+        outbound.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "disabled", "enabled": false},
+                    {"alias": "beta", "enabled": true},
+                    {"alias": "gamma", "enabled": true}
+                ]
+            })),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while s.picker.as_ref().unwrap().loading {
+                tokio::task::yield_now().await;
+                s.drain_picker_fetch();
+            }
+        })
+        .await
+        .unwrap();
+        let picker = s.picker.as_ref().unwrap();
+        assert_eq!(picker.aliases, ["beta", "gamma"]);
+        assert_eq!(
+            picker.state.cursor, 0,
+            "selection follows beta, not row index"
+        );
+        let refreshed = picker.display_items();
+        assert_eq!(
+            widgets::PickerModal::area_for("Agents", &initial, Rect::new(0, 0, 80, 24)),
+            widgets::PickerModal::area_for("Agents", &refreshed, Rect::new(0, 0, 80, 24))
+        );
+
+        s.close_picker();
+        s.open_picker(PaneKind::Acp, HashSet::new(), &rpc);
+        assert_eq!(s.picker.as_ref().unwrap().aliases, ["beta", "gamma"]);
+        let abandoned: serde_json::Value =
+            serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+        s.close_picker();
+        s.open_picker(PaneKind::Chat, HashSet::new(), &rpc);
+        outbound.dispatch_response(
+            abandoned["id"].as_str().unwrap(),
+            Some(serde_json::json!({"agents": [{"alias": "old", "enabled": true}]})),
+            None,
+        );
+        tokio::task::yield_now().await;
+        s.drain_picker_fetch();
+        assert_eq!(s.picker.as_ref().unwrap().aliases, ["beta", "gamma"]);
+
+        let (other_tx, _other_rx) = mpsc::channel::<String>(16);
+        let other = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(other_tx),
+        )));
+        s.open_picker(PaneKind::Chat, HashSet::new(), &other);
+        let cold = s.picker.as_mut().unwrap();
+        assert!(
+            cold.aliases.is_empty(),
+            "reconnect invalidates the display cache"
+        );
+        assert!(cold.display_items().iter().all(|row| row.trim().is_empty()));
+        cold.opened_at = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            cold.display_items()[0].trim(),
+            t("zc-sidebar-picker-loading")
+        );
+    }
+
+    #[tokio::test]
     async fn picker_error_row_is_not_selectable() {
         let mut s = sidebar();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1102,6 +1257,7 @@ mod tests {
             open_aliases: HashSet::new(),
             loading: true,
             error: None,
+            opened_at: Instant::now(),
             rx,
             double_click: mouse::DoubleClickTracker::new(),
             modal_rect: Rect::default(),
@@ -1125,6 +1281,7 @@ mod tests {
             open_aliases: HashSet::new(),
             loading: true,
             error: None,
+            opened_at: Instant::now(),
             rx,
             double_click: mouse::DoubleClickTracker::new(),
             modal_rect: Rect::default(),

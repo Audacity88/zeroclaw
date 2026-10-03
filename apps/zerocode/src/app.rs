@@ -4391,6 +4391,8 @@ mod tests {
                         status: chat::SidebarStatus::Ready,
                         pane_kind: chat::PaneKind::Chat,
                         focused: true,
+                        display_ordinal: 1,
+                        last_activity: None,
                     }],
                     &crate::agent_sidebar::SidebarCtx {
                         active_pane: Some(chat::PaneKind::Chat),

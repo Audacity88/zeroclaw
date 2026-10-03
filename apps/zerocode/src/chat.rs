@@ -2752,7 +2752,8 @@ impl Chat {
                     self.begin_notification_resync();
                     continue;
                 }
-                _ => break,
+                Ok(_) => continue,
+                Err(_) => break,
             }
         }
         for sid in reconciles {
@@ -13643,10 +13644,13 @@ impl ChatState {
             self.turn_had_streaming_text = true;
         }
         self.flush_streaming_thought();
-        self.entries
-            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                "zc-chat-resynced-turn-running",
-            ))));
+        let notice = crate::i18n::t("zc-chat-resynced-turn-running");
+        // Keep a new gap marker when output separates recovery intervals.
+        if !matches!(self.entries.last(), Some(ChatEntry::SystemMessage(text)) if text.as_ref() == notice)
+        {
+            self.entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+        }
         self.info_message = None;
         self.lag_reattach = Some(LagReattach {
             generation: self.turn_generation,
@@ -16122,6 +16126,80 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(!rendered.contains("expired notice"));
+    }
+
+    fn rendered_meta_row(
+        width: u16,
+        path: Option<&str>,
+        message: Option<&crate::widgets::InfoMessage>,
+    ) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_session_meta_row(frame, frame.area(), path, message))
+            .expect("draw metadata row");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn session_meta_row_places_path_left_and_feedback_right() {
+        let message = crate::widgets::InfoMessage::error("Attachment failed");
+        let rendered = rendered_meta_row(80, Some(" /work/repo - (main) "), Some(&message));
+        assert!(rendered.starts_with(" /work/repo - (main)"));
+        assert!(rendered.ends_with("Attachment failed "));
+    }
+
+    #[test]
+    fn session_meta_row_truncates_path_before_short_feedback() {
+        let message = crate::widgets::InfoMessage::error("Failed");
+        let rendered = rendered_meta_row(
+            30,
+            Some(" /very/long/workspace/path - (main) "),
+            Some(&message),
+        );
+        assert!(rendered.contains('\u{2026}'));
+        assert!(rendered.ends_with("Failed "));
+        assert!(!rendered.contains("(main)"));
+    }
+
+    #[test]
+    fn narrow_session_meta_row_prioritizes_feedback_over_path() {
+        let message = crate::widgets::InfoMessage::error("Attachment failed");
+        let rendered = rendered_meta_row(12, Some(" /work/repo "), Some(&message));
+        assert_eq!(rendered, "Attachment\u{2026} ");
+        assert!(!rendered.contains("/work"));
+    }
+
+    #[test]
+    fn session_meta_row_preserves_feedback_gutter_at_tiny_widths() {
+        let message = crate::widgets::InfoMessage::error("\u{8b66}\u{544a}");
+        assert_eq!(rendered_meta_row(0, Some(" /work "), Some(&message)), "");
+        assert_eq!(rendered_meta_row(1, Some(" /work "), Some(&message)), " ");
+        assert_eq!(
+            rendered_meta_row(2, Some(" /work "), Some(&message)),
+            "\u{2026} "
+        );
+    }
+
+    #[test]
+    fn selection_copy_without_an_overlay_uses_meta_row_feedback() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        assert!(state.copy_current_selection());
+        assert_eq!(
+            state.info_message.as_ref().map(|m| m.text.as_str()),
+            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str())
+        );
+        assert_eq!(state.copy_feedback, None);
     }
 
     #[test]
@@ -19451,6 +19529,66 @@ mod tests {
             state.turn_in_flight,
             "stale frame must not settle the new turn"
         );
+    }
+
+    #[tokio::test]
+    async fn notification_recovery_drains_past_unrelated_events() {
+        let (tx, _writer_rx) = mpsc::channel::<String>(16);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state_for("sess-running", "myagent")));
+        for text in ["first", "second"] {
+            chat.rpc
+                .push_notification_for_test("logs/event", serde_json::Value::Null);
+            chat.rpc.push_notification_for_test(
+                "session/update",
+                serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-running",
+                    "text": text
+                }),
+            );
+        }
+        chat.drain_notifications();
+        let ChatPhase::Active(active) = &chat.phase else {
+            panic!("session remains active");
+        };
+        assert_eq!(active.streaming_text, "firstsecond");
+        assert!(chat.session_resync_in_flight.is_empty());
+    }
+
+    #[test]
+    fn notification_recovery_coalesces_only_adjacent_gap_notices() {
+        let mut active = state_for("sess-running", "myagent");
+        active.push_user_message(Some("live turn".to_string()), Vec::new());
+        active.streaming_text = "before gap".to_string();
+        active.reattach_to_running_turn();
+        let first_gap_len = active.entries.len();
+        for _ in 0..20 {
+            active.reattach_to_running_turn();
+        }
+        assert_eq!(active.entries.len(), first_gap_len);
+        assert!(active.turn_in_flight);
+        assert_eq!(
+            active.lag_reattach.as_ref().map(|lag| lag.generation),
+            Some(active.turn_generation)
+        );
+        for thought in [false, true] {
+            if thought {
+                active.streaming_thought = "new thought".to_string();
+            } else {
+                active.streaming_text = "new output".to_string();
+            }
+            let before = active.entries.len();
+            active.reattach_to_running_turn();
+            assert_eq!(active.entries.len(), before + 2);
+            active.reattach_to_running_turn();
+            assert_eq!(active.entries.len(), before + 2);
+        }
+        assert!(active.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::AgentMessage(text) if text.as_ref() == "before gap"
+        )));
     }
 
     #[tokio::test]
@@ -32670,6 +32808,7 @@ mod tests {
             model_provider_ref: "openai.default".into(),
             models: vec!["onyx".into(), "nylon".into(), "other".into()],
             current: None,
+            error: None,
         });
         active_state(&mut chat).rebuild_lines(80);
 
