@@ -587,7 +587,8 @@ zc-chat-tool-show-all = [Show all · { $count } more lines]
 zc-chat-tool-show-less = [Show less]
 zc-chat-tool-display-limited = [Display limited; copy for full content]
 zc-chat-tool-encoded-size = { $count } encoded characters
-zc-chat-tool-write-preview = Supplied content preview; creation or overwrite cannot be inferred from the input. No content diff is available.
+zc-chat-tool-encoding = Encoding
+zc-chat-tool-write-preview = Content preview · not a diff
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

@@ -411,10 +411,7 @@ pub fn content_lines_limited(
                     Style::default().fg(plain_fg),
                 )]
             });
-        let mut spans = vec![Span::styled(
-            gutter(i + 1, width),
-            Style::default().fg(plain_fg).add_modifier(Modifier::BOLD),
-        )];
+        let mut spans = vec![Span::styled(gutter(i + 1, width), theme::dim_style())];
         spans.extend(content_spans);
         out.push(Line::from(spans));
     }

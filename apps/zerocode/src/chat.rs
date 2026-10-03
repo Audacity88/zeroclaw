@@ -6752,6 +6752,12 @@ fn render_tool_entry(
         }
     };
     let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        let style = if name == "file_write" && label == "result" {
+            theme::body_style()
+        } else {
+            theme::dim_style()
+        }
+        .add_modifier(sel_mod);
         for (line_idx, text_line) in text.split('\n').enumerate() {
             let prefix = if line_idx == 0 {
                 format!("  {label}: ")
@@ -6760,7 +6766,7 @@ fn render_tool_entry(
             };
             lines.push(Line::from(Span::styled(
                 format!("{prefix}{text_line}"),
-                theme::dim_style().add_modifier(sel_mod),
+                style,
             )));
         }
     };
@@ -6831,24 +6837,38 @@ fn render_tool_entry(
         "file_write" => {
             if disclosure.is_open() {
                 let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
-                let content = parsed
+                let file_input = parsed
                     .as_ref()
                     .filter(|input| valid_specialized_file_input(name, input))
-                    .and_then(|input| input.get("content"))
-                    .and_then(|value| value.as_str());
-                if let (Some(input), Some(content)) = (parsed.as_ref(), content) {
+                    .and_then(|input| {
+                        Some((
+                            input.get("path")?.as_str()?,
+                            input.get("content")?.as_str()?,
+                        ))
+                    });
+                if let (Some(input), Some((path, content))) = (parsed.as_ref(), file_input) {
+                    let (path, path_limited) =
+                        terminal_safe_tool_text_limited(path, TOOL_EXPANDED_MAX_BYTES, 1);
+                    display_limited |= path_limited;
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(path, theme::body_style().add_modifier(sel_mod)),
+                    ]));
                     let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
-                        &semantic_tool_metadata(input, &["content"]),
+                        &semantic_tool_metadata(input, &["path", "content", "encoding"]),
                         TOOL_EXPANDED_MAX_BYTES,
                         TOOL_EXPANDED_MAX_LINES,
                     );
                     display_limited |= metadata_limited;
-                    push_text(lines, "input", &metadata);
+                    if metadata != "{}" {
+                        push_text(lines, "input", &metadata);
+                    }
                     let encoding = input
                         .get("encoding")
                         .and_then(|value| value.as_str())
                         .unwrap_or("utf8");
                     if encoding == "base64" {
+                        push_text(lines, &crate::i18n::t("zc-chat-tool-encoding"), encoding);
                         push_text(
                             lines,
                             "content",
@@ -6866,11 +6886,10 @@ fn render_tool_entry(
                         display_limited |= limited;
                         // Input alone cannot establish creation or removed lines,
                         // including for pending, failed and historical calls.
-                        push_text(
-                            lines,
-                            "content",
-                            &crate::i18n::t("zc-chat-tool-write-preview"),
-                        );
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", crate::i18n::t("zc-chat-tool-write-preview")),
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
                         let rendered = diff::content_lines_limited(
                             &content,
                             file_ext(input),
@@ -6879,7 +6898,10 @@ fn render_tool_entry(
                         );
                         footer =
                             (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
-                        lines.extend(rendered.lines);
+                        lines.extend(rendered.lines.into_iter().map(|mut line| {
+                            line.spans.insert(0, Span::raw("  "));
+                            line
+                        }));
                     }
                 } else {
                     display_limited |= render_generic_input(lines);
@@ -6904,6 +6926,9 @@ fn render_tool_entry(
     }
 
     if let Some(res) = result {
+        if name == "file_write" && disclosure.is_open() {
+            lines.push(Line::default());
+        }
         let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
             terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
@@ -24592,10 +24617,11 @@ mod tests {
         let preview_text = rendered_text(&preview_lines);
         let footer_line = footer_line.expect("long preview has a disclosure footer");
         assert!(preview_text.starts_with("▼ [tool: file_write]"));
-        assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
+        assert!(preview_text.contains("  /tmp/example.txt"));
+        assert!(!preview_text.contains("input:"));
         assert!(preview_text.contains("line 0"));
         assert!(preview_text.contains("line 5"));
-        assert!(preview_text.contains("Supplied content preview"));
+        assert!(preview_text.contains("Content preview · not a diff"));
         assert!(!preview_text.contains("| + "));
         assert!(!preview_text.contains("line 6"));
         assert!(preview_text.contains("4 more lines"));
@@ -24651,7 +24677,7 @@ mod tests {
         );
         let base64_text = rendered_text(&base64_lines);
         assert!(footer_line.is_none());
-        assert!(base64_text.contains(r#""encoding":"base64""#));
+        assert!(base64_text.contains("Encoding: base64"));
         assert!(base64_text.contains("content: 4000 encoded characters"));
         assert!(!base64_text.contains(&"A".repeat(200)));
 
