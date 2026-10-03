@@ -31,6 +31,10 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Request exposure and protocol recognition need distinct tool projections"
+)]
 pub(crate) async fn consume_provider_streaming_response(
     model_provider: &dyn ModelProvider,
     messages: &[ChatMessage],

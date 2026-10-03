@@ -571,11 +571,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(returned_schemas(&result).len(), 2);
-        let guard = activated.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(guard.is_builtin_schema_exposed("calendar"));
-        assert!(guard.is_builtin_schema_exposed("weather"));
-        assert!(guard.tool_specs().is_empty());
-        drop(guard);
+        {
+            let guard = activated.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.is_builtin_schema_exposed("calendar"));
+            assert!(guard.is_builtin_schema_exposed("weather"));
+            assert!(guard.tool_specs().is_empty());
+        }
         assert!(tool.deferred_prompt_section().is_empty());
         let result = tool
             .execute(serde_json::json!({"query": "select:weather"}))
@@ -612,12 +613,13 @@ mod tests {
         assert_eq!(schemas.len(), 2);
         assert_eq!(schemas[0]["name"], "calendar");
         assert_eq!(schemas[1]["name"], "remote__calendar");
-        let guard = activated.lock().unwrap();
-        assert!(guard.is_builtin_schema_exposed("calendar"));
-        assert!(!guard.is_builtin_schema_exposed("weather"));
-        assert!(guard.is_activated("remote__calendar"));
-        assert_eq!(guard.tool_names(), vec!["remote__calendar"]);
-        drop(guard);
+        {
+            let guard = activated.lock().unwrap();
+            assert!(guard.is_builtin_schema_exposed("calendar"));
+            assert!(!guard.is_builtin_schema_exposed("weather"));
+            assert!(guard.is_activated("remote__calendar"));
+            assert_eq!(guard.tool_names(), vec!["remote__calendar"]);
+        }
         assert_eq!(seen.lock().unwrap().as_slice(), ["remote__calendar"]);
 
         let result = tool
