@@ -770,3 +770,8 @@ zc-config-section-peer-groups-help = Named groups that bind a channel, member ag
 zc-config-section-cron-help = Scheduled tasks that bind a schedule to a prompt, channel, and target.
 zc-config-section-tunnel-help = Optionally expose the gateway through Cloudflare or ngrok, or keep it local only.
 zc-config-section-onboard-state-help = Quickstart lifecycle state and its legacy per-section completion ledger.
+
+zc-chat-tool-write-overwrite = Overwrote existing file
+zc-chat-tool-write-diff = Changes · temporary local view
+zc-chat-tool-write-preview-unavailable = Content preview · diff unavailable
+zc-chat-tool-write-unchanged = Content unchanged
