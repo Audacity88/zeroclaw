@@ -853,6 +853,16 @@ impl App {
 
         let hint = match &self.screen {
             Screen::AliasList { .. }
+                if self.zeroclaw_pane == ZeroclawPane::Detail && self.alias_add_selected() =>
+            {
+                format!(
+                    " {}={}  ?={}",
+                    tab_key(T::Enter),
+                    crate::i18n::t("zc-config-footer-action-add"),
+                    crate::i18n::t("zc-config-footer-action-help"),
+                )
+            }
+            Screen::AliasList { .. }
                 if self.zeroclaw_pane == ZeroclawPane::Detail
                     && self.provider_alias_rename_available()
                     && self.filter.is_none() =>
@@ -1329,7 +1339,10 @@ impl App {
                 }
 
                 // List area click.
-                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area)
+                    && mouse.column > self.last_main_area.x
+                    && mouse.column < self.last_main_area.right().saturating_sub(1)
+                {
                     let count = self.visible_count();
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
@@ -1337,6 +1350,7 @@ impl App {
                         self.last_list_offset,
                         count,
                     ) {
+                        self.zeroclaw_pane = ZeroclawPane::Detail;
                         let is_double = self.double_click.click(mouse.column, mouse.row);
                         self.set_visible_cursor(pos);
                         if is_double {
@@ -1727,16 +1741,7 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.alias_list_has_tabs() && self.alias_tab == 1 {
-                    if self.cost_cursor < self.cost_resources.len() {
-                        let idx = self.cost_cursor;
-                        self.enter_cost_resource(idx).await?;
-                    }
-                } else if self.alias_cursor < self.aliases.len() {
-                    let idx = self.alias_cursor;
-                    self.enter_alias(idx).await?;
-                }
-                // If on [+ Add], double-click does nothing — use keyboard.
+                self.activate_alias_list().await?;
             }
             Screen::AliasCreate { .. } | Screen::AliasRename { .. } => {}
             Screen::FieldList { .. } => {
@@ -2555,7 +2560,6 @@ impl App {
             FilterAction::Passthrough => {}
         }
 
-        let add_pos = visible.len(); // position of [+ Add] in the rendered list
         let action = ConfigTabAction::from_chord(&key);
         // With tabs, TabLeft is consumed for tab switching while alias_tab > 0;
         // it only reaches here on the leftmost tab, where it walks out like Back.
@@ -2614,24 +2618,7 @@ impl App {
                 }
             }
             _ if into => {
-                if has_add && self.alias_cursor == add_pos {
-                    if let Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb,
-                        ..
-                    } = &self.screen
-                    {
-                        self.edit_buf.clear();
-                        self.screen = Screen::AliasCreate {
-                            section_idx: *section_idx,
-                            map_path: map_path.clone(),
-                            breadcrumb: breadcrumb.clone(),
-                        };
-                    }
-                } else if self.alias_cursor < self.aliases.len() {
-                    self.enter_alias(self.alias_cursor).await?;
-                }
+                self.activate_alias_list().await?;
             }
             Some(ConfigTabAction::ToggleSecret) if self.alias_cursor < self.aliases.len() => {
                 if let Screen::AliasList { map_path, .. } = &self.screen {
@@ -2658,6 +2645,58 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn alias_add_selected(&self) -> bool {
+        if self.alias_list_has_tabs() && self.alias_tab == 1 {
+            self.cost_cursor == self.cost_resources.len()
+        } else {
+            self.filter.is_none() && self.alias_cursor == self.aliases.len()
+        }
+    }
+
+    /// Keyboard and mouse activation share the same Add and open behavior.
+    async fn activate_alias_list(&mut self) -> Result<()> {
+        if self.alias_add_selected() {
+            if let Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            } = &self.screen
+            {
+                let mut map_path = map_path.clone();
+                let mut breadcrumb = breadcrumb.clone();
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    let Some(base) = self.cost_base_path() else {
+                        return Ok(());
+                    };
+                    map_path = base;
+                    breadcrumb.push(ConfigTab::Costs.label().to_string());
+                }
+                self.edit_buf.clear();
+                self.screen = Screen::AliasCreate {
+                    section_idx: *section_idx,
+                    map_path,
+                    breadcrumb,
+                };
+            }
+        } else if self.alias_list_has_tabs() && self.alias_tab == 1 {
+            if self.cost_cursor < self.cost_resources.len() {
+                self.enter_cost_resource(self.cost_cursor).await?;
+            }
+        } else {
+            let visible = self.filtered_indices(&self.aliases);
+            let cursor = if self.filter.is_some() {
+                self.filter_cursor
+            } else {
+                self.alias_cursor
+            };
+            if let Some(&idx) = visible.get(cursor) {
+                self.deactivate_filter();
+                self.enter_alias(idx).await?;
+            }
         }
         Ok(())
     }
@@ -2696,25 +2735,7 @@ impl App {
                 self.cost_cursor += 1;
             }
             Some(ConfigTabAction::Enter) => {
-                if self.cost_cursor == add_pos {
-                    if let Screen::AliasList {
-                        section_idx,
-                        breadcrumb,
-                        ..
-                    } = &self.screen
-                    {
-                        self.edit_buf.clear();
-                        let mut bc = breadcrumb.clone();
-                        bc.push(ConfigTab::Costs.label().to_string());
-                        self.screen = Screen::AliasCreate {
-                            section_idx: *section_idx,
-                            map_path: base,
-                            breadcrumb: bc,
-                        };
-                    }
-                } else if self.cost_cursor < self.cost_resources.len() {
-                    self.enter_cost_resource(self.cost_cursor).await?;
-                }
+                self.activate_alias_list().await?;
             }
             Some(ConfigTabAction::DeleteRow | ConfigTabAction::ToggleSecret)
                 if self.cost_cursor < self.cost_resources.len() =>
@@ -6875,6 +6896,253 @@ mod tests {
             .unwrap()
             .draw(|frame| manager.draw_into(frame, frame.area()))
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_detail_row_click_routes_keyboard_to_the_list() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for screen in 0..3 {
+            let (mut manager, _outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            match screen {
+                0 => {
+                    manager.screen = Screen::TypeList { section_idx: 0 };
+                    manager.types = vec![
+                        ConfigTemplateEntry {
+                            path: "providers.models.openai".into(),
+                        },
+                        ConfigTemplateEntry {
+                            path: "providers.models.anthropic".into(),
+                        },
+                    ];
+                }
+                1 => {}
+                _ => {
+                    manager.screen = Screen::FieldList {
+                        section_idx: 0,
+                        prefix: "providers.models.openai.old".into(),
+                        breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+                    };
+                    manager.fields = vec![
+                        field("providers.models.openai.old.model"),
+                        field("providers.models.openai.old.api_url"),
+                    ];
+                }
+            }
+            manager.zeroclaw_pane = ZeroclawPane::Sections;
+            render_config_for_mouse(&mut manager);
+            let area = manager.last_main_area;
+            let click = |row| MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: area.x + 3,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            for row in [area.y, area.y + 8] {
+                manager
+                    .handle_mouse(click(row), Rect::default(), &mut term)
+                    .await
+                    .unwrap();
+                assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+            }
+            for column in [area.x, area.right() - 1] {
+                for _ in 0..2 {
+                    manager
+                        .handle_mouse(
+                            MouseEvent {
+                                column,
+                                ..click(area.y + 1)
+                            },
+                            Rect::default(),
+                            &mut term,
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+                assert_eq!(manager.visible_cursor(), 0);
+                assert!(rx.try_recv().is_err());
+            }
+            manager
+                .handle_mouse(click(area.y + 1), Rect::default(), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+            config_key(&mut manager, &mut term, KeyCode::Down).await;
+            assert_eq!(manager.visible_cursor(), 1);
+            assert_eq!(manager.section_cursor, 0);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_add_mouse_and_keyboard_open_without_mutation() {
+        use crate::keymap::Chord;
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row("config_tab", "enter", vec![Chord::key(KeyCode::F(6))]);
+        for costs in [false, true] {
+            for count in [0, 2] {
+                for keyboard in [false, true] {
+                    let (mut manager, outbound, mut rx, mut term) =
+                        alias_rename_manager("providers.tts", "openai");
+                    manager.aliases.truncate(count);
+                    if costs {
+                        manager.sections[0].cost_category = "tts".into();
+                        manager.alias_tab = 1;
+                        manager.cost_resources = manager.aliases.clone();
+                    }
+                    manager.zeroclaw_pane = ZeroclawPane::Sections;
+                    render_config_for_mouse(&mut manager);
+                    let area = manager.last_main_area;
+                    let click = MouseEvent {
+                        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                        column: area.x + 3,
+                        row: area.y + 1 + count as u16,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    for column in [area.x, area.right() - 1] {
+                        for _ in 0..2 {
+                            manager
+                                .handle_mouse(
+                                    MouseEvent { column, ..click },
+                                    Rect::default(),
+                                    &mut term,
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+                        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+                        assert!(rx.try_recv().is_err());
+                    }
+                    manager
+                        .handle_mouse(click, Rect::default(), &mut term)
+                        .await
+                        .unwrap();
+                    assert!(matches!(manager.screen, Screen::AliasList { .. }));
+                    assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+                    assert!(manager.bottom_hint().contains("F6"));
+                    assert!(
+                        manager
+                            .bottom_hint()
+                            .contains(&crate::i18n::t("zc-config-footer-action-add"))
+                    );
+                    assert!(rx.try_recv().is_err());
+                    if keyboard {
+                        config_key(&mut manager, &mut term, KeyCode::F(6)).await;
+                    } else {
+                        manager
+                            .handle_mouse(click, Rect::default(), &mut term)
+                            .await
+                            .unwrap();
+                    }
+                    let expected_path = if costs {
+                        "cost.rates.providers.tts.openai"
+                    } else {
+                        "providers.tts.openai"
+                    };
+                    let Screen::AliasCreate {
+                        map_path,
+                        breadcrumb,
+                        ..
+                    } = &manager.screen
+                    else {
+                        panic!("Add must open the name form");
+                    };
+                    assert_eq!(map_path, expected_path);
+                    assert_eq!(breadcrumb.len(), if costs { 3 } else { 2 });
+                    if costs {
+                        assert_eq!(breadcrumb.last().unwrap(), ConfigTab::Costs.label());
+                    }
+                    assert!(manager.edit_buf.is_empty());
+                    manager.handle_paste("unsaved");
+                    assert!(rx.try_recv().is_err());
+                    let replies = async {
+                        answer_config_request(
+                            &outbound,
+                            &mut rx,
+                            "config/map-keys",
+                            serde_json::json!({"path": "providers.tts.openai"}),
+                            Ok(serde_json::json!({"keys": []})),
+                        )
+                        .await;
+                        if costs {
+                            answer_config_request(
+                                &outbound,
+                                &mut rx,
+                                "config/map-keys",
+                                serde_json::json!({"path": expected_path}),
+                                Ok(serde_json::json!({"keys": []})),
+                            )
+                            .await;
+                        }
+                    };
+                    let ((), ()) =
+                        tokio::join!(config_key(&mut manager, &mut term, KeyCode::Esc), replies);
+                    assert!(matches!(manager.screen, Screen::AliasList { .. }));
+                    assert_eq!(manager.alias_tab, usize::from(costs));
+                    assert!(rx.try_recv().is_err());
+                }
+            }
+        }
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_filtered_mouse_click_opens_the_visible_alias() {
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        manager.filter = Some("no-match".into());
+        manager.zeroclaw_pane = ZeroclawPane::Sections;
+        render_config_for_mouse(&mut manager);
+        let area = manager.last_main_area;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x + 3,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..2 {
+            manager
+                .handle_mouse(click, Rect::default(), &mut term)
+                .await
+                .unwrap();
+        }
+        assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(rx.try_recv().is_err());
+        manager.filter = Some("other".into());
+        render_config_for_mouse(&mut manager);
+        manager
+            .handle_mouse(click, Rect::default(), &mut term)
+            .await
+            .unwrap();
+        let reply = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix": "providers.models.openai.other"}),
+            Ok(serde_json::json!({"entries": []})),
+        );
+        let (result, ()) = tokio::join!(
+            manager.handle_mouse(click, Rect::default(), &mut term),
+            reply
+        );
+        result.unwrap();
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix, .. } if prefix == "providers.models.openai.other")
+        );
+        assert!(manager.filter.is_none());
+        assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
