@@ -128,8 +128,10 @@ fn agent_for_with_steering(
         vec![Box::new(tool)],
     );
     if let Some(pacing) = pacing {
-        let mut config = Config::default();
-        config.pacing = pacing;
+        let config = Config {
+            pacing,
+            ..Config::default()
+        };
         agent.provider_switch_config = Some(ProviderSwitchConfig {
             config: Some(Arc::new(config)),
             ..ProviderSwitchConfig::default()
