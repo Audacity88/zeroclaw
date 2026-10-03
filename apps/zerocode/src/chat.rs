@@ -6724,6 +6724,36 @@ fn bounded_tool_output(raw_output: String) -> String {
     }
 }
 
+fn file_write_result_summary(result: &str, input_json: &str) -> Option<String> {
+    // Saved results are prose. Recognize only the recorded evidence grammar;
+    // unknown output stays intact and input never supplies missing provenance.
+    let (bytes, rest) = result.strip_prefix("Written ")?.split_once(" bytes to ")?;
+    let input = serde_json::from_str::<serde_json::Value>(input_json).ok()?;
+    let path = input.get("path")?.as_str()?;
+    let before_write = rest
+        .strip_prefix(path)?
+        .strip_prefix(". Before write: ")?
+        .strip_suffix(". Content diff unavailable; previous contents were not retained.")?;
+    let bytes = bytes.parse::<u64>().ok()?.to_string();
+    if before_write == "file absent" {
+        Some(crate::i18n::t_args(
+            "zc-chat-tool-write-result-absent",
+            &[("bytes", &bytes)],
+        ))
+    } else {
+        let previous_bytes = before_write
+            .strip_prefix("existing file, ")?
+            .strip_suffix(" bytes")?
+            .parse::<u64>()
+            .ok()?
+            .to_string();
+        Some(crate::i18n::t_args(
+            "zc-chat-tool-write-result-existing",
+            &[("bytes", &bytes), ("previous_bytes", &previous_bytes)],
+        ))
+    }
+}
+
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -6926,6 +6956,12 @@ fn render_tool_entry(
     }
 
     if let Some(res) = result {
+        let summary = if name == "file_write" {
+            file_write_result_summary(res, input_json)
+        } else {
+            None
+        };
+        let res = summary.as_deref().unwrap_or(res);
         if name == "file_write" && disclosure.is_open() {
             lines.push(Line::default());
         }
@@ -24656,6 +24692,82 @@ mod tests {
         assert!(!full_text.contains(&write_input));
         assert!(full_text.find("line 9").unwrap() < full_text.find("[Show less]").unwrap());
         assert!(full_text.find("[Show less]").unwrap() < full_text.find("result: first").unwrap());
+    }
+
+    #[test]
+    fn recorded_file_write_results_are_compact_without_rewriting_history() {
+        let path = "demo. Before write: file absent.txt";
+        let input = serde_json::json!({"path": path, "content": "new"}).to_string();
+        for (evidence, expected) in [
+            ("file absent", "Wrote 56 bytes · file previously absent."),
+            (
+                "existing file, 22 bytes",
+                "Wrote 56 bytes · file previously 22 bytes.",
+            ),
+            (
+                "existing file, 0 bytes",
+                "Wrote 56 bytes · file previously 0 bytes.",
+            ),
+        ] {
+            // A path can itself contain status-like text; only the final evidence counts.
+            let result = format!(
+                "Written 56 bytes to {path}. Before write: {evidence}. Content diff unavailable; previous contents were not retained."
+            );
+            for disclosure in [
+                ToolDisclosure::Collapsed,
+                ToolDisclosure::Preview,
+                ToolDisclosure::Full,
+            ] {
+                let mut lines = Vec::new();
+                render_tool_entry(
+                    &mut lines,
+                    "file_write",
+                    &input,
+                    Some(&result),
+                    false,
+                    disclosure,
+                );
+                let rendered = rendered_text(&lines);
+                assert!(rendered.contains(expected));
+                assert!(!rendered.contains("previous contents were not retained"));
+            }
+            let entry = ChatEntry::Tool {
+                tool_call_id: Arc::from("tc-summary"),
+                name: Arc::from("file_write"),
+                input_json: Arc::from(input.clone()),
+                result: Some(Arc::from(result.clone())),
+            };
+            assert!(clipboard_text(&entry).contains(&result));
+        }
+        for result in ["Written 56 bytes to demo.txt", "Error: write failed"] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "file_write",
+                &input,
+                Some(result),
+                false,
+                ToolDisclosure::Preview,
+            );
+            let rendered = rendered_text(&lines);
+            assert!(rendered.contains(result));
+            assert!(!rendered.contains("file previously"));
+        }
+        let path = "demo.txt. Before write: existing file, 22 bytes. Content diff unavailable; previous contents were not retained.";
+        let input = serde_json::json!({"path": path, "content": "new"}).to_string();
+        let result = format!("Written 56 bytes to {path}");
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "file_write",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let rendered = rendered_text(&lines);
+        assert!(rendered.contains(&result));
+        assert!(!rendered.contains("file previously"));
     }
 
     #[test]
