@@ -24658,7 +24658,8 @@ mod tests {
         assert!(preview_text.contains("line 0"));
         assert!(preview_text.contains("line 5"));
         assert!(preview_text.contains("Content preview · not a diff"));
-        assert!(!preview_text.contains("| + "));
+        assert!(preview_text.contains("  1 + line 0"));
+        assert!(!preview_text.contains("1 | "));
         assert!(!preview_text.contains("line 6"));
         assert!(preview_text.contains("4 more lines"));
         assert!(!preview_text.contains(&write_input));
@@ -24685,7 +24686,8 @@ mod tests {
         );
         let full_text = rendered_text(&full_lines);
         assert!(full_text.contains("line 9"));
-        assert!(!full_text.contains("| + "));
+        assert!(full_text.contains("  10 + line 9"));
+        assert!(full_text.contains("Content preview · not a diff"));
         assert!(full_text.contains("first"));
         assert!(full_text.contains(&"result".repeat(60)));
         assert!(full_text.contains("[Show less]"));
