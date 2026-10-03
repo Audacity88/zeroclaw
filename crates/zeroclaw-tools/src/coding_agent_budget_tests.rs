@@ -62,10 +62,7 @@ fn wrapped_tool<T: Tool + 'static>(inner: T, security: Arc<SecurityPolicy>) -> B
 
 #[cfg(unix)]
 fn link_successful_tmux(path: &Path) {
-    let executable = ["/usr/bin/true", "/bin/true"]
-        .into_iter()
-        .find(|candidate| Path::new(candidate).is_file())
-        .expect("installed true executable");
+    let executable = which::which("true").expect("installed true executable");
     std::os::unix::fs::symlink(executable, path).expect("link tmux fixture");
 }
 
