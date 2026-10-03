@@ -406,14 +406,10 @@ pub(super) async fn run_shell_command(
             group_guard.disarm();
             let (stdout_capture, stderr_capture) =
                 tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
-            let mut stdout = decode_capture(&stdout_capture);
-            let mut stderr = decode_capture(&stderr_capture);
-            if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
-                append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
-            }
-            if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
-                append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
-            }
+            let stdout =
+                decode_capture_with_marker(&stdout_capture, "\n... [output truncated at 1MB]");
+            let stderr =
+                decode_capture_with_marker(&stderr_capture, "\n... [stderr truncated at 1MB]");
             return ToolResult {
                 success: status.success(),
                 output: stdout.into(),
@@ -435,14 +431,15 @@ pub(super) async fn run_shell_command(
     let _ = tokio::time::timeout(CHILD_CLEANUP_TIMEOUT, child.wait()).await;
     let (stdout_capture, stderr_capture) =
         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
-    let stderr = decode_capture(&stderr_capture);
+    let stdout = decode_capture_with_marker(&stdout_capture, "\n... [output truncated at 1MB]");
+    let stderr = decode_capture_with_marker(&stderr_capture, "\n... [stderr truncated at 1MB]");
     if !stderr.is_empty() {
         error.push('\n');
         error.push_str(&stderr);
     }
     ToolResult {
         success: false,
-        output: decode_capture(&stdout_capture).into(),
+        output: stdout.into(),
         error: Some(error),
     }
 }
@@ -465,6 +462,14 @@ fn decode_capture(capture: &DrainOutput) -> String {
     } else {
         decode_output(&capture.bytes)
     }
+}
+
+fn decode_capture_with_marker(capture: &DrainOutput, marker: &str) -> String {
+    let mut output = decode_capture(capture);
+    if capture.truncated || output.len() > MAX_OUTPUT_BYTES {
+        append_truncation_marker(&mut output, marker);
+    }
+    output
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -1937,6 +1942,23 @@ mod tests {
                 .ends_with("\n... [stderr truncated at 1MB]"),
             "stderr should retain the truncation marker after the drain cap"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_marks_partial_output_truncated_on_timeout() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(
+            "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }'; \
+             awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"y\" }' 1>&2; sleep 10",
+        );
+        let result = run_shell_command(command, 2, 0).await;
+
+        assert!(!result.success);
+        assert!(result.output.ends_with("\n... [output truncated at 1MB]"));
+        let error = result.error.unwrap();
+        assert!(error.contains("Command timed out"));
+        assert!(error.ends_with("\n... [stderr truncated at 1MB]"));
     }
 
     #[cfg(unix)]

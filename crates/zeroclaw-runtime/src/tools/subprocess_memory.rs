@@ -218,6 +218,192 @@ struct ProcessIdentity {
     start_time: u64,
 }
 
+struct NativeMemory {
+    pid: Pid,
+    identity: ProcessIdentity,
+    rss_bytes: u64,
+}
+
+fn resident_memory_with_fallback(
+    pid: Pid,
+    identity: ProcessIdentity,
+    rss_bytes: u64,
+    native_read: impl FnOnce(Pid, ProcessIdentity) -> Result<NativeMemory, &'static str>,
+) -> Result<Option<u64>, &'static str> {
+    if rss_bytes != 0 {
+        return Ok(Some(rss_bytes));
+    }
+    // sysinfo represents both a failed memory read and a successful zero as zero.
+    // The native response supplies current RSS and pins it to the observed identity.
+    let native = native_read(pid, identity)?;
+    if native.pid != pid || native.identity != identity {
+        return Ok(None);
+    }
+    Ok(Some(native.rss_bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn native_resident_memory(
+    pid: Pid,
+    _identity: ProcessIdentity,
+) -> Result<NativeMemory, &'static str> {
+    // SAFETY: proc_taskallinfo contains only integer fields and arrays of integers.
+    let mut info: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+    // SAFETY: info is writable for exactly size bytes. Read identity and RSS together.
+    let returned = unsafe {
+        libc::proc_pidinfo(
+            pid.as_u32() as libc::c_int,
+            libc::PROC_PIDTASKALLINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    macos_memory_response(&info, returned)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_memory_response(
+    info: &libc::proc_taskallinfo,
+    returned: libc::c_int,
+) -> Result<NativeMemory, &'static str> {
+    if returned != std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int {
+        return Err("native resident memory read failed or was incomplete");
+    }
+    Ok(NativeMemory {
+        pid: Pid::from_u32(info.pbsd.pbi_pid),
+        identity: ProcessIdentity {
+            parent: (info.pbsd.pbi_ppid != 0).then(|| Pid::from_u32(info.pbsd.pbi_ppid)),
+            start_time: info.pbsd.pbi_start_tvsec,
+        },
+        rss_bytes: info.ptinfo.pti_resident_size,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_resident_memory(
+    pid: Pid,
+    _identity: ProcessIdentity,
+) -> Result<NativeMemory, &'static str> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.as_u32()))
+        .map_err(|_| "native resident memory read failed")?;
+    // SAFETY: sysconf only queries these process-independent numeric system constants.
+    let (page_size, clock_ticks) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PAGESIZE),
+            libc::sysconf(libc::_SC_CLK_TCK),
+        )
+    };
+    if page_size <= 0 || clock_ticks <= 0 {
+        return Err("native resident memory units are not observable");
+    }
+    linux_memory_response(
+        &stat,
+        page_size as u64,
+        clock_ticks as u64,
+        System::boot_time(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_memory_response(
+    stat: &str,
+    page_size: u64,
+    clock_ticks: u64,
+    boot_time: u64,
+) -> Result<NativeMemory, &'static str> {
+    let invalid = "native resident memory read failed or was incomplete";
+    if page_size == 0 || clock_ticks == 0 {
+        return Err(invalid);
+    }
+    let (pid, comm_and_fields) = stat.split_once(" (").ok_or(invalid)?;
+    // comm may itself contain spaces and parentheses; numeric fields follow its last ')'.
+    let (_, fields) = comm_and_fields.rsplit_once(") ").ok_or(invalid)?;
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    // Only fields through RSS are needed; older kernels omit later additions.
+    if !stat.ends_with('\n') || fields.len() < 22 || fields[0].len() != 1 {
+        return Err(invalid);
+    }
+    let pid = pid.parse::<u32>().map_err(|_| invalid)?;
+    let parent = fields[1].parse::<u32>().map_err(|_| invalid)?;
+    let start_ticks = fields[19].parse::<u64>().map_err(|_| invalid)?;
+    let rss_pages = fields[21].parse::<u64>().map_err(|_| invalid)?;
+    Ok(NativeMemory {
+        pid: Pid::from_u32(pid),
+        identity: ProcessIdentity {
+            parent: (parent != 0).then(|| Pid::from_u32(parent)),
+            // Match sysinfo's whole-second process start time conversion.
+            start_time: (start_ticks / clock_ticks).saturating_add(boot_time),
+        },
+        rss_bytes: rss_pages.checked_mul(page_size).ok_or(invalid)?,
+    })
+}
+
+#[cfg(windows)]
+fn native_resident_memory(
+    pid: Pid,
+    identity: ProcessIdentity,
+) -> Result<NativeMemory, &'static str> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    // SAFETY: open a query-only handle, then use that same process object for both reads.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            pid.as_u32(),
+        )
+    }
+    .map_err(|_| "native resident memory query handle is not observable")?;
+    let result = (|| {
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: all output pointers are writable FILETIMEs and handle remains open.
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .map_err(|_| "native process identity is not observable")?;
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut memory = PROCESS_MEMORY_COUNTERS {
+            cb: size,
+            ..Default::default()
+        };
+        // SAFETY: memory is writable for size bytes and refers to the same live handle.
+        unsafe { GetProcessMemoryInfo(handle, &mut memory, size) }
+            .map_err(|_| "native resident memory read failed")?;
+        let creation_ticks =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        let start_time = (creation_ticks / 10_000_000)
+            .checked_sub(11_644_473_600)
+            .ok_or("native process identity is not observable")?;
+        Ok(NativeMemory {
+            pid,
+            identity: ProcessIdentity {
+                // Parent was checked in the refreshed snapshot; creation pins this handle.
+                parent: identity.parent,
+                start_time,
+            },
+            rss_bytes: memory.WorkingSetSize as u64,
+        })
+    })();
+    // SAFETY: every successful OpenProcess above reaches this close, including failed reads.
+    unsafe { CloseHandle(handle) }.map_err(|_| "native memory query handle close failed")?;
+    result
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn native_resident_memory(
+    _pid: Pid,
+    _identity: ProcessIdentity,
+) -> Result<NativeMemory, &'static str> {
+    Err("native resident memory is not supported on this platform")
+}
+
 fn sample_memory(
     root: Pid,
     root_start_time: Option<u64>,
@@ -285,9 +471,6 @@ fn sample_memory(
     if root_process.start_time() != start_time {
         return Err("owned root identity changed");
     }
-    if root_process.memory() == 0 {
-        return Err("owned root resident memory is not observable");
-    }
     let mut rss_bytes = 0_u64;
     let mut pending = vec![root];
     let mut counted = HashSet::new();
@@ -312,10 +495,21 @@ fn sample_memory(
             }
             continue;
         }
-        if process.memory() == 0 && process.status() != ProcessStatus::Zombie {
-            return Err("descendant resident memory is not observable");
-        }
-        rss_bytes = rss_bytes.saturating_add(process.memory());
+        let memory = if pid != root
+            && process.memory() == 0
+            && process.status() == ProcessStatus::Zombie
+        {
+            Some(0)
+        } else {
+            resident_memory_with_fallback(pid, *identity, process.memory(), native_resident_memory)?
+        };
+        let Some(memory) = memory else {
+            if pid == root {
+                return Err("owned root identity changed");
+            }
+            continue;
+        };
+        rss_bytes = rss_bytes.saturating_add(memory);
         // An unchanged descendant is eligible only through unchanged, visible parents.
         if let Some(descendants) = children.get(&pid) {
             pending.extend(descendants);
@@ -334,6 +528,149 @@ mod tests {
     const FIXTURE_TEST: &str = "tools::subprocess_memory::tests::memory_fixture";
     // Bound aggregate test-host pressure even when the surrounding suite runs in parallel.
     static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn successful_native_read_accepts_zero_and_positive_resident_memory() {
+        let pid = Pid::from_u32(42);
+        let identity = ProcessIdentity {
+            parent: Some(Pid::from_u32(7)),
+            start_time: 100,
+        };
+        for rss_bytes in [0, 4096] {
+            assert_eq!(
+                resident_memory_with_fallback(pid, identity, 0, |queried, expected| {
+                    assert_eq!(queried, pid);
+                    assert!(expected == identity);
+                    Ok(NativeMemory {
+                        pid,
+                        identity,
+                        rss_bytes,
+                    })
+                }),
+                Ok(Some(rss_bytes))
+            );
+        }
+    }
+
+    #[test]
+    fn failed_native_read_does_not_accept_sysinfo_zero() {
+        let identity = ProcessIdentity {
+            parent: None,
+            start_time: 100,
+        };
+        assert_eq!(
+            resident_memory_with_fallback(Pid::from_u32(42), identity, 0, |_, _| {
+                Err("native resident memory read failed")
+            }),
+            Err("native resident memory read failed")
+        );
+    }
+
+    #[test]
+    fn native_identity_mismatch_is_not_counted() {
+        let pid = Pid::from_u32(42);
+        let identity = ProcessIdentity {
+            parent: Some(Pid::from_u32(7)),
+            start_time: 100,
+        };
+        for native in [
+            NativeMemory {
+                pid: Pid::from_u32(43),
+                identity,
+                rss_bytes: 4096,
+            },
+            NativeMemory {
+                pid,
+                identity: ProcessIdentity {
+                    parent: Some(Pid::from_u32(8)),
+                    ..identity
+                },
+                rss_bytes: 4096,
+            },
+            NativeMemory {
+                pid,
+                identity: ProcessIdentity {
+                    start_time: 101,
+                    ..identity
+                },
+                rss_bytes: 4096,
+            },
+        ] {
+            assert_eq!(
+                resident_memory_with_fallback(pid, identity, 0, |_, _| Ok(native)),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn positive_sysinfo_resident_memory_bypasses_native_read() {
+        let identity = ProcessIdentity {
+            parent: None,
+            start_time: 100,
+        };
+        assert_eq!(
+            resident_memory_with_fallback(Pid::from_u32(42), identity, 4096, |_, _| {
+                panic!("positive sysinfo RSS must bypass the native read")
+            }),
+            Ok(Some(4096))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_response_requires_the_complete_record() {
+        // SAFETY: proc_taskallinfo contains only integer fields and arrays of integers.
+        let mut info: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
+        info.pbsd.pbi_pid = 42;
+        info.pbsd.pbi_ppid = 7;
+        info.pbsd.pbi_start_tvsec = 100;
+        let size = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+        for returned in [-1, 0, size - 1] {
+            assert!(macos_memory_response(&info, returned).is_err());
+        }
+        let memory = macos_memory_response(&info, size).unwrap();
+        assert_eq!(memory.pid, Pid::from_u32(42));
+        assert_eq!(memory.identity.parent, Some(Pid::from_u32(7)));
+        assert_eq!(memory.identity.start_time, 100);
+        assert_eq!(memory.rss_bytes, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_native_response_checks_complete_stat_and_memory_units() {
+        let mut fields = vec!["0"; 50];
+        fields[0] = "S";
+        fields[1] = "7";
+        fields[19] = "1099";
+        let stat = format!("42 (a name ) with (parentheses)) {}\n", fields.join(" "));
+        let memory = linux_memory_response(&stat, 4096, 100, 90).unwrap();
+        assert_eq!(memory.pid, Pid::from_u32(42));
+        assert_eq!(memory.identity.parent, Some(Pid::from_u32(7)));
+        assert_eq!(memory.identity.start_time, 100);
+        assert_eq!(memory.rss_bytes, 0);
+        fields[21] = "2";
+        let stat = format!("42 (name) {}\n", fields.join(" "));
+        assert_eq!(
+            linux_memory_response(&stat, 4096, 100, 90)
+                .unwrap()
+                .rss_bytes,
+            8192
+        );
+        let short_stat = format!("42 (name) {}\n", fields[..22].join(" "));
+        assert_eq!(
+            linux_memory_response(&short_stat, 4096, 100, 90)
+                .unwrap()
+                .rss_bytes,
+            8192
+        );
+        assert!(linux_memory_response(stat.trim_end(), 4096, 100, 90).is_err());
+        assert!(linux_memory_response("42 (name) S 7\n", 4096, 100, 90).is_err());
+        assert!(linux_memory_response(&stat, 4096, 0, 90).is_err());
+        fields[21] = "-1";
+        let stat = format!("42 (name) {}\n", fields.join(" "));
+        assert!(linux_memory_response(&stat, 4096, 100, 90).is_err());
+    }
 
     fn fixture_command(case: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
