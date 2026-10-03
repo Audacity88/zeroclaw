@@ -203,18 +203,20 @@ pub(crate) fn prepare_existing_sqlite_storage(
         Err(error) => return Err(error.into()),
     };
     let memory_dir = storage_root.join("memory");
+    let db_path = memory_dir.join(database_name);
+    match std::fs::symlink_metadata(&db_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
     match std::fs::symlink_metadata(&memory_dir) {
         Ok(_) => admit_existing_owner_only_dir(&memory_dir)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     }
 
-    let db_path = memory_dir.join(database_name);
-    match std::fs::symlink_metadata(&db_path) {
-        Ok(_) => check_sqlite_storage(&db_path)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
+    check_sqlite_storage(&db_path)?;
     Ok(Some(db_path))
 }
 
@@ -439,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_sqlite_storage_does_not_create_missing_entries() {
+    fn existing_sqlite_storage_does_not_create_or_tighten_missing_entries() {
         let root = TempDir::new().unwrap();
         let memory_dir = root.path().join("memory");
 
@@ -450,11 +452,13 @@ mod tests {
         assert!(!memory_dir.exists());
 
         std::fs::create_dir(&memory_dir).unwrap();
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             prepare_existing_sqlite_storage(root.path(), "audit.db").unwrap(),
             None
         );
         assert!(!memory_dir.join("audit.db").exists());
+        assert_eq!(mode(&memory_dir), 0o755);
     }
 
     #[test]
