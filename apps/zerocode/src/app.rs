@@ -1428,8 +1428,8 @@ const MODES: &[Mode] = &[
     Mode::Chat,
     Mode::Logs,
     Mode::Doctor,
-    Mode::Quickstart,
     Mode::Sop,
+    Mode::Quickstart,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -1760,7 +1760,7 @@ pub async fn run(
     let mut content_area = Rect::default();
     let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
     let mut dock = ConversationDock::from_config_dir(config_dir);
-    // Where Esc from the (sidebar-launched) Quickstart wizard returns to.
+    // Where Esc from the mode-bar Quickstart wizard returns to.
     let mut quickstart_return = Mode::Dashboard;
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut reconnect_attempt: Option<ReconnectAttempt<(RpcClient, crate::ActiveLeg)>> = None;
@@ -1854,8 +1854,7 @@ pub async fn run(
     // Route one sidebar event: switch to the owning pane's mode and call
     // into it. A macro (like `build_panes!`) because the routing needs the
     // same pile of `&mut` locals. Session-touching events are gated on a
-    // live connection; the Quickstart launcher works offline like the mode
-    // bar always has.
+    // live connection; Quickstart remains a mode-bar destination.
     macro_rules! apply_sidebar_event {
         ($event:expr, $dispatch_state:expr) => {{
             let connected = $dispatch_state.rpc_allowed();
@@ -1943,20 +1942,6 @@ pub async fn run(
                             acp_pane.add_agent_session(&alias).await;
                         }
                     }
-                }
-                crate::agent_sidebar::SidebarEvent::OpenQuickstart if mode != Mode::Quickstart => {
-                    remember_quickstart_return(mode, Mode::Quickstart, &mut quickstart_return);
-                    switch_mode(
-                        &mut mode,
-                        Mode::Quickstart,
-                        &$dispatch_state,
-                        &mut dashboard_pane,
-                        &mut quickstart,
-                        &mut acp_pane,
-                        &mut chat_pane,
-                        &mut sop_pane,
-                    )
-                    .await;
                 }
                 _ => {}
             }
@@ -2070,10 +2055,15 @@ pub async fn run(
             theme::set_active(t);
         }
 
-        // Sidebar rows: Code group first, then Chat, matching the mode bar
-        // order. Derived fresh each frame — the panes own the state.
-        let mut sidebar_rows = acp_pane.session_summaries();
-        sidebar_rows.extend(chat_pane.session_summaries());
+        // Session rows belong to the active conversation pane.
+        let sidebar_rows = match mode {
+            Mode::Acp => acp_pane.session_summaries(),
+            Mode::Chat => chat_pane.session_summaries(),
+            _ => Vec::new(),
+        };
+        if !matches!(mode, Mode::Acp | Mode::Chat) {
+            sidebar.close_picker();
+        }
         let plan_visible = match mode {
             Mode::Acp => acp_pane.plan_visible(),
             Mode::Chat => chat_pane.plan_visible(),
@@ -2086,7 +2076,6 @@ pub async fn run(
                 Mode::Chat => Some(chat::PaneKind::Chat),
                 _ => None,
             },
-            quickstart_active: mode == Mode::Quickstart,
             connected: !matches!(conn_state, ConnectionState::Disconnected { .. }),
         };
 
@@ -4435,7 +4424,6 @@ mod tests {
                     }],
                     &crate::agent_sidebar::SidebarCtx {
                         active_pane: Some(chat::PaneKind::Chat),
-                        quickstart_active: false,
                         connected: true,
                     },
                 );
@@ -4693,7 +4681,6 @@ mod tests {
                     &[],
                     &crate::agent_sidebar::SidebarCtx {
                         active_pane: Some(chat::PaneKind::Chat),
-                        quickstart_active: false,
                         connected: true,
                     },
                 )
@@ -5741,13 +5728,14 @@ mod tests {
     }
 
     #[test]
-    fn mode_cycle_includes_quickstart_and_wraps() {
-        let quickstart = MODES
-            .iter()
-            .position(|mode| *mode == Mode::Quickstart)
-            .expect("Quickstart stays in keyboard navigation");
-        assert_eq!(Mode::Quickstart.cycle(1), MODES[quickstart + 1]);
-        assert_eq!(Mode::Quickstart.cycle(-1), MODES[quickstart - 1]);
+    fn quickstart_is_the_final_mode_bar_tab() {
+        assert_eq!(MODES.last(), Some(&Mode::Quickstart));
+    }
+
+    #[test]
+    fn cycle_from_quickstart_wraps_to_mode_bar_edges() {
+        assert_eq!(Mode::Quickstart.cycle(1), MODES[0]);
+        assert_eq!(Mode::Quickstart.cycle(-1), MODES[MODES.len() - 2]);
         assert_eq!(MODES[0].cycle(1), MODES[1]);
         assert_eq!(MODES[0].cycle(-1), MODES[MODES.len() - 1]);
     }

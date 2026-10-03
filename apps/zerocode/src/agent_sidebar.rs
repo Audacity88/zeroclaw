@@ -1,6 +1,4 @@
-//! Shell-level agent sidebar: every session the chat-like panes track, with
-//! live status dots, `+`/`-` session controls, and the Quickstart
-//! launcher at the bottom.
+//! Sessions section renderer for the shell-owned conversation dock.
 //!
 //! The sidebar owns only widget state (scroll, hit rects,
 //! picker). Session rows are derived per frame from the panes'
@@ -32,7 +30,6 @@ pub(crate) const CONTENT_MIN_COLS: u16 = 40;
 pub(crate) struct SidebarCtx {
     /// The chat-like pane the current mode maps to, if any.
     pub active_pane: Option<PaneKind>,
-    pub quickstart_active: bool,
     pub connected: bool,
 }
 
@@ -43,7 +40,6 @@ pub(crate) enum SidebarEvent {
     CloseSession { pane: PaneKind, session_id: String },
     OpenPicker,
     PickAgent { pane: PaneKind, alias: String },
-    OpenQuickstart,
 }
 
 /// The `+` agent picker modal.
@@ -141,7 +137,6 @@ pub(crate) struct AgentSidebar {
     /// The focused session in the active pane, captured during the last draw.
     minus_target: Option<(PaneKind, String)>,
     plus_rect: Rect,
-    quickstart_rect: Rect,
     row_rects: Vec<(PaneKind, String, Rect)>,
     row_close_rects: Vec<(PaneKind, String, Rect)>,
     picker: Option<SidebarPicker>,
@@ -158,7 +153,6 @@ impl AgentSidebar {
             minus_rect: Rect::default(),
             minus_target: None,
             plus_rect: Rect::default(),
-            quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
             row_close_rects: Vec::new(),
             picker: None,
@@ -187,7 +181,6 @@ impl AgentSidebar {
         self.minus_rect = Rect::default();
         self.minus_target = None;
         self.plus_rect = Rect::default();
-        self.quickstart_rect = Rect::default();
         self.row_rects.clear();
         self.row_close_rects.clear();
     }
@@ -266,52 +259,24 @@ impl AgentSidebar {
             return;
         }
 
-        // Bottom of the panel: separator + Quickstart launcher row.
-        let quickstart_rows = u16::from(inner.height >= 1) + u16::from(inner.height >= 2);
-        let rows_area = Rect {
-            height: inner.height - quickstart_rows,
-            ..inner
-        };
-
-        self.draw_session_rows(frame, rows_area, rows, ctx);
-
-        if quickstart_rows == 2 {
-            let sep = Rect {
-                y: inner.y + inner.height - 2,
-                height: 1,
-                ..inner
-            };
-            let count_hint = t("zc-sidebar-count-hint");
-            let separator = if !rows.is_empty()
-                && crate::display_width::display_width(&count_hint) <= usize::from(inner.width)
-            {
-                count_hint
-            } else {
-                "\u{2500}".repeat(inner.width as usize)
-            };
-            frame.render_widget(
-                Paragraph::new(Span::styled(separator, theme::dim_style())).centered(),
-                sep,
-            );
-        }
-        if quickstart_rows >= 1 {
-            let qs = Rect {
+        // Explain counts only when the session list leaves a free row.
+        let count_hint = t("zc-sidebar-count-hint");
+        if !rows.is_empty()
+            && rows.len() < usize::from(inner.height)
+            && crate::display_width::display_width(&count_hint) < usize::from(inner.width)
+        {
+            let hint_area = Rect {
                 y: inner.y + inner.height - 1,
                 height: 1,
                 ..inner
             };
-            let style = if ctx.quickstart_active {
-                theme::selected_style()
-            } else {
-                theme::accent_style()
-            };
-            let label = widgets::truncate_to_width(
-                &format!("\u{bb} {}", t("zc-pane-quickstart")),
-                qs.width as usize,
+            frame.render_widget(
+                Paragraph::new(Span::styled(count_hint, theme::dim_style())),
+                hint_area,
             );
-            frame.render_widget(Paragraph::new(Span::styled(label, style)), qs);
-            self.quickstart_rect = qs;
         }
+
+        self.draw_session_rows(frame, inner, rows, ctx);
     }
 
     fn draw_session_rows(
@@ -591,9 +556,6 @@ impl AgentSidebar {
                 if mouse::in_rect(col, row, self.plus_rect) {
                     return Some(SidebarEvent::OpenPicker);
                 }
-                if mouse::in_rect(col, row, self.quickstart_rect) {
-                    return Some(SidebarEvent::OpenQuickstart);
-                }
                 // A per-row `✕` closes that specific session; the rest of
                 // the row only moves focus.
                 for (pane, sid, rect) in &self.row_close_rects {
@@ -710,7 +672,6 @@ mod tests {
             minus_rect: Rect::default(),
             minus_target: None,
             plus_rect: Rect::default(),
-            quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
             row_close_rects: Vec::new(),
             picker: None,
@@ -751,13 +712,12 @@ mod tests {
     }
 
     #[test]
-    fn draw_records_row_controls_and_quickstart_rects() {
+    fn draw_records_row_controls_and_count_hint() {
         let mut s = sidebar();
-        let area = Rect::new(0, 1, 24, 12);
+        let area = Rect::new(0, 1, 40, 12);
         let rows = vec![summary("alpha", "s1", true), summary("beta", "s2", false)];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let backend = ratatui::backend::TestBackend::new(100, 14);
@@ -767,10 +727,11 @@ mod tests {
         assert_eq!(s.row_rects.len(), 2);
         assert!(s.minus_rect.width > 0, "minus affordance recorded");
         assert!(s.plus_rect.width > 0, "plus affordance recorded");
-        assert!(s.quickstart_rect.width > 0, "quickstart row recorded");
         let count_hint_row = Rect {
-            y: s.quickstart_rect.y - 1,
-            ..s.quickstart_rect
+            x: area.x + 1,
+            y: area.bottom() - 2,
+            width: area.width - 2,
+            height: 1,
         };
         assert!(
             rendered_row(term.backend().buffer(), count_hint_row)
@@ -819,10 +780,6 @@ mod tests {
             s.handle_mouse(&click(s.plus_rect.x, s.plus_rect.y)),
             Some(SidebarEvent::OpenPicker)
         );
-        assert_eq!(
-            s.handle_mouse(&click(s.quickstart_rect.x, s.quickstart_rect.y)),
-            Some(SidebarEvent::OpenQuickstart)
-        );
     }
 
     #[test]
@@ -834,7 +791,6 @@ mod tests {
         code.pane_kind = PaneKind::Acp;
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Acp),
-            quickstart_active: false,
             connected: true,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
@@ -858,7 +814,6 @@ mod tests {
         rows[1].display_ordinal = 2;
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
@@ -885,7 +840,6 @@ mod tests {
         let rows = vec![summary("alpha", "s1", true)];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let area = Rect::new(70, 0, 30, 12);
@@ -894,7 +848,6 @@ mod tests {
             .unwrap();
         let old_targets = [
             sidebar.plus_rect,
-            sidebar.quickstart_rect,
             sidebar.row_rects[0].2,
             sidebar.row_close_rects[0].2,
         ];
@@ -916,7 +869,6 @@ mod tests {
         assert!(sidebar.row_rects.is_empty());
         assert!(sidebar.row_close_rects.is_empty());
         assert_eq!(sidebar.plus_rect, Rect::default());
-        assert_eq!(sidebar.quickstart_rect, Rect::default());
         for rect in old_targets {
             assert_eq!(sidebar.handle_mouse(&click(rect.x, rect.y)), None);
         }
@@ -935,7 +887,6 @@ mod tests {
         ];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
@@ -963,7 +914,6 @@ mod tests {
         row.last_activity = Some("not-a-date".into());
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 6)).unwrap();
@@ -985,7 +935,6 @@ mod tests {
             row.message_count = message_count;
             let ctx = SidebarCtx {
                 active_pane: Some(PaneKind::Chat),
-                quickstart_active: false,
                 connected: true,
             };
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
@@ -1046,7 +995,6 @@ mod tests {
         ];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
@@ -1102,23 +1050,21 @@ mod tests {
     #[test]
     fn scroll_clamps_to_row_overflow() {
         let mut s = sidebar();
-        let area = Rect::new(0, 0, 24, 6);
-        // inner height 4 => rows area 2 (separator + quickstart take 2).
+        let area = Rect::new(0, 0, 40, 6);
         let rows: Vec<_> = (0..5)
             .map(|i| summary(&format!("a{i}"), &format!("s{i}"), false))
             .collect();
         let ctx = SidebarCtx {
             active_pane: None,
-            quickstart_active: false,
             connected: true,
         };
         s.scroll = 99;
         let backend = ratatui::backend::TestBackend::new(100, 6);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|frame| s.draw(frame, area, &rows, &ctx)).unwrap();
-        assert_eq!(s.scroll, 3, "scroll clamps to rows.len() - visible");
-        assert_eq!(s.row_rects.len(), 2);
-        assert_eq!(s.row_rects[0].1, "s3", "clamped scroll shows the tail");
+        assert_eq!(s.scroll, 1, "scroll clamps to rows.len() - visible");
+        assert_eq!(s.row_rects.len(), 4);
+        assert_eq!(s.row_rects[0].1, "s1", "clamped scroll shows the tail");
     }
 
     #[tokio::test]

@@ -1757,15 +1757,11 @@ impl InputBarState {
                 ExplorerAction::Confirm(paths) => {
                     match PendingAttachment::from_explorer_paths(&paths) {
                         Ok(atts) => {
-                            let labels: Vec<String> = atts.iter().map(|a| a.label()).collect();
                             for att in atts {
                                 self.pending_attachments.push(att);
                             }
                             self.file_explorer = None;
-                            return InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-attached",
-                                &[("label", &labels.join(", "))],
-                            ));
+                            return InputBarAction::Consumed;
                         }
                         Err(e) => {
                             self.file_explorer = None;
@@ -1994,12 +1990,8 @@ impl InputBarState {
         if clipboard::looks_like_file_path(trimmed)
             && let Ok(att) = PendingAttachment::from_path(trimmed)
         {
-            let label = att.label();
             self.add_attachment(att);
-            return InputBarAction::StatusMessage(crate::i18n::t_args(
-                "zc-input-attached",
-                &[("label", &label)],
-            ));
+            return InputBarAction::Consumed;
         }
         self.insert_text(text);
         InputBarAction::Consumed
@@ -2197,12 +2189,8 @@ impl InputBarState {
                     } else {
                         match PendingAttachment::from_path(path) {
                             Ok(att) => {
-                                let label = att.label();
                                 self.add_attachment(att);
-                                InputBarAction::StatusMessage(crate::i18n::t_args(
-                                    "zc-input-attached",
-                                    &[("label", &label)],
-                                ))
+                                InputBarAction::Consumed
                             }
                             Err(e) => InputBarAction::StatusMessage(crate::i18n::t_args(
                                 "zc-input-attach-error",
@@ -2325,13 +2313,9 @@ impl InputBarState {
                 match PendingAttachment::from_path(tmp_path.to_str().unwrap_or("")) {
                     Ok(mut att) => {
                         att.source = crate::attachment::AttachmentSource::Clipboard;
-                        let label = att.label();
                         self.clipboard_temps.push(tmp_path);
                         self.add_attachment(att);
-                        InputBarAction::StatusMessage(crate::i18n::t_args(
-                            "zc-input-attached",
-                            &[("label", &label)],
-                        ))
+                        InputBarAction::Consumed
                     }
                     Err(e) => {
                         self.cleanup_report.merge(remove_clipboard_temp(&tmp_path));
@@ -2851,7 +2835,14 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>())
+        use crate::keymap::InputBarAction as Ib;
+        HelpNode::entries(crate::help::entries_for([
+            Ib::Submit,
+            Ib::Inject,
+            Ib::NewLine,
+            Ib::OpenFileBrowser,
+            Ib::ClearInput,
+        ]))
     }
 }
 

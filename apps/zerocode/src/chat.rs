@@ -6555,7 +6555,10 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
                     E::key("Mouse", crate::i18n::t("zc-chat-help-open-link")),
-                    E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
+                    E::key(
+                        "/toggle-thinking",
+                        crate::i18n::t("zc-chat-help-toggle-thoughts"),
+                    ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::NewSession),
@@ -6575,7 +6578,9 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-queue-help-resume"),
                     ),
                 ];
-                pane_entries.extend(queue_sidebar_help_entries());
+                if state.queue_sidebar_open() {
+                    pane_entries.extend(queue_sidebar_help_entries());
+                }
                 // Code owns a session root the user can re-select; Chat
                 // sessions follow their agent's workspace, so the hint is
                 // scoped to this pane.
