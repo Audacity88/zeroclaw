@@ -48866,6 +48866,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-fable-5".to_string()],
+                thinking_display: None,
             },
         );
 
@@ -48886,6 +48887,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-opus-4-8".to_string()],
+                thinking_display: None,
             },
         );
 
