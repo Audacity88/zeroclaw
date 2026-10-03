@@ -7057,6 +7057,18 @@ mod tests {
         assert_eq!(manager.section_cursor, 1);
     }
 
+    fn draw_setup_test_frame(frame: &mut Frame, manager: &mut App) {
+        let mut chat = crate::chat::Chat::new(manager.rpc.clone(), crate::chat::PaneKind::Chat);
+        let mut acp = crate::acp::Acp::new(manager.rpc.clone());
+        crate::app::draw_app_frame(
+            frame,
+            crate::app::Mode::Config,
+            &mut chat,
+            &mut acp,
+            |frame, chunks, _, _| manager.draw_into(frame, chunks[1]),
+        );
+    }
+
     #[test]
     fn older_daemon_setup_metadata_stays_unknown() {
         let value = serde_json::to_value(field("model_routes.fast.model")).unwrap();
@@ -7168,7 +7180,7 @@ mod tests {
             };
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| manager.draw_into(frame, frame.area()))
+                .draw(|frame| draw_setup_test_frame(frame, &mut manager))
                 .unwrap();
             let text: String = terminal
                 .backend()
@@ -7184,7 +7196,7 @@ mod tests {
             manager.aliases = vec!["present".to_string()];
             manager.filter = Some("nomatch".to_string());
             terminal
-                .draw(|frame| manager.draw_into(frame, frame.area()))
+                .draw(|frame| draw_setup_test_frame(frame, &mut manager))
                 .unwrap();
             let text: String = terminal
                 .backend()
@@ -7222,7 +7234,7 @@ mod tests {
                 manager.fields = vec![required];
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
-                    .draw(|frame| manager.draw_into(frame, frame.area()))
+                    .draw(|frame| draw_setup_test_frame(frame, &mut manager))
                     .unwrap();
                 let text: String = terminal
                     .backend()
@@ -7242,7 +7254,7 @@ mod tests {
                     breadcrumb: vec![],
                 };
                 terminal
-                    .draw(|frame| manager.draw_into(frame, frame.area()))
+                    .draw(|frame| draw_setup_test_frame(frame, &mut manager))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
                 let mut detail = String::new();
