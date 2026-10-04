@@ -6876,17 +6876,12 @@ fn render_tool_entry(
                     display_limited |=
                         render_field(lines, &crate::i18n::t("zc-chat-tool-task"), prompt, 120);
                 }
-                if matches!(disclosure, ToolDisclosure::Full) {
-                    if let Some(target) = subagent_target.as_deref() {
-                        if terminal_safe_tool_text_limited(target, 120, 1).1 {
-                            display_limited |= render_field(
-                                lines,
-                                &crate::i18n::t("zc-chat-tool-target"),
-                                target,
-                                120,
-                            );
-                        }
-                    }
+                if matches!(disclosure, ToolDisclosure::Full)
+                    && let Some(target) = subagent_target.as_deref()
+                    && terminal_safe_tool_text_limited(target, 120, 1).1
+                {
+                    display_limited |=
+                        render_field(lines, &crate::i18n::t("zc-chat-tool-target"), target, 120);
                 }
                 let projected_fields: &[&str] = match name {
                     "delegate" if input.get("parallel").is_some() => &["prompt", "parallel"],
@@ -7043,11 +7038,11 @@ fn render_tool_entry(
                 theme::input_style().add_modifier(sel_mod),
             )));
         }
-        if matches!(disclosure, ToolDisclosure::Full) {
-            if let Some(details) = details {
-                display_limited |=
-                    render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
-            }
+        if matches!(disclosure, ToolDisclosure::Full)
+            && let Some(details) = details
+        {
+            display_limited |=
+                render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
         }
     } else if let Some(res) = result {
         display_limited |= render_field(lines, "result", res, 200);
