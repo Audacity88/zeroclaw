@@ -220,6 +220,173 @@ pub(crate) fn prepare_existing_sqlite_storage(
     Ok(Some(db_path))
 }
 
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_store(root: &Path, database: &str) -> anyhow::Result<()> {
+        match database {
+            "audit.db" => {
+                crate::audit::AuditedMemory::new(crate::none::NoneMemory::new("none"), root)
+                    .map(|_| ())
+            }
+            "response_cache.db" => {
+                crate::response_cache::ResponseCache::new(root, 60, 1000).map(|_| ())
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn create_regular_file(path: &Path) {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_storage_accepts_regular_files_and_optional_sidecars() {
+        for database in ["audit.db", "response_cache.db"] {
+            for sidecars in [&[][..], &["-wal"][..], &["-shm"][..], &["-wal", "-shm"][..]] {
+                let root = TempDir::new().unwrap();
+                let db = prepare_sqlite_storage(root.path(), database).unwrap();
+                assert!(!sqlite_sidecar_path(&db, "-wal").exists());
+                assert!(!sqlite_sidecar_path(&db, "-shm").exists());
+                for suffix in sidecars {
+                    create_regular_file(&sqlite_sidecar_path(&db, suffix));
+                }
+
+                check_sqlite_storage(&db).unwrap();
+                assert_eq!(
+                    prepare_existing_sqlite_storage(root.path(), database).unwrap(),
+                    Some(db.clone())
+                );
+                for suffix in ["-wal", "-shm"] {
+                    assert_eq!(
+                        sqlite_sidecar_path(&db, suffix).exists(),
+                        sidecars.contains(&suffix),
+                        "{database} {suffix}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_storage_rejects_directories_at_each_leaf() {
+        for database in ["audit.db", "response_cache.db"] {
+            for suffix in ["", "-wal", "-shm"] {
+                let root = TempDir::new().unwrap();
+                let db = prepare_sqlite_storage(root.path(), database).unwrap();
+                let entry = sqlite_sidecar_path(&db, suffix);
+                if suffix.is_empty() {
+                    std::fs::remove_file(&entry).unwrap();
+                }
+                std::fs::create_dir(&entry).unwrap();
+                let sentinel = entry.join("sentinel");
+                std::fs::write(&sentinel, b"unchanged").unwrap();
+
+                let error = check_sqlite_storage(&db).unwrap_err();
+                assert!(
+                    error.to_string().contains("not a regular file"),
+                    "{error:#}"
+                );
+                assert!(prepare_existing_sqlite_storage(root.path(), database).is_err());
+                assert!(
+                    open_store(root.path(), database).is_err(),
+                    "{database} {suffix}"
+                );
+                assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_storage_constructors_reopen_existing_databases() {
+        for database in ["audit.db", "response_cache.db"] {
+            let root = TempDir::new().unwrap();
+            open_store(root.path(), database).unwrap();
+            let db = root.path().join("memory").join(database);
+            {
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE admission_probe (value TEXT NOT NULL);
+                     INSERT INTO admission_probe VALUES ('retained');",
+                )
+                .unwrap();
+            }
+
+            open_store(root.path(), database).unwrap();
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let value: String = conn
+                .query_row("SELECT value FROM admission_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "retained", "{database}");
+        }
+    }
+
+    #[test]
+    fn existing_sqlite_storage_does_not_create_missing_storage() {
+        for database in ["audit.db", "response_cache.db"] {
+            let root = TempDir::new().unwrap();
+            let absent_root = root.path().join("absent");
+            assert_eq!(
+                prepare_existing_sqlite_storage(&absent_root, database).unwrap(),
+                None
+            );
+            assert!(!absent_root.exists());
+
+            let memory_dir = root.path().join("memory");
+            assert_eq!(
+                prepare_existing_sqlite_storage(root.path(), database).unwrap(),
+                None
+            );
+            assert!(!memory_dir.exists());
+            std::fs::create_dir(&memory_dir).unwrap();
+            assert_eq!(
+                prepare_existing_sqlite_storage(root.path(), database).unwrap(),
+                None
+            );
+            assert_eq!(std::fs::read_dir(&memory_dir).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_storage_rejects_windows_symlink_leaves() {
+        for database in ["audit.db", "response_cache.db"] {
+            for suffix in ["", "-wal", "-shm"] {
+                let root = TempDir::new().unwrap();
+                let outside = TempDir::new().unwrap();
+                let sentinel = outside.path().join("sentinel");
+                std::fs::write(&sentinel, b"unchanged").unwrap();
+                let db = prepare_sqlite_storage(root.path(), database).unwrap();
+                let entry = sqlite_sidecar_path(&db, suffix);
+                if suffix.is_empty() {
+                    std::fs::remove_file(&entry).unwrap();
+                }
+                // A runner without symlink privileges must report missing
+                // evidence rather than pass without exercising admission.
+                std::os::windows::fs::symlink_file(&sentinel, &entry)
+                    .expect("Windows symlink admission test requires symlink privileges");
+
+                assert!(check_sqlite_storage(&db).is_err());
+                assert!(prepare_existing_sqlite_storage(root.path(), database).is_err());
+                assert!(
+                    open_store(root.path(), database).is_err(),
+                    "{database} {suffix}"
+                );
+                assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+            }
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
