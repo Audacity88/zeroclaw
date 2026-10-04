@@ -844,3 +844,13 @@ zc-config-description-scroll = Description · { $up }/{ $down } scroll
 zc-config-help-scroll-description = Scroll the description (or use the mouse wheel over it)
 zc-config-action-toggle-selection = Toggle selection
 zc-config-help-mouse-toggle = Click, scroll, double-click to toggle selection
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = field details
+zc-config-field-path = Path: { $path }
+zc-config-field-current-value = Current value:
+zc-config-field-unset = <unset>
+zc-config-field-secret-set = Set (hidden)
+zc-config-field-value-unavailable = Unavailable
+zc-config-field-environment-override = Environment override is active.
+zc-config-field-precheck-timeout-secs-label = Precheck timeout (seconds)
+zc-config-field-max-cost-per-day-cents-label = Maximum cost per day (cents)

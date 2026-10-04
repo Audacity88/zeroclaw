@@ -2182,7 +2182,6 @@ pub async fn run(
 
             // Help modal overlay (drawn last so it sits on top).
             if let Some(state) = help_overlay.as_mut() {
-                let mut node = HelpNode::entries(global_help_entries());
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
@@ -2193,7 +2192,7 @@ pub async fn run(
                     Mode::Quickstart => quickstart.help_context(),
                     Mode::Sop => sop_pane.help_context(),
                 };
-                node.children.push(pane_node);
+                let node = help_node_for_pane(mode, pane_node);
                 draw_help_modal(frame, frame.area(), &node, state);
             }
 
@@ -3471,6 +3470,15 @@ fn format_bytes(bytes: u64) -> String {
 
 // ── Help modal ───────────────────────────────────────────────────
 
+fn help_node_for_pane(mode: Mode, mut pane: HelpNode) -> HelpNode {
+    let mut node = HelpNode::entries(global_help_entries());
+    if mode == Mode::Config {
+        node.description = pane.description.take();
+    }
+    node.children.push(pane);
+    node
+}
+
 /// Flatten a `HelpNode` tree into renderable lines, depth-first.
 /// Returns `(key_string, action)` pairs; both empty = spacer; action empty +
 /// key non-empty = section header; key == "\x01" = dim rule separator.
@@ -3482,7 +3490,7 @@ fn flatten_help_node(node: &HelpNode, out: &mut Vec<(String, String)>, inner_wid
 
     // Description prose → soft-wrapped plain lines, no key column.
     if let Some(desc) = &node.description {
-        let wrap_at = inner_width.saturating_sub(2).max(20);
+        let wrap_at = inner_width.saturating_sub(2).max(1);
         for line in soft_wrap(desc, wrap_at) {
             out.push(("".into(), line));
         }
@@ -3502,38 +3510,13 @@ fn flatten_help_node(node: &HelpNode, out: &mut Vec<(String, String)>, inner_wid
     }
 }
 
-/// Wrap by terminal cells, including long chords and wide graphemes.
+/// Wrap prose using the same terminal-cell and long-token rules as text input.
 fn soft_wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(2);
-    let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            if !current.is_empty() {
-                if crate::display_width::display_width(&current)
-                    + 1
-                    + crate::display_width::display_width(word)
-                    <= width
-                {
-                    current.push(' ');
-                } else {
-                    lines.push(std::mem::take(&mut current));
-                }
-            }
-            for (_, grapheme, cells) in crate::display_width::grapheme_widths(word) {
-                if !current.is_empty()
-                    && crate::display_width::display_width(&current) + cells > width
-                {
-                    lines.push(std::mem::take(&mut current));
-                }
-                current.push_str(grapheme);
-            }
-        }
-        if !current.is_empty() {
-            lines.push(current);
-        }
-    }
-    lines
+    let width = width.min(u16::MAX as usize) as u16;
+    crate::input_bar::wrap_visual_lines(text, width)
+        .into_iter()
+        .map(|line| text[line.start..line.end].to_string())
+        .collect()
 }
 
 fn filter_help_node(node: &HelpNode, query: &str) -> Option<HelpNode> {
@@ -3605,7 +3588,7 @@ fn draw_help_modal(
 ) {
     // We need inner_width to soft-wrap descriptions. Use a generous default
     // first pass, then clamp to terminal width.
-    let max_inner_w = (area.width as usize).saturating_sub(6).clamp(2, 96);
+    let max_inner_w = (area.width as usize).saturating_sub(6).max(1);
 
     let mut all_flat: Vec<(String, String)> = Vec::new();
     flatten_help_node(node, &mut all_flat, max_inner_w);
@@ -6177,6 +6160,70 @@ mod tests {
         })
         .await
         .expect("aborted connection task should drop its state");
+    }
+
+    #[test]
+    fn help_details_wrap_complete_long_tokens_and_unicode_and_scroll_to_the_end() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let token = format!("/{}", "界🔧config_path_".repeat(35));
+        for (width, height) in [(60, 24), (120, 40)] {
+            let description = format!(
+                "Path: {token}\n{}\nEND-OF-FIELD",
+                "full description\n".repeat(45)
+            );
+            let node = HelpNode {
+                description: Some(description),
+                ..Default::default()
+            };
+            let node = help_node_for_pane(Mode::Config, node);
+            let mut flat = Vec::new();
+            flatten_help_node(&node, &mut flat, width as usize - 6);
+            assert!(
+                flat.iter().all(
+                    |(_, text)| crate::display_width::display_width(text) <= width as usize - 8
+                )
+            );
+            let joined: String = flat.iter().map(|(_, text)| text.as_str()).collect();
+            assert!(
+                joined.contains(&token),
+                "wrapped tokens must retain every grapheme"
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut state = HelpOverlayState::default();
+            terminal
+                .draw(|frame| draw_help_modal(frame, frame.area(), &node, &mut state))
+                .unwrap();
+            let first: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(!first.contains("END-OF-FIELD"));
+            assert!(
+                first.contains("Path:"),
+                "field details should appear before global bindings"
+            );
+            state.scroll = flat
+                .iter()
+                .position(|(_, text)| text.contains("END-OF-FIELD"))
+                .unwrap();
+            terminal
+                .draw(|frame| draw_help_modal(frame, frame.area(), &node, &mut state))
+                .unwrap();
+            let last: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                last.contains("END-OF-FIELD"),
+                "the full description must be reachable by scrolling"
+            );
+        }
     }
 
     #[test]
