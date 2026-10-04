@@ -2174,10 +2174,13 @@ fn build_channel_system_prompt(
         }
         if instructions.contains("[DOCUMENT:") {
             prompt.push_str(
-                "\n\nWhen generating large HTML, scripts, spreadsheets or exports, save the \
-                 complete artifact inside the configured workspace instead of pasting it into chat. \
-                 Send a short summary plus the document marker described above, following this \
-                 channel's path and URL restrictions.",
+                "\n\nWhen generating large HTML, scripts, spreadsheets or exports, use available \
+                 file-writing tools to save the complete artifact inside the configured workspace \
+                 instead of pasting it into chat. After saving successfully, send a short summary \
+                 plus the document marker described above, following this channel's path and URL \
+                 restrictions. If file-writing tools are unavailable or saving fails, explain the \
+                 limitation and provide the content in chat. Do not emit a document marker for an \
+                 unsaved file.",
             );
         }
     }
@@ -45410,6 +45413,18 @@ BTC is currently around $65,000 based on latest tool output."#
                 .contains("save the complete artifact inside the configured workspace"),
             "generated artifact guidance should reach the provider's system message"
         );
+        assert!(
+            calls[0][0]
+                .1
+                .contains("If file-writing tools are unavailable or saving fails")
+                && calls[0][0]
+                    .1
+                    .contains("explain the limitation and provide the content in chat")
+                && calls[0][0]
+                    .1
+                    .contains("Do not emit a document marker for an unsaved file"),
+            "the no-tools provider request must include an honest inline fallback"
+        );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
     }
 
@@ -45436,7 +45451,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 prompt.contains("save the complete artifact inside the configured workspace")
                     && prompt.contains("instead of pasting it into chat")
                     && prompt.contains("short summary plus the document marker")
-                    && prompt.contains("following this channel's path and URL restrictions"),
+                    && prompt.contains("following this channel's path and URL restrictions")
+                    && prompt.contains("After saving successfully")
+                    && prompt.contains("If file-writing tools are unavailable or saving fails")
+                    && prompt.contains("explain the limitation and provide the content in chat")
+                    && prompt.contains("Do not emit a document marker for an unsaved file"),
                 "{channel_name} must guide large artifacts through its existing document route"
             );
             assert_eq!(
