@@ -2185,7 +2185,9 @@ impl App {
                         self.select_cursor
                     };
                     if let Some(&orig) = visible.get(cursor) {
-                        self.deactivate_filter();
+                        if self.array_selection.is_none() {
+                            self.deactivate_filter();
+                        }
                         self.commit_select(orig).await?;
                     }
                 }
@@ -9868,6 +9870,20 @@ mod tests {
         );
         assert_eq!(*calls.lock().unwrap(), vec!["config/resolve-alias-source"]);
         assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        let mut term = filter_test_term();
+        manager.activate_mouse(&mut term).await.unwrap();
+        assert_eq!(manager.detail_filter().map(String::as_str), Some("b.new"));
+        assert_eq!(manager.filter_cursor, 0);
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["z.old", "a.live", "missing"]
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["config/resolve-alias-source"]);
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.detail_filter().map(String::as_str), Some("b.new"));
         manager
             .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await

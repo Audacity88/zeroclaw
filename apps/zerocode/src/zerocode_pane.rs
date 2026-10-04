@@ -1890,6 +1890,12 @@ impl ZerocodePane {
         }
     }
 
+    fn connection_editor_claims_key(&self, event: &KeyEvent) -> bool {
+        use crate::keymap::ConfigEditorAction as E;
+        self.conn_edit.is_some()
+            && matches!(E::from_chord(event), Some(E::Save | E::Confirm | E::Cancel))
+    }
+
     /// Display only local chords that can reach the active widget.
     fn local_hint_keys<A: crate::keymap::RebindableActions>(&self, action: A) -> Vec<String> {
         let advertised = crate::keymap::action_key_labels(action);
@@ -1901,6 +1907,7 @@ impl ZerocodePane {
                 advertised.contains(&chord.display())
                     && !self.global_preempts_local(&event)
                     && (self.binding_query_claims_key(&event)
+                        || self.connection_editor_claims_key(&event)
                         || !matches!(
                             crate::keymap::ConfigTabAction::from_chord(&event),
                             Some(
@@ -2060,7 +2067,7 @@ impl ZerocodePane {
                 },
             );
         }
-        // Outer section dispatch remains live except for printable query text.
+        // Active editor commands and printable query text precede section dispatch.
         let outer_keys = |action: A| {
             action
                 .resolved()
@@ -2068,6 +2075,12 @@ impl ZerocodePane {
                 .filter(|chord| {
                     let event = KeyEvent::new(chord.code, chord.effective_modifiers());
                     !self.binding_query_claims_key(&event)
+                        && !self.connection_editor_claims_key(&event)
+                        && !(self.wants_text_input()
+                            && matches!(event.code, KeyCode::Char(_))
+                            && !event.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                            ))
                         && !self.global_preempts_local(&event)
                         && A::from_chord(&event) == Some(action)
                 })
@@ -2722,7 +2735,9 @@ mod tests {
 
     #[test]
     fn settings_hints_omit_chords_intercepted_by_outer_and_global_dispatch() {
-        use crate::keymap::{ConfigEditorAction as E, RebindableActions, SearchBoxAction as S};
+        use crate::keymap::{
+            ConfigEditorAction as E, ConfigTabAction as A, RebindableActions, SearchBoxAction as S,
+        };
         let _g = overrides::TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2738,8 +2753,19 @@ mod tests {
             &E::Save.key(),
             vec![Chord::key(KeyCode::Tab), effective.clone()],
         );
-        assert_eq!(pane.local_hint_keys(E::Save), vec![effective.display()]);
+        assert_eq!(
+            pane.local_hint_keys(E::Save),
+            vec!["Tab".to_string(), effective.display()]
+        );
         assert!(pane.bottom_hint().contains(&effective.display()));
+        assert!(pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-config-footer-action-save")
+        }));
+        assert!(!pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-zerocode-hint-section")
+        }));
         given_explicit_row(&E::Save.key(), vec![Chord::ctrl('b')]);
         assert!(pane.local_hint_keys(E::Save).is_empty());
         assert!(
@@ -2749,6 +2775,24 @@ mod tests {
                 .iter()
                 .any(|entry| entry.action == crate::i18n::t("zc-config-footer-action-save"))
         );
+        given_explicit_row(&E::Cancel.key(), vec![Chord::key(KeyCode::Tab)]);
+        assert_eq!(pane.local_hint_keys(E::Cancel), vec!["Tab"]);
+        assert!(pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-config-footer-action-cancel")
+        }));
+        assert!(!pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-zerocode-hint-section")
+        }));
+        given_explicit_row(&A::SectionNext.key(), vec![Chord::char('n')]);
+        assert!(!pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"n".to_string())
+                && entry.action == crate::i18n::t("zc-zerocode-hint-section")
+        }));
+        assert!(pane.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert_eq!(pane.conn_edit.as_ref().unwrap().buf, "n");
+        given_explicit_row(&A::SectionNext.key(), vec![Chord::key(KeyCode::Tab)]);
         pane.conn_edit = None;
         pane.begin_binding_search();
         given_explicit_row(&S::Accept.key(), vec![Chord::key(KeyCode::Tab)]);
