@@ -630,6 +630,10 @@ zc-chat-tool-target = Target
 zc-chat-tool-response = Response
 zc-chat-tool-details = Details
 zc-chat-tool-result-not-recorded = Result not recorded
+zc-chat-tool-encoding = Encoding
+zc-chat-tool-write-preview = Content preview · not a diff
+zc-chat-tool-write-result-absent = Wrote { $bytes } bytes · file previously absent.
+zc-chat-tool-write-result-existing = Wrote { $bytes } bytes · file previously { $previous_bytes } bytes.
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -921,3 +925,8 @@ zc-config-setup-required = required
 zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
 zc-config-footer-action-open-or-add = open / add
+
+zc-chat-tool-write-overwrite = Overwrote existing file
+zc-chat-tool-write-diff = Changes · temporary local view
+zc-chat-tool-write-preview-unavailable = Content preview · diff unavailable
+zc-chat-tool-write-unchanged = Content unchanged
