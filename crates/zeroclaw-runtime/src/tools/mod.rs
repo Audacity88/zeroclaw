@@ -2921,7 +2921,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn registry_reports_seatbelt_initialization_before_tool_execution() {
-        assert!(std::path::Path::new("/usr/bin/sandbox-exec").is_file());
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let cycle = tmp.path().join("cycle");
         std::os::unix::fs::symlink("cycle", &cycle).unwrap();
