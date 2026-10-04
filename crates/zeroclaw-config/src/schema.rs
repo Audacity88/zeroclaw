@@ -41466,6 +41466,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         .unwrap();
         let mut config: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
             .expect("a config carrying the retired table still loads");
+        config.loaded_from = Some(config_path.clone());
         config.config_path = config_path;
         config
     }
