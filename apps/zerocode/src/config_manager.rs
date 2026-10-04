@@ -1674,10 +1674,6 @@ impl App {
                     && mouse.column > self.last_main_area.x
                     && mouse.column < self.last_main_area.right().saturating_sub(1)
                 {
-                    if self.filter_for(ZeroclawPane::Sections).is_some() {
-                        self.deactivate_filter();
-                    }
-                    self.zeroclaw_pane = ZeroclawPane::Detail;
                     let count = self.visible_count();
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
@@ -1685,6 +1681,9 @@ impl App {
                         self.last_list_offset,
                         count,
                     ) {
+                        if self.filter_for(ZeroclawPane::Sections).is_some() {
+                            self.deactivate_filter();
+                        }
                         self.zeroclaw_pane = ZeroclawPane::Detail;
                         let is_double = self.double_click.click(mouse.column, mouse.row);
                         self.set_visible_cursor(pos);
@@ -4551,6 +4550,7 @@ impl App {
                         }
                     }
                     self.array_selection = Some(selected);
+                    self.field_draft_loaded = self.field_draft();
                     self.select_cursor = 0;
                 } else {
                     let current = self.fields[idx].value.as_ref().and_then(|v| v.as_str());
@@ -5757,16 +5757,26 @@ impl App {
                     label_width,
                 );
                 let value = field_value_display(f);
-                let setup_marker = f.setup.as_ref().map(|setup| {
-                    format!("[{}] ", crate::i18n::t(if setup.missing {
-                        "zc-config-setup-required-missing"
-                    } else {
-                        "zc-config-setup-required"
-                    }))
-                }).unwrap_or_default();
+                let setup_marker = f
+                    .setup
+                    .as_ref()
+                    .map(|setup| {
+                        format!(
+                            "[{}] ",
+                            crate::i18n::t(if setup.missing {
+                                "zc-config-setup-required-missing"
+                            } else {
+                                "zc-config-setup-required"
+                            })
+                        )
+                    })
+                    .unwrap_or_default();
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
                 let value_width = row_width.saturating_sub(
-                    crate::display_width::display_width(&label) + setup_marker.len() + 3 + env_marker.len(),
+                    crate::display_width::display_width(&label)
+                        + setup_marker.len()
+                        + 3
+                        + env_marker.len(),
                 );
                 let line = format!(
                     "{setup_marker}{label} = {}{env_marker}",
@@ -6929,7 +6939,7 @@ mod tests {
             A::from_chord(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
             Some(A::SectionNext)
         );
-        manager.filter = Some("daemon filter".into());
+        set_detail_filter(&mut manager, "daemon filter".into());
         manager.edit_buf = "daemon draft".into();
         let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
         manager
@@ -6939,7 +6949,7 @@ mod tests {
             )
             .await
             .unwrap();
-        manager.handle_paste("qj?\n");
+        manager.handle_paste("qj?\n").await;
         assert!(manager.section == ConfigSection::Zerocode);
         assert!(manager.wants_text_input());
         assert_eq!(manager.filter.as_deref(), Some("daemon filter"));
@@ -7144,6 +7154,15 @@ mod tests {
         App::new(rpc, std::path::Path::new("/tmp"))
     }
 
+    fn set_detail_filter(manager: &mut App, query: String) {
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: manager.section_cursor,
+            active_tab: manager.active_tab,
+        });
+        manager.filter = Some(query);
+    }
+
     fn description_test_manager() -> App {
         let mut manager = test_manager();
         let mut first = field("example.first");
@@ -7161,15 +7180,9 @@ mod tests {
     }
 
     fn draw_setup_test_frame(frame: &mut Frame, manager: &mut App) {
-        let mut chat = crate::chat::Chat::new(manager.rpc.clone(), crate::chat::PaneKind::Chat);
-        let mut acp = crate::acp::Acp::new(manager.rpc.clone());
-        crate::app::draw_app_frame(
-            frame,
-            crate::app::Mode::Config,
-            &mut chat,
-            &mut acp,
-            |frame, chunks, _, _| manager.draw_into(frame, chunks[1]),
-        );
+        manager.loaded_section = Some(manager.section_cursor);
+        let chunks = crate::app::app_frame_layout(frame.area());
+        manager.draw_into(frame, chunks[1]);
     }
 
     #[test]
@@ -7297,7 +7310,7 @@ mod tests {
             assert_eq!(manager.alias_cursor, 0);
             assert!(manager.last_main_area.height >= 4);
             manager.aliases = vec!["present".to_string()];
-            manager.filter = Some("nomatch".to_string());
+            set_detail_filter(&mut manager, "nomatch".to_string());
             terminal
                 .draw(|frame| draw_setup_test_frame(frame, &mut manager))
                 .unwrap();
@@ -7346,9 +7359,13 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect();
-                let name = path.rsplit_once('.').unwrap().1;
+                let name = if path.ends_with("api_key") {
+                    "API"
+                } else {
+                    "Model"
+                };
                 assert!(
-                    text.contains(&format!("{name} [missing]")),
+                    text.contains(&format!("[missing] {name}")),
                     "{width} columns: {name}"
                 );
                 manager.screen = Screen::AliasCreate {
@@ -7371,19 +7388,6 @@ mod tests {
                 assert!(detail.contains("cancels without saving"), "{detail}");
                 assert!(detail.contains("keeps the saved entry"), "{detail}");
             }
-        }
-    }
-
-    fn entry_with_cost_setup(key: &str, cost_category: &str) -> ConfigSectionEntry {
-        ConfigSectionEntry {
-            key: key.to_string(),
-            label: key.to_string(),
-            help: String::new(),
-            completed: false,
-            group: String::new(),
-            group_key: String::new(),
-            shape: None,
-            cost_category: cost_category.to_string(),
         }
     }
 
@@ -7416,7 +7420,7 @@ mod tests {
         selected.is_env_overridden = true;
         manager.fields = vec![stale, selected];
         manager.field_cursor = 0;
-        manager.filter = Some("precheck.timeout_secs".into());
+        set_detail_filter(&mut manager, "precheck.timeout_secs".into());
         manager.filter_cursor = 0;
         let details = manager.help_context().description.unwrap();
         assert!(details.contains("Path: agents.demo.precheck.timeout_secs"));
@@ -7432,7 +7436,7 @@ mod tests {
         assert!(!details.contains("must-stay-hidden"));
         manager.fields[1].populated = false;
         assert!(manager.field_details().unwrap().ends_with("<unset>"));
-        manager.filter = Some("no-matches".into());
+        set_detail_filter(&mut manager, "no-matches".into());
         assert!(manager.help_context().description.is_none());
     }
 
@@ -7565,7 +7569,7 @@ mod tests {
         let rendered = render_config(&mut manager);
         assert!(rendered.contains("Filter sections: /MCP"));
         assert!(!rendered.contains("Filter list:"));
-        assert!(rendered.contains("first ="));
+        assert!(rendered.contains("First ="));
         manager
             .handle_key(key(KeyCode::Esc), &mut term)
             .await
@@ -7575,7 +7579,7 @@ mod tests {
         assert_eq!(manager.loaded_section, Some(1));
         assert_eq!(manager.field_cursor, 1);
         assert_eq!(manager.active_tab, 1);
-        assert!(render_config(&mut manager).contains("second ="));
+        assert!(render_config(&mut manager).contains("Second ="));
         assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Sections);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
@@ -7648,7 +7652,7 @@ mod tests {
         }
         let rendered = render_config(&mut manager);
         assert_eq!(rendered.matches("No matches").count(), 2);
-        assert!(!rendered.contains("second ="));
+        assert!(!rendered.contains("Second ="));
         assert!(manager.last_section_rows.is_empty());
         assert_eq!(manager.last_main_area, Rect::default());
         assert!(manager.last_tab_area.is_none());
@@ -7682,7 +7686,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.section_cursor, 1);
-        assert!(render_config(&mut manager).contains("second ="));
+        assert!(render_config(&mut manager).contains("Second ="));
     }
 
     #[tokio::test]
@@ -7790,8 +7794,8 @@ mod tests {
             }
             assert!(manager.status_msg.is_some());
             let rendered = render_config(&mut manager);
-            assert!(!rendered.contains("first ="));
-            assert!(!rendered.contains("second ="));
+            assert!(!rendered.contains("First ="));
+            assert!(!rendered.contains("Second ="));
             assert_eq!(manager.last_main_area, Rect::default());
             assert!(manager.last_tab_area.is_none());
             manager
@@ -7892,19 +7896,6 @@ mod tests {
         assert_eq!(manager.section_cursor, 1);
     }
 
-    fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
-        ConfigSectionEntry {
-            key: key.to_string(),
-            label: key.to_string(),
-            help: String::new(),
-            completed: false,
-            group: String::new(),
-            group_key: String::new(),
-            shape: None,
-            cost_category: cost_category.to_string(),
-        }
-    }
-
     #[test]
     fn config_metadata_keys_use_locale_independent_identifiers_composed_2() {
         assert_eq!(
@@ -7978,7 +7969,7 @@ mod tests {
                 for tab in [0, 1] {
                     manager.alias_tab = tab;
                     manager.description_pane.offset = 0;
-                    manager.filter = Some("missing".into());
+                    set_detail_filter(&mut manager, "missing".into());
                     let rendered = render_description_test(&mut manager, width, height);
                     assert!(rendered.contains("Section explanation."));
                     let top: String = rendered
@@ -8009,7 +8000,7 @@ mod tests {
         assert!(rendered.contains("First setting explanation"));
         assert!(!rendered.contains("Section explanation."));
         assert_eq!(manager.description_pane.offset, 0);
-        manager.filter = Some("no-matching-field".into());
+        set_detail_filter(&mut manager, "no-matching-field".into());
         assert!(render_description_test(&mut manager, 60, 20).contains("Section explanation."));
         manager.filter = None;
         manager.fields[0].description.clear();
@@ -8028,7 +8019,7 @@ mod tests {
     #[tokio::test]
     async fn description_pane_follows_filtered_selection_and_resets_scroll() {
         let mut manager = description_test_manager();
-        manager.filter = Some("second".into());
+        set_detail_filter(&mut manager, "second".into());
         let rendered = render_description_test(&mut manager, 60, 20);
         assert!(rendered.contains("Long setting explanation."));
         assert!(!rendered.contains("First setting explanation"));
@@ -8045,7 +8036,7 @@ mod tests {
             render_description_test(&mut manager, 60, 20).contains("First setting explanation")
         );
         assert_eq!(manager.description_pane.offset, 0);
-        manager.filter = Some("no-matching-field".into());
+        set_detail_filter(&mut manager, "no-matching-field".into());
         render_description_test(&mut manager, 60, 20);
         assert_eq!(manager.description_pane.area.height, 0);
     }
@@ -9080,7 +9071,7 @@ mod tests {
             manager.templates = vec![ConfigTemplateEntry {
                 path: "providers.models.openai".into(),
             }];
-            manager.filter = Some("old".into());
+            set_detail_filter(&mut manager, "old".into());
             manager.edit_buf = "unsaved".into();
             manager.edit_cursor = manager.edit_buf.len();
             manager.active_tab = 1;
@@ -9357,7 +9348,7 @@ mod tests {
     async fn provider_alias_rename_filtered_mouse_click_opens_the_visible_alias() {
         let (mut manager, outbound, mut rx, mut term) =
             alias_rename_manager("providers.models", "openai");
-        manager.filter = Some("no-match".into());
+        set_detail_filter(&mut manager, "no-match".into());
         manager.zeroclaw_pane = ZeroclawPane::Sections;
         render_config_for_mouse(&mut manager);
         let area = manager.last_main_area;
@@ -9376,7 +9367,7 @@ mod tests {
         assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
         assert!(matches!(manager.screen, Screen::AliasList { .. }));
         assert!(rx.try_recv().is_err());
-        manager.filter = Some("other".into());
+        set_detail_filter(&mut manager, "other".into());
         render_config_for_mouse(&mut manager);
         manager
             .handle_mouse(click, Rect::default(), &mut term)
@@ -9434,7 +9425,7 @@ mod tests {
                 assert_eq!(manager.edit_buf, "unsaved");
                 assert!(rx.try_recv().is_err());
             }
-            manager.filter = Some("old".into());
+            set_detail_filter(&mut manager, "old".into());
             let fields = manager.fields.clone();
             let replies = async {
                 if target > 0 {
@@ -9648,7 +9639,7 @@ mod tests {
             },
         ];
         mgr.type_cursor = 2;
-        mgr.filter = Some("chan".to_string());
+        set_detail_filter(&mut mgr, "chan".to_string());
         mgr.filter_origin = Some(FilterOrigin {
             pane: ZeroclawPane::Detail,
             section_cursor: 0,
@@ -9828,6 +9819,7 @@ mod tests {
         aliases: Option<Vec<String>>,
     ) -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
         let (mut manager, calls) = responding_manager_with_aliases(aliases, true);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
         let first = field("a.first");
         let mut second = field_with_value(
             PropKind::StringArray,
@@ -9901,6 +9893,33 @@ mod tests {
             manager.array_selection.as_ref().unwrap(),
             &["z.old", "a.live", "missing", "b.new"]
         );
+    }
+
+    #[tokio::test]
+    async fn composed_array_draft_compares_membership_and_survives_parking() {
+        let (mut manager, calls) = array_picker_manager(
+            &["unknown", "a.live"],
+            Some(vec!["a.live".into(), "b.new".into()]),
+        )
+        .await;
+        assert!(!manager.has_pending_edits());
+        manager.select_cursor = 1;
+        assert!(!manager.has_pending_edits());
+        manager.commit_select(1).await.unwrap();
+        assert!(manager.has_pending_edits());
+        manager.cycle_section(1);
+        manager.cycle_section(-1);
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["unknown", "a.live", "b.new"]
+        );
+        manager.discard_drafts();
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["unknown", "a.live"]
+        );
+        assert!(!manager.has_pending_edits());
+        assert_eq!(*calls.lock().unwrap(), vec!["config/resolve-alias-source"]);
     }
 
     #[tokio::test]
@@ -10160,7 +10179,7 @@ mod tests {
             .await
             .unwrap();
         manager.alias_cursor = 1;
-        manager.filter = Some("unchanged".into());
+        set_detail_filter(&mut manager, "unchanged".into());
         manager.handle_paste("unsafe\n").await;
         assert_eq!(manager.filter.as_deref(), Some("unchanged"));
         let mut repeat = key(KeyCode::Enter);

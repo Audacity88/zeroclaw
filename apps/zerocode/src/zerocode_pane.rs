@@ -727,7 +727,6 @@ impl ZerocodePane {
             area,
             &mut state,
         );
-
     }
 
     fn draw_presets(&self, frame: &mut Frame, area: Rect) {

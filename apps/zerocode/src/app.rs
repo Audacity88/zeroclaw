@@ -3363,7 +3363,7 @@ fn mode_window_width(titles: &[String], start: usize, end: usize) -> usize {
 const HEALTHY_GREEN: Color = Color::Rgb(80, 220, 120);
 const DEAD_RED: Color = Color::Rgb(255, 80, 80);
 
-fn app_frame_layout(area: Rect) -> [Rect; 3] {
+pub(crate) fn app_frame_layout(area: Rect) -> [Rect; 3] {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
