@@ -97,18 +97,9 @@ When reviewing a config write, check that:
 
 ## Full saves need load provenance
 
-`Config::save()` refuses to overwrite an existing `config.toml` unless the
-in-memory value was populated from that exact file (`loaded_from`, set by
-`load_or_init` in both its existing-file and fresh-init branches, and by the
-loaders that re-read a config file before mutating it). A
-default-constructed, programmatically built, or repointed `Config` therefore
-cannot replace an operator's populated config with a near-empty snapshot.
-Creating a missing file (first run) still succeeds: a value that never read
-a file gets exactly one create and must then reload or force, and
-`force_save()` is the explicit path for a verified intentional overwrite.
-When reviewing a code path that builds a fresh `Config` and expects to write
-it over an existing file, either load first or justify the `force_save()`
-call.
+`Config::save()` refuses to overwrite an existing `config.toml` unless the in-memory value was populated from that exact file (`loaded_from`, set by `load_or_init` in both its existing-file and fresh-init branches, and by the loaders that re-read a config file before mutating it). A default-constructed, programmatically built, or repointed `Config` therefore cannot replace an operator's populated config with a near-empty snapshot.
+
+Creating a missing file (first run) still succeeds: a value that never read a file gets exactly one create and must then reload or force, and `force_save()` is the explicit path for a verified intentional overwrite. When reviewing a code path that builds a fresh `Config` and expects to write it over an existing file, either load first or justify the `force_save()` call.
 
 ## Saved vs applied
 
