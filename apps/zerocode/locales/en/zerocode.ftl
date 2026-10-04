@@ -618,8 +618,8 @@ zc-chat-tool-subagent = Subagent
 zc-chat-tool-delegation = Delegation
 zc-chat-tool-task = Task
 zc-chat-tool-target = Target
-zc-chat-tool-status = Status
-zc-chat-tool-result-received = Result received
+zc-chat-tool-response = Response
+zc-chat-tool-details = Details
 zc-chat-tool-result-not-recorded = Result not recorded
 
 zc-config-breadcrumb-root = Config
