@@ -727,6 +727,7 @@ impl ZerocodePane {
             area,
             &mut state,
         );
+
     }
 
     fn draw_presets(&self, frame: &mut Frame, area: Rect) {
@@ -1340,12 +1341,12 @@ impl ZerocodePane {
             {
                 self.begin_binding_search();
             }
-            Some(ConfigTabAction::DeleteRow)
+            Some(ConfigTabAction::Reset)
                 if self.cursor == PaneCursor::Detail && self.focus == Focus::Bindings =>
             {
                 self.reset_row();
             }
-            Some(ConfigTabAction::DeleteRow) if self.focus == Focus::AgentTheme => {
+            Some(ConfigTabAction::Reset) if self.focus == Focus::AgentTheme => {
                 self.clear_agent_override();
             }
             _ => {}
@@ -1374,7 +1375,7 @@ impl ZerocodePane {
         self.theme_target_agent.is_some()
     }
 
-    /// Remove the highlighted agent's override (DeleteRow in the AgentTheme
+    /// Remove the highlighted agent's override (Reset in the AgentTheme
     /// section).
     fn clear_agent_override(&mut self) {
         let Some(alias) = self.agents.get(self.agent_cursor).cloned() else {
@@ -2013,7 +2014,7 @@ impl ZerocodePane {
                         "zc-zerocode-hint-pick-theme",
                     );
                     add(
-                        self.local_hint_keys(A::DeleteRow),
+                        self.local_hint_keys(A::Reset),
                         "zc-zerocode-hint-clear-theme",
                     );
                 }
@@ -2025,7 +2026,7 @@ impl ZerocodePane {
                     if !self.visible_binding_indices().is_empty() {
                         add(self.local_hint_keys(A::Enter), "zc-zerocode-hint-rebind");
                         add(
-                            self.local_hint_keys(A::DeleteRow),
+                            self.local_hint_keys(A::Reset),
                             "zc-config-footer-action-reset",
                         );
                     }
@@ -2811,7 +2812,7 @@ mod tests {
             &A::Enter.key(),
             vec![Chord::with(KeyCode::F(8), KeyModifiers::ALT)],
         );
-        given_explicit_row(&A::DeleteRow.key(), Vec::new());
+        given_explicit_row(&A::Reset.key(), Vec::new());
         given_explicit_row(
             &E::Save.key(),
             vec![Chord::with(KeyCode::F(9), KeyModifiers::ALT)],
