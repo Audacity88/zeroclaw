@@ -25993,6 +25993,11 @@ impl Config {
     /// Same as `save()`, but skips the loaded-provenance guard. Only for
     /// callers that verifiably intend to replace an existing file with a
     /// `Config` that never read it.
+    ///
+    /// Destination-path checks still apply. To replace an existing file, set
+    /// `config_path` to the intended path with a nonempty parent directory.
+    /// A bare filename such as `config.toml` is refused if its runtime-resolved
+    /// destination already exists.
     pub async fn force_save(&self) -> Result<()> {
         self.save_impl(true).await.map(|_| ())
     }
