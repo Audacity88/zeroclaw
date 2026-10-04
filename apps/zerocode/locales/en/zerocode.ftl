@@ -838,3 +838,5 @@ zc-chat-help-resume-session = Resume existing session
 zc-config-description = Description
 zc-config-description-scroll = Description · { $up }/{ $down } scroll
 zc-config-help-scroll-description = Scroll the description (or use the mouse wheel over it)
+zc-config-action-toggle-selection = Toggle selection
+zc-config-help-mouse-toggle = Click, scroll, double-click to toggle selection
