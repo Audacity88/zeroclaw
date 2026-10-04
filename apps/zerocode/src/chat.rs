@@ -9135,12 +9135,11 @@ fn capture_transcript_snapshot(
     if !content_changed
         && let Some(snapshot) = state.transcript_snapshot.as_mut()
         && snapshot.area.width == body.width
-        && snapshot.area.height == body.height
         && snapshot.content_height() == total_rows
         && (scroll..visible_end)
             .all(|row| snapshot.cells.contains_key(&row) && snapshot.row_breaks.contains_key(&row))
     {
-        // A dock can move the conversation without changing its rendered cells.
+        // Dock and status rows can move or shorten the viewport without rewrapping text.
         snapshot.set_viewport(body, scroll);
         return false;
     }
@@ -9149,7 +9148,6 @@ fn capture_transcript_snapshot(
     if state.transcript_selection.is_some()
         && let Some(snapshot) = state.transcript_snapshot.as_mut()
         && snapshot.area.width == body.width
-        && snapshot.area.height == body.height
         && snapshot.content_height() == total_rows
     {
         snapshot.merge(captured);
