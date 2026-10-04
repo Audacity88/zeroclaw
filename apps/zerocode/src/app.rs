@@ -2024,6 +2024,9 @@ pub async fn run(
     }
 
     loop {
+        // Synchronous terminal polls and ready RPC futures can keep this loop
+        // running without yielding to the outer shutdown-signal selector.
+        tokio::task::yield_now().await;
         pause_config_query_outside_mode(mode, &mut config_app);
         // Draw
         timing.mark(Phase::Tick);
