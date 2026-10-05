@@ -9947,9 +9947,7 @@ impl ChatState {
         if input.get("content").and_then(|v| v.as_str()) != Some(diff.written())
             || input
                 .get("encoding")
-                .and_then(|v| v.as_str())
-                .unwrap_or("utf8")
-                != "utf8"
+                .is_some_and(|value| value.as_str() != Some("utf8"))
         {
             return;
         }
@@ -25657,6 +25655,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn local_file_diff_tokens_route_to_owning_pane_with_original_deadline() {
+        let (tx, _rx) = mpsc::channel(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let mut chat = Chat::new(rpc.clone(), PaneKind::Chat);
+        let mut code = Chat::new(rpc.clone(), PaneKind::Acp);
+        let mut chat_state = state();
+        chat_state
+            .entries
+            .push(local_diff_entry("reused", "chat new"));
+        chat.phase = ChatPhase::Active(Box::new(chat_state));
+        code.phase = ChatPhase::Active(Box::new(state_for("code-active", "agent")));
+        let mut background = state_for("code-background", "agent");
+        background
+            .entries
+            .push(local_diff_entry("reused", "code new"));
+        code.background.push(background);
+        let (code_token, code_deadline) = rpc
+            .push_local_file_diff_for_test(serde_json::json!({
+                "type":"local_file_diff", "session_id":"code-background", "tool_call_id":"reused",
+                "previous":"code private", "written":"code new"
+            }))
+            .unwrap();
+        let (chat_token, chat_deadline) = rpc
+            .push_local_file_diff_for_test(serde_json::json!({
+                "type":"local_file_diff", "session_id":"sess-1", "tool_call_id":"reused",
+                "previous":"chat private", "written":"chat new"
+            }))
+            .unwrap();
+        assert!(rpc.take_local_file_diff(code_token, "sess-1").is_none());
+        chat.drain_notifications();
+        code.drain_notifications();
+        let chat_pair = &active_state(&mut chat).local_file_diffs[&0];
+        assert_eq!(chat_pair.diff.previous(), "chat private");
+        assert_eq!(chat_pair.expires, chat_deadline);
+        let code_pair = &code.background[0].local_file_diffs[&0];
+        assert_eq!(code_pair.diff.previous(), "code private");
+        assert_eq!(code_pair.expires, code_deadline);
+        assert!(active_state(&mut code).local_file_diffs.is_empty());
+        assert!(
+            rpc.take_local_file_diff(code_token, "code-background")
+                .is_none()
+        );
+        assert!(rpc.take_local_file_diff(chat_token, "sess-1").is_none());
+    }
+
     #[test]
     fn local_file_diff_renders_removals_additions_and_disclosure() {
         use zeroclaw_api::local_file_diff::LocalFileDiff;
@@ -25780,6 +25824,25 @@ mod tests {
             LocalFileDiff::new("stale".into(), "first".into()).unwrap(),
         );
         assert_eq!(s.local_file_diffs[&0].diff.previous(), "private first");
+        for encoding in [
+            serde_json::json!("base64"),
+            serde_json::json!("hex"),
+            serde_json::json!(3),
+        ] {
+            let ChatEntry::Tool { input_json, .. } = &mut s.entries[2] else {
+                unreachable!()
+            };
+            *input_json =
+                serde_json::json!({"path":"demo.txt", "content":"third", "encoding":encoding})
+                    .to_string()
+                    .into();
+            s.retain_local_file_diff(
+                "repeated",
+                LocalFileDiff::new("invalid encoding".into(), "third".into()).unwrap(),
+            );
+            assert!(!s.local_file_diffs.contains_key(&2));
+        }
+        s.entries[2] = local_diff_entry("repeated", "third");
         s.load_history(Vec::new(), false);
         s.retain_local_file_diff(
             "repeated",

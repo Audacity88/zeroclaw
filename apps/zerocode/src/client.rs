@@ -3298,6 +3298,20 @@ impl RpcClient {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_local_file_diff_for_test(&self, params: Value) -> Option<(u64, Instant)> {
+        let mut inbox = self.local_file_diff_inbox.lock().ok()?;
+        let frame = inbox.route(serde_json::json!({"method":"session/update", "params":params}))?;
+        let token = frame.pointer("/params/token")?.as_u64()?;
+        let expires = inbox.pending.iter().find_map(|(id, update)| match update {
+            SessionUpdate::LocalFileDiff { expires, .. } if *id == token => Some(*expires),
+            _ => None,
+        })?;
+        drop(inbox);
+        self.push_notification_for_test("session/update", frame["params"].clone());
+        Some((token, expires))
+    }
+
     /// Stop this client's transport and release everything it holds open.
     ///
     /// A replaced client is not idle: its reader still owns the socket, its
