@@ -102,6 +102,13 @@ pub struct AnthropicModelProvider {
     /// One TTL per request by design. Defaults to the 5-minute API
     /// default.
     cache_ttl: CacheTtl,
+    /// Operator `extra_headers` from `[providers.models.anthropic.<alias>]`,
+    /// validated once at build time. Sent as client default headers, so a
+    /// header the provider sets itself on the request (`x-api-key`,
+    /// `Authorization`, `anthropic-version`, `anthropic-beta`,
+    /// `content-type`) keeps the provider's value. Empty means requests use
+    /// the shared runtime client unchanged.
+    extra_headers: reqwest::header::HeaderMap,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -655,6 +662,7 @@ pub struct AnthropicBuilder {
     server_fallback_models: Vec<String>,
     thinking_display: Option<zeroclaw_config::schema::AnthropicThinkingDisplay>,
     cache_ttl: Option<CacheTtl>,
+    extra_headers: reqwest::header::HeaderMap,
 }
 
 impl AnthropicBuilder {
@@ -713,6 +721,37 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Operator-configured headers sent with every request (auth bridges,
+    /// gateways that want their own credential header). Entries whose name
+    /// or value is not a valid HTTP header are skipped with a warning, the
+    /// same handling the OpenAI-compatible provider applies. Values are
+    /// marked sensitive so they never appear in debug output.
+    pub fn extra_headers(mut self, headers: &std::collections::HashMap<String, String>) -> Self {
+        let mut map = reqwest::header::HeaderMap::with_capacity(headers.len());
+        for (name, value) in headers {
+            match (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                (Ok(header_name), Ok(mut header_value)) => {
+                    header_value.set_sensitive(true);
+                    map.insert(header_name, header_value);
+                }
+                _ => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"header": name})),
+                        "Skipping invalid extra header name or value"
+                    );
+                }
+            }
+        }
+        self.extra_headers = map;
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -727,6 +766,7 @@ impl AnthropicBuilder {
             server_fallback_models: self.server_fallback_models,
             thinking_display: self.thinking_display,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
+            extra_headers: self.extra_headers,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -745,6 +785,7 @@ impl AnthropicModelProvider {
             server_fallback_models: Vec::new(),
             thinking_display: None,
             cache_ttl: None,
+            extra_headers: reqwest::header::HeaderMap::new(),
         }
     }
 
@@ -2602,11 +2643,37 @@ impl AnthropicModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        if self.extra_headers.is_empty() {
+            return zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "model_provider.anthropic",
+                self.timeout_secs,
+                10,
+            );
+        }
+        // Default headers are client-scoped, so a provider with extra headers
+        // cannot share the cached runtime client.
+        let builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .default_headers(self.extra_headers.clone());
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.anthropic",
-            self.timeout_secs,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|error| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Failed to build Anthropic client with extra headers; sending without them"
+            );
+            zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                "model_provider.anthropic",
+                self.timeout_secs,
+                10,
+            )
+        })
     }
 
     /// Streaming requests have no whole-request deadline. Header acquisition
@@ -2615,7 +2682,8 @@ impl AnthropicModelProvider {
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(STREAM_IDLE_TIMEOUT)
+            .default_headers(self.extra_headers.clone());
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.anthropic",
@@ -10490,6 +10558,103 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .map(|s| s.contains("server-side-fallback"))
                 .unwrap_or(false)
         })
+    }
+
+    fn gateway_headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn extra_headers_reach_non_streaming_requests_without_replacing_auth() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .extra_headers(&gateway_headers(&[
+                ("x-gateway-key", "gateway-secret"),
+                // A configured header the provider also sets: the provider's
+                // own credential must stay the only x-api-key value.
+                ("x-api-key", "should-not-win"),
+            ]))
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, _body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        assert_eq!(
+            headers.get("x-gateway-key").and_then(|v| v.to_str().ok()),
+            Some("gateway-secret")
+        );
+        let api_keys: Vec<_> = headers.get_all("x-api-key").iter().collect();
+        assert_eq!(api_keys.len(), 1, "expected exactly one x-api-key header");
+        assert_eq!(api_keys[0].to_str().unwrap(), "sk-ant-api-key");
+    }
+
+    #[tokio::test]
+    async fn extra_headers_reach_streaming_requests() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .extra_headers(&gateway_headers(&[("x-gateway-key", "gateway-secret")]))
+            .build();
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let stream =
+            provider.stream_chat(request, "claude-fable-5", None, StreamOptions::new(true));
+        let _events: Vec<StreamResult<StreamEvent>> = stream.collect().await;
+        server.abort();
+
+        let (headers, _body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no streaming request captured");
+        assert_eq!(
+            headers.get("x-gateway-key").and_then(|v| v.to_str().ok()),
+            Some("gateway-secret")
+        );
+        assert_eq!(
+            headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("sk-ant-api-key")
+        );
+    }
+
+    #[test]
+    fn extra_headers_skip_invalid_entries_and_keep_valid_ones() {
+        let provider = AnthropicModelProvider::builder("test")
+            .extra_headers(&gateway_headers(&[
+                ("x-gateway-key", "gateway-secret"),
+                ("bad header name", "value"),
+                ("x-bad-value", "line\nbreak"),
+            ]))
+            .build();
+        assert_eq!(provider.extra_headers.len(), 1);
+        let value = provider
+            .extra_headers
+            .get("x-gateway-key")
+            .expect("valid header kept");
+        assert_eq!(value.to_str().unwrap(), "gateway-secret");
+        assert!(
+            value.is_sensitive(),
+            "extra header values must be marked sensitive"
+        );
     }
 
     #[tokio::test]
