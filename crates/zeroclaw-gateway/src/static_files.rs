@@ -436,7 +436,7 @@ mod tests {
         );
         let root_path = root.path().to_path_buf();
         let mut request =
-            tokio::spawn(async move { serve_fs_file(Some(&root_path), "pipe.js").await });
+            zeroclaw_spawn::spawn!(async move { serve_fs_file(Some(&root_path), "pipe.js").await });
 
         let result = tokio::time::timeout(Duration::from_secs(2), &mut request).await;
         if result.is_err() {
