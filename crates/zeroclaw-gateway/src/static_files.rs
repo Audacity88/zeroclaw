@@ -418,6 +418,55 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn fs_asset_rejects_fifo_without_waiting_for_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("pipe.js");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // The path is NUL-terminated and remains valid for this syscall.
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) },
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+        let root_path = root.path().to_path_buf();
+        let mut request =
+            tokio::spawn(async move { serve_fs_file(Some(&root_path), "pipe.js").await });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut request).await;
+        if result.is_err() {
+            // A timed-out spawn_blocking read survives cancellation. Keep a writer
+            // open until it exits, so a missing O_NONBLOCK fails instead of hanging
+            // the test runtime during shutdown.
+            let writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
+            let drained = tokio::time::timeout(Duration::from_secs(5), &mut request).await;
+            if drained.is_err() {
+                // Retain a writer for a delayed open during runtime shutdown.
+                std::mem::forget(writer);
+            }
+            drained
+                .expect("FIFO request did not exit after opening a writer")
+                .unwrap();
+        }
+
+        let response = result
+            .expect("FIFO request waited for a writer")
+            .expect("FIFO request task panicked");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn fs_asset_rejects_symlink_that_resolves_outside_root() {
         use std::os::unix::fs::symlink;
 
