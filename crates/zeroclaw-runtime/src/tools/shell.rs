@@ -982,7 +982,7 @@ mod tests {
         let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(2);
         let result = tool
             .execute(json!({
-                "command": "if ( : </dev/tty ) 2>/dev/null; then printf attached; else printf detached; fi"
+                "command": "if ( : < /dev/tty ) 2> /dev/null; then printf attached; else printf detached; fi"
             }))
             .await
             .unwrap();
@@ -1944,7 +1944,7 @@ mod tests {
             } else {
                 1
             });
-            let task = tokio::spawn(async move {
+            let task = zeroclaw_spawn::spawn!(async move {
                 tool.execute(json!({
                     "command": "(sleep 2; printf survived > survivor) & printf ready > ready; wait"
                 }))
