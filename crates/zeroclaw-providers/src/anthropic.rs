@@ -2642,38 +2642,35 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
+    /// Buffered-request client. Without extra headers this is the shared
+    /// cached runtime client. With them, a dedicated client is built per
+    /// call (like the streaming client, so a runtime proxy change is picked
+    /// up) that stops at a cross-host redirect: reqwest strips only its own
+    /// credential headers on such a hop, so an operator header would
+    /// otherwise reach the redirect target. A build failure is returned,
+    /// never replaced by a client that drops the headers.
+    fn http_client(&self) -> anyhow::Result<Client> {
         if self.extra_headers.is_empty() {
-            return zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-                "model_provider.anthropic",
-                self.timeout_secs,
-                10,
+            return Ok(
+                zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+                    "model_provider.anthropic",
+                    self.timeout_secs,
+                    10,
+                ),
             );
         }
-        // Default headers are client-scoped, so a provider with extra headers
-        // cannot share the cached runtime client.
         let builder = Client::builder()
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .default_headers(self.extra_headers.clone());
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            .default_headers(self.extra_headers.clone())
+            .redirect(crate::opencode_session::redirect_policy());
+        let builder = zeroclaw_config::schema::try_apply_runtime_proxy_to_builder(
             builder,
             "model_provider.anthropic",
-        );
-        builder.build().unwrap_or_else(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                "Failed to build Anthropic client with extra headers; sending without them"
-            );
-            zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-                "model_provider.anthropic",
-                self.timeout_secs,
-                10,
-            )
-        })
+        )?;
+        builder
+            .build()
+            .context("Failed to build Anthropic client with extra headers")
     }
 
     /// Streaming requests have no whole-request deadline. Header acquisition
@@ -2682,8 +2679,15 @@ impl AnthropicModelProvider {
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT)
-            .default_headers(self.extra_headers.clone());
+            .read_timeout(STREAM_IDLE_TIMEOUT);
+        let builder = if self.extra_headers.is_empty() {
+            builder
+        } else {
+            // Same cross-host redirect stop as the buffered client.
+            builder
+                .default_headers(self.extra_headers.clone())
+                .redirect(crate::opencode_session::redirect_policy())
+        };
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.anthropic",
@@ -3183,7 +3187,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let mut request = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -3322,7 +3326,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let req = self
-            .http_client()
+            .http_client()?
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -3419,7 +3423,7 @@ impl ModelProvider for AnthropicModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             let mut request = self
-                .http_client()
+                .http_client()?
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
             request = self.apply_auth(request, credential, false, &[]);
@@ -3552,7 +3556,13 @@ impl ModelProvider for AnthropicModelProvider {
             // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
-            let client = self.http_client();
+            let client = match self.http_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    let message = format!("Failed to build Anthropic client: {error:#}");
+                    return stream::once(async move { Err(StreamError::Http(message)) }).boxed();
+                }
+            };
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
             // Owned copy of the requested model moved into the `'static` block
@@ -4571,6 +4581,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("client")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
                 false,
@@ -4610,6 +4621,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("client")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
                 false,
@@ -4646,6 +4658,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .apply_auth(
                     model_provider
                         .http_client()
+                        .expect("client")
                         .get("https://api.anthropic.com/v1/models"),
                     credential,
                     false,
@@ -10657,6 +10670,28 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    #[test]
+    fn extra_header_clients_stop_at_cross_host_redirects() {
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default. The policy itself is tested in `opencode_session`.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+        let with_headers = AnthropicModelProvider::builder("test")
+            .extra_headers(&gateway_headers(&[("x-gateway-key", "gateway-secret")]))
+            .build();
+        assert!(has_policy(with_headers.http_client().expect("client")));
+        assert!(has_policy(
+            with_headers
+                .streaming_http_client()
+                .expect("streaming client")
+        ));
+
+        let plain = AnthropicModelProvider::builder("test").build();
+        assert!(!has_policy(plain.http_client().expect("client")));
+        assert!(!has_policy(
+            plain.streaming_http_client().expect("streaming client")
+        ));
+    }
+
     #[tokio::test]
     async fn server_fallback_config_adds_param_and_beta_header() {
         let (addr, captured, server) = spawn_capturing_server().await;
@@ -11792,6 +11827,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("client")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
                 true,
@@ -11817,6 +11853,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             .apply_auth(
                 model_provider
                     .http_client()
+                    .expect("client")
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
                 true,
