@@ -183,6 +183,8 @@ Docs are built and published as part of the release pipeline rather than on ever
 
 Scheduled monthly scan on the 1st of every month at 09:00 UTC. Runs `cargo outdated --workspace` across all workspace members. Opens a `dependencies`-labeled issue when stale deps are found. Permissions: `contents: read` + `issues: write`. Dedup guard prevents piling up if the previous issue is still open.
 
+The issue preview may be truncated, but its linked `monthly-outdated-report` artifact retains the complete scan output for 30 days.
+
 First triage step for a new issue: check if the reported outdated crates have semver-incompatible bumps and whether the consuming crate's API changed. If the bump is trivial (patch/minor), create a short dep-only PR. If the upgrade is blocked by semver breaks, close the issue with a note and the blocking crate name.
 
 ### Cross-Platform Build (`cross-platform-build-manual.yml`)
