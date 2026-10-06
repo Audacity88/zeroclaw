@@ -3041,7 +3041,7 @@ pub async fn handle_migrate(
             // failure refuses the migration with the original file
             // untouched. There is no second save: the migrated file
             // written below IS the persisted config.
-            let prepared = match zeroclaw_config::schema::Config::prepare_from_migrated_toml(
+            let mut prepared = match zeroclaw_config::schema::Config::prepare_from_migrated_toml(
                 &new_content,
                 &config_path,
                 &data_dir,
@@ -3143,6 +3143,9 @@ pub async fn handle_migrate(
                     // revision. The disk replacement above is committed —
                     // it is not rolled back — and this publication is the
                     // same retained task, so the two cannot split.
+                    // The prepared value now represents the file successfully replaced
+                    // above, so later full saves retain that target's load provenance.
+                    prepared.loaded_from = Some(replace_config_path.clone());
                     authorization.publish_persisted(&prepared);
                     commit
                         .publish(revision, prepared)
