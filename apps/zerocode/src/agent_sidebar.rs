@@ -809,7 +809,6 @@ mod tests {
                     rows,
                     &SidebarCtx {
                         active_pane: Some(PaneKind::Chat),
-                        quickstart_active: false,
                         connected: true,
                     },
                 );

@@ -4875,7 +4875,6 @@ mod tests {
         let area = Rect::new(70, 0, 30, 10);
         let ctx = crate::agent_sidebar::SidebarCtx {
             active_pane: Some(chat::PaneKind::Chat),
-            quickstart_active: false,
             connected: true,
         };
         let mut rows = acp_pane.session_summaries();
