@@ -11035,10 +11035,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let server = ::zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        // A 1 s read-idle client stands in for the real bound so the silent
+        // A 100 ms read-idle client stands in for the real bound so the silent
         // body trips it quickly; the message must still name the bound.
         let client = reqwest::Client::builder()
-            .read_timeout(std::time::Duration::from_secs(1))
+            .read_timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap();
         let response = client
