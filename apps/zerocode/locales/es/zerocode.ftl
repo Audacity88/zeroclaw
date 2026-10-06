@@ -428,7 +428,6 @@ zc-chat-no-agents = No hay agentes habilitados. Configura un agente en la pesta�
 zc-chat-error-fetch-agents = No se pudieron obtener los agentes: { $error }
 zc-chat-history-trimmed = El historial anterior de la conversaci처n se recort처: { $reason } (se eliminaron { $dropped } mensajes; se conservaron { $kept } turnos).
 
-zc-chat-injected-prompt-source = Indicaci처n inyectada por el agente { $source }:
 zc-chat-error-create-session = No se pudo crear la sesi처n: { $error }
 zc-chat-session-switch-error = No se pudo cambiar de sesi처n: { $error }
 zc-chat-status-working = trabajando
