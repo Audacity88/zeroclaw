@@ -8962,6 +8962,16 @@ fn render_conversation(
             body_area,
         ));
     }
+    // Retain suppression tags in cached lines for later URL rescans, but never
+    // emit their private underline color to the terminal or visible snapshot.
+    for y in body_area.y..body_area.bottom() {
+        for x in body_area.x..body_area.right() {
+            let cell = &mut f.buffer_mut()[(x, y)];
+            if cell.underline_color == DISABLED_URL_UNDERLINE_COLOR {
+                cell.underline_color = ratatui::style::Color::Reset;
+            }
+        }
+    }
     let transcript_snapshot_captured = capture_transcript_snapshot(
         f,
         state,
@@ -10230,7 +10240,22 @@ struct TableCellLine<'a> {
 }
 
 fn table_wrap_break(grapheme: &str) -> bool {
-    grapheme == "\u{200b}" || (grapheme != "\u{00a0}" && grapheme.chars().all(char::is_whitespace))
+    grapheme.chars().all(table_wrap_break_char)
+}
+
+fn table_wrap_break_char(ch: char) -> bool {
+    ch == '\u{200b}' || (ch != '\u{00a0}' && ch.is_whitespace())
+}
+
+fn table_fragment_content_range(text: &str) -> Range<usize> {
+    let mut range = text.len()..text.len();
+    for (offset, grapheme, _) in crate::display_width::grapheme_widths(text) {
+        if !table_wrap_break(grapheme) {
+            range.start = range.start.min(offset);
+            range.end = offset + grapheme.len();
+        }
+    }
+    range
 }
 
 fn wrap_table_cell(text: &str, budget: usize) -> Vec<TableCellLine<'_>> {
@@ -10251,12 +10276,20 @@ fn wrap_table_cell(text: &str, budget: usize) -> Vec<TableCellLine<'_>> {
             let mut fragments = Vec::new();
             let mut start_index = 0usize;
             while start_index < graphemes.len() {
+                let mut content_start = start_index;
+                while content_start < graphemes.len() && graphemes[content_start].3 {
+                    content_start += 1;
+                }
+                if content_start == graphemes.len() {
+                    fragments.push((graphemes[start_index].0, text.len()));
+                    break;
+                }
                 let mut width = 0usize;
-                let mut end_index = start_index;
+                let mut end_index = content_start;
                 let mut last_break = None;
                 while end_index < graphemes.len() {
                     let next_width = width.saturating_add(graphemes[end_index].2);
-                    if end_index > start_index && next_width > budget {
+                    if end_index > content_start && next_width > budget {
                         break;
                     }
                     width = next_width;
@@ -10270,8 +10303,12 @@ fn wrap_table_cell(text: &str, budget: usize) -> Vec<TableCellLine<'_>> {
                 }
                 if end_index < graphemes.len() {
                     end_index = last_break
-                        .filter(|index| *index > start_index)
+                        .filter(|index| *index > content_start)
                         .unwrap_or(end_index);
+                }
+                // Preserve source separators without blank continuation rows.
+                while end_index < graphemes.len() && graphemes[end_index].3 {
+                    end_index += 1;
                 }
                 let start = graphemes[start_index].0;
                 let end = graphemes[end_index - 1].1;
@@ -10455,23 +10492,28 @@ fn render_table(
                 for (index, cell_lines) in wrapped_cells.iter().enumerate() {
                     let align = alignments.get(index).copied().unwrap_or(MdAlign::None);
                     if let Some(fragment) = cell_lines.get(line_index) {
+                        let content_range = table_fragment_content_range(fragment.text);
+                        let text_start = content_range.start;
+                        let text = &fragment.text[content_range];
                         let (left_padding, right_padding) =
-                            cell_padding(fragment.text, widths[index], align);
+                            cell_padding(text, widths[index], align);
                         spans.push(Span::raw(" ".repeat(outer_left_padding + left_padding)));
                         let mut cursor = 0usize;
                         for (start, end) in &fragment.disabled_url_ranges {
-                            if *start > cursor {
-                                spans.push(Span::raw(fragment.text[cursor..*start].to_string()));
+                            let start = start.saturating_sub(text_start).min(text.len());
+                            let end = end.saturating_sub(text_start).min(text.len());
+                            if start > cursor {
+                                spans.push(Span::raw(text[cursor..start].to_string()));
                             }
                             spans.push(Span::styled(
-                                fragment.text[*start..*end].to_string(),
+                                text[start..end].to_string(),
                                 disabled_url_actions_style(),
                             ));
-                            cursor = *end;
+                            cursor = end;
                         }
                         spans.push(Span::raw(format!(
                             "{}{}{}",
-                            &fragment.text[cursor..],
+                            &text[cursor..],
                             " ".repeat(right_padding),
                             " ".repeat(outer_right_padding),
                         )));
@@ -12910,12 +12952,7 @@ impl ChatState {
                 .push((line_start, screen_cursor));
 
             if !self.cached_thought_layouts.contains_key(&line_index) {
-                let text = line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>();
-                let urls = recognized_url_ranges(&text);
+                let (_, urls) = actionable_url_ranges(line);
                 if !urls.is_empty() {
                     let layout = self.cached_line_layouts[line_index]
                         .as_ref()
@@ -31357,10 +31394,152 @@ mod tests {
     }
 
     #[test]
+    fn md_table_wrap_spaces_do_not_add_blank_or_indented_rows() {
+        for (input, budget, expected) in [
+            ("30 Dec 2025", 3, vec!["30", "Dec", "202", "5"]),
+            ("Senior Dev", 6, vec!["Senior", "Dev"]),
+            ("a  b", 2, vec!["a", "b"]),
+        ] {
+            let wrapped = wrap_table_cell(input, budget);
+            assert_eq!(
+                wrapped.iter().map(|line| line.text).collect::<String>(),
+                input
+            );
+            assert_eq!(
+                wrapped
+                    .iter()
+                    .map(|line| line.text.trim_matches(table_wrap_break_char))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let lines = render_table(
+                vec![vec![input.to_string()]],
+                vec![pulldown_cmark::Alignment::None],
+                (budget + 4) as u16,
+            );
+            let rows = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .filter(|line| line.starts_with('\u{2502}'))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), expected.len());
+            for (row, text) in rows.iter().zip(expected) {
+                assert_eq!(row, &format!("\u{2502} {text:<budget$} \u{2502}"));
+                assert!(crate::display_width::display_width(row) <= budget + 4);
+            }
+        }
+    }
+
+    #[test]
+    fn md_table_url_markers_are_consumed_before_cached_and_streaming_display() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let width = 24;
+        let source = |url: &str| {
+            format!("| links |\n|---|\n| https://example.com/a/very/long/path |\n\n{url}\n")
+        };
+        let mut chat = state();
+        chat.browse_cursor = Some(0);
+        chat.entries
+            .push(ChatEntry::AgentMessage(Arc::from(source("https://a.co"))));
+        let area = Rect::new(0, 0, width + 2, 80);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        for mode in 0..4 {
+            match mode {
+                0 => chat.mark_dirty_full(),
+                1 => {
+                    chat.entries
+                        .push(ChatEntry::AgentMessage(Arc::from(source("https://b.co"))));
+                    chat.mark_dirty_append();
+                }
+                2 | 3 => {
+                    chat.entries[1] = ChatEntry::AgentMessage(Arc::from(source("https://c.co")));
+                    if mode == 2 {
+                        chat.mark_dirty_tail(1);
+                    } else {
+                        chat.mark_dirty_full();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            chat.rebuild_lines(width);
+            assert!(
+                chat.cached_lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(disables_url_actions),
+                "canonical lines retain suppression through prefix rescans"
+            );
+            assert!(
+                chat.cached_lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            );
+            let urls = chat
+                .cached_url_regions
+                .iter()
+                .flat_map(|region| &region.urls)
+                .map(|(_, _, url)| url.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                urls,
+                match mode {
+                    0 => vec!["https://a.co"],
+                    1 => vec!["https://a.co", "https://b.co"],
+                    _ => vec!["https://a.co", "https://c.co"],
+                }
+            );
+            terminal
+                .draw(|frame| render_conversation(frame, &mut chat, area))
+                .unwrap();
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .all(|cell| cell.underline_color != DISABLED_URL_UNDERLINE_COLOR)
+            );
+        }
+
+        chat.browse_cursor = None;
+        chat.mark_dirty_full();
+        chat.streaming_text = source("https://d.co");
+        terminal
+            .draw(|frame| render_conversation(frame, &mut chat, area))
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.underline_color != DISABLED_URL_UNDERLINE_COLOR)
+        );
+        assert!(
+            chat.url_hit_regions
+                .iter()
+                .any(|hit| hit.url == "https://d.co")
+        );
+        assert!(
+            !chat
+                .url_hit_regions
+                .iter()
+                .any(|hit| hit.url.starts_with("https://example.com"))
+        );
+    }
+
+    #[test]
     fn md_table_cell_wrapping_handles_more_than_u16_max_whitespace() {
         let input = " ".repeat(70_000);
         let wrapped = wrap_table_cell(&input, 65_536);
-        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped.len(), 1);
         assert_eq!(
             wrapped.iter().map(|line| line.text).collect::<String>(),
             input
@@ -31369,7 +31548,13 @@ mod tests {
 
     #[test]
     fn md_table_cell_fitting_unicode_and_zero_width_content_stays_whole() {
-        for (input, budget) in [("\u{754c}", 2), ("\u{200b}", 1), ("e\u{301}", 1)] {
+        for (input, budget) in [
+            ("\u{754c}", 2),
+            ("\u{200b}", 1),
+            ("e\u{301}", 1),
+            (" \u{301}a", 2),
+            ("\u{00a0}a", 2),
+        ] {
             let wrapped = wrap_table_cell(input, budget);
             assert_eq!(
                 wrapped,
@@ -31378,6 +31563,9 @@ mod tests {
                     disabled_url_ranges: Vec::new(),
                 }]
             );
+            if input != "\u{200b}" {
+                assert_eq!(&input[table_fragment_content_range(input)], input);
+            }
         }
     }
 
