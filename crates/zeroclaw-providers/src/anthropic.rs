@@ -9402,6 +9402,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn extra_headers_reach_non_streaming_requests_without_replacing_auth() {
+        // Serialized against the test that makes the extra-header client
+        // fail to build through an invalid runtime proxy.
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let (addr, captured, server) = spawn_capturing_server().await;
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("sk-ant-api-key"))
@@ -9490,26 +9493,313 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    #[test]
-    fn extra_header_clients_stop_at_cross_host_redirects() {
-        // reqwest's `Debug` names the redirect policy only when it is not the
-        // default. The policy itself is tested in `opencode_session`.
-        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
-        let with_headers = AnthropicModelProvider::builder("test")
+    /// Loopback servers for the extra-header redirect boundary. On `origin`,
+    /// `/same/v1/messages` answers with a same-host 307 to
+    /// `/final/v1/messages`, which replies with a message (SSE when the
+    /// request asked to stream) and records the `x-gateway-key` it received;
+    /// `/cross/v1/messages` answers with a 307 to `elsewhere`, which only
+    /// counts the requests that reach it.
+    struct RedirectServers {
+        origin: std::net::SocketAddr,
+        elsewhere_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        final_keys: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        servers: [tokio::task::JoinHandle<()>; 2],
+    }
+
+    impl RedirectServers {
+        fn provider(&self, path: &str) -> AnthropicModelProvider {
+            AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{}{path}", self.origin))
+                .extra_headers(&gateway_headers(&[("x-gateway-key", "gateway-secret")]))
+                .build()
+        }
+
+        fn elsewhere_hits(&self) -> usize {
+            self.elsewhere_hits
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn final_keys(&self) -> Vec<Option<String>> {
+            self.final_keys.lock().unwrap().clone()
+        }
+
+        fn abort(&self) {
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    async fn spawn_redirect_servers() -> RedirectServers {
+        use axum::{
+            Json, Router,
+            body::Bytes,
+            http::{HeaderMap, StatusCode, header},
+            response::{IntoResponse, Redirect, Response},
+            routing::post,
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-fable-5\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+
+        async fn bind(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            (addr, server)
+        }
+
+        let elsewhere_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&elsewhere_hits);
+        let (elsewhere, elsewhere_server) = bind(Router::new().fallback(move || {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }))
+        .await;
+
+        let final_keys = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::clone(&final_keys);
+        let cross_target = format!("http://{elsewhere}/v1/messages");
+        let (origin, origin_server) = bind(
+            Router::new()
+                .route(
+                    "/same/v1/messages",
+                    post(|| async { Redirect::temporary("/final/v1/messages") }),
+                )
+                .route(
+                    "/cross/v1/messages",
+                    post(move || {
+                        let target = cross_target.clone();
+                        async move { Redirect::temporary(&target) }
+                    }),
+                )
+                .route(
+                    "/final/v1/messages",
+                    post(move |headers: HeaderMap, body: Bytes| {
+                        let keys = Arc::clone(&keys);
+                        async move {
+                            keys.lock().unwrap().push(
+                                headers
+                                    .get("x-gateway-key")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string),
+                            );
+                            let streaming = serde_json::from_slice::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|body| body.get("stream")?.as_bool())
+                                .unwrap_or(false);
+                            if streaming {
+                                Response::builder()
+                                    .header(header::CONTENT_TYPE, "text/event-stream")
+                                    .body(axum::body::Body::from(SSE))
+                                    .unwrap()
+                            } else {
+                                Json(serde_json::json!({
+                                    "id": "msg_test",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "text", "text": "ok"}],
+                                    "model": "claude-fable-5",
+                                    "stop_reason": "end_turn",
+                                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                                }))
+                                .into_response()
+                            }
+                        }
+                    }),
+                ),
+        )
+        .await;
+
+        RedirectServers {
+            origin,
+            elsewhere_hits,
+            final_keys,
+            servers: [origin_server, elsewhere_server],
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_headers_buffered_redirects_stay_on_the_configured_host() {
+        // The extra-header client fails to build while another test holds
+        // an invalid runtime proxy; the guard serializes against it.
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let servers = spawn_redirect_servers().await;
+
+        let same = servers
+            .provider("/same")
+            .chat_with_system(None, "hello", "claude-fable-5", None)
+            .await;
+        let cross = servers
+            .provider("/cross")
+            .chat_with_system(None, "hello", "claude-fable-5", None)
+            .await;
+        servers.abort();
+
+        assert_eq!(same.expect("a same-host redirect is followed"), "ok");
+        assert_eq!(
+            servers.final_keys(),
+            vec![Some("gateway-secret".to_string())],
+            "the followed same-host hop keeps the configured header"
+        );
+        assert!(
+            cross.is_err(),
+            "a stopped cross-host redirect must not read as success"
+        );
+        assert_eq!(
+            servers.elsewhere_hits(),
+            0,
+            "the cross-host target must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_headers_streaming_redirects_stay_on_the_configured_host() {
+        async fn stream(provider: AnthropicModelProvider) -> Vec<StreamResult<StreamEvent>> {
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: None,
+            };
+            provider
+                .stream_chat(request, "claude-fable-5", None, StreamOptions::new(true))
+                .collect()
+                .await
+        }
+
+        let servers = spawn_redirect_servers().await;
+        let same = stream(servers.provider("/same")).await;
+        let cross = stream(servers.provider("/cross")).await;
+        servers.abort();
+
+        let mut text = String::new();
+        for event in &same {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(_) => {}
+                Err(error) => panic!("same-host redirect stream failed: {error:?}"),
+            }
+        }
+        assert_eq!(text, "ok", "a same-host redirect is followed");
+        assert_eq!(
+            servers.final_keys(),
+            vec![Some("gateway-secret".to_string())],
+            "the followed same-host hop keeps the configured header"
+        );
+        assert!(
+            cross.iter().any(Result::is_err),
+            "a stopped cross-host redirect must surface as a stream error: {cross:?}"
+        );
+        assert_eq!(
+            servers.elsewhere_hits(),
+            0,
+            "the cross-host target must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_header_client_build_failure_errors_without_sending() {
+        use axum::{Router, http::StatusCode};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().fallback(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        });
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
             .extra_headers(&gateway_headers(&[("x-gateway-key", "gateway-secret")]))
             .build();
-        assert!(has_policy(with_headers.http_client().expect("client")));
-        assert!(has_policy(
-            with_headers
-                .streaming_http_client()
-                .expect("streaming client")
-        ));
 
-        let plain = AnthropicModelProvider::builder("test").build();
-        assert!(!has_policy(plain.http_client().expect("client")));
-        assert!(!has_policy(
-            plain.streaming_http_client().expect("streaming client")
-        ));
+        // An invalid proxy URL scoped to this provider makes the
+        // extra-header client fail to build. The shared client would ignore
+        // it, so any fallback to that client would reach the server.
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("not a proxy url".to_string()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.anthropic".to_string()],
+            ..Default::default()
+        });
+        let buffered = provider
+            .chat_with_system(None, "hello", "claude-fable-5", None)
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            // Thinking without a display beta takes the buffered request
+            // inside `stream_chat`.
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1024,
+                display: None,
+            }),
+        };
+        let thinking: Vec<StreamResult<StreamEvent>> = provider
+            .stream_chat(request, "claude-fable-5", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        set_runtime_proxy_config(ProxyConfig::default());
+        server.abort();
+
+        let error = format!("{:#}", buffered.expect_err("buffered request must fail"));
+        assert!(
+            error.contains("Invalid runtime proxy configuration"),
+            "buffered error must name the client build failure: {error}"
+        );
+        match thinking.as_slice() {
+            [Err(StreamError::Http(message))] => assert!(
+                message.contains("Failed to build Anthropic client"),
+                "thinking stream error must name the client build failure: {message}"
+            ),
+            other => panic!("thinking stream must yield one build error, got {other:?}"),
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no request, with or without the configured headers, may be sent"
+        );
     }
 
     #[tokio::test]

@@ -3092,6 +3092,9 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use zeroclaw_config::schema::AnthropicModelProviderConfig;
 
+        // Serialized against the anthropic.rs test that makes the
+        // extra-header client fail to build through an invalid runtime proxy.
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
 
         async fn capture_headers(
