@@ -137,6 +137,8 @@ Inbound senders are gated through [peer groups](./peer-groups.md), not a per-cha
 
 The setting applies globally to all channels that use the shared channel orchestrator. Choose the mode for every audience that can receive a reply, including shared rooms and public channels. `detailed` exposes routing identifiers to those audiences; `redacted` reports recovery without those identifiers. There are no per-channel overrides.
 
+This setting does not control fallback notices in gateway web chat, ZeroCode, or RPC sessions; those use the agent turn path and retain their existing detailed notices with provider and model identifiers.
+
 Set the mode through ZeroCode Config or another supported config editor, or use:
 
 ```bash
