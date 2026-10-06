@@ -2193,9 +2193,8 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// A live session and its shell share one immutable forwarded map. A
-    /// reconnect may reuse it only if its *current* grants select the same
-    /// environment; otherwise the caller must create a new incarnation.
+    /// Resume keeps the session's immutable environment, not the attaching
+    /// connection's map. Current grants must still permit using that environment.
     fn authorize_resumed_environment(
         &self,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
@@ -2205,27 +2204,7 @@ impl RpcDispatcher {
             Method::SessionNew,
             grants,
             retained.is_some_and(|env| !env.is_empty()),
-        )?;
-        let current = self.session_tui_env(grants);
-        let retained = retained
-            .map(|env| env.as_ref())
-            .filter(|env| !env.is_empty());
-        let current = current.as_ref().filter(|env| !env.is_empty());
-        if retained != current {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Session environment differs from this connection; create a new session",
-            );
-            self.audit_auth_denial(
-                Method::SessionNew,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
-        }
-        Ok(())
+        )
     }
 
     /// Apply a principal's posture to an agent: narrow its tool surface to the
@@ -19016,16 +18995,15 @@ mod tests {
         );
     }
 
-    /// The environment is immutable for a live session. A reconnect carrying
-    /// a different map must create a new session; it cannot mutate the shell
-    /// underneath the session's admission record.
+    /// Another local operator connection may resume the same incarnation,
+    /// but its different environment cannot mutate the session's shell.
     #[cfg(unix)]
     #[tokio::test]
     async fn resuming_a_session_requires_its_original_environment() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = enforcement_ctx(shell_env_config(&tmp));
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:reuse".into());
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx.clone(), "unix:reuse".into());
         client.set_authenticated_for_test();
 
         // ── First connection: env-bearing registration builds the session ──
@@ -19056,39 +19034,36 @@ mod tests {
         );
         let canonical = ctx.sessions.get_agent("s-reuse").await.unwrap();
 
-        // ── A different registration cannot mutate the same incarnation ──
-        let epoch = ctx
-            .tui_registry
-            .register(crate::rpc::tui_identity::TuiEntry {
-                tui_id: "tui_reuse0001".to_string(),
-                connected_at: chrono::Utc::now(),
-                peer_label: "tui_reuse0001".to_string(),
-                transport: "unix".to_string(),
-                env: std::collections::HashMap::new(),
-                outbound: None,
-                auth: None,
-            });
-        client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
+        // A second terminal can attach without replacing the original map.
+        let mut other = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:reuse-other".into());
+        other.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut other,
+            "tui_other0001",
+            "REUSE_SOCK",
+            "/tmp/other.sock",
+        );
         let response = rpc(
-            &mut client,
+            &mut other,
             &mut rx,
             2,
             "session/new",
             json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
         )
         .await;
-        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+        assert_eq!(response["result"]["session_id"], "s-reuse", "{response}");
         assert!(
             Arc::ptr_eq(
                 &canonical,
                 &ctx.sessions.get_agent("s-reuse").await.unwrap()
             ),
-            "the refused resume leaves the canonical incarnation in place"
+            "resume from another terminal keeps the canonical incarnation"
         );
         let after = session_shell_env(&ctx, "s-reuse").await;
         assert!(
-            after.contains("REUSE_SOCK=/tmp/reuse.sock"),
-            "a refused resume must not change the shell environment:\n{after}"
+            after.contains("REUSE_SOCK=/tmp/reuse.sock") && !after.contains("/tmp/other.sock"),
+            "resume must use the original shell environment:\n{after}"
         );
 
         // ── Permitted continuity: re-registering the SAME environment keeps it ──
@@ -19120,9 +19095,7 @@ mod tests {
     }
 
     /// A session built with NO forwarded environment stays environment-free
-    /// across reuse; a matching empty registration is still compatible, and a
-    /// connection that now forwards a map is refused instead of grafting it
-    /// onto the live incarnation.
+    /// across reuse, even when the attaching connection forwards a map.
     #[cfg(unix)]
     #[tokio::test]
     async fn resuming_an_environment_free_session_stays_environment_free() {
@@ -19161,7 +19134,7 @@ mod tests {
         }
         let canonical = ctx.sessions.get_agent("s-empty").await.unwrap();
 
-        // ── An environment-bearing registration cannot resume it ──
+        // An environment-bearing registration can attach, but not graft its map.
         register_tui_env(
             &ctx,
             &mut client,
@@ -19177,20 +19150,13 @@ mod tests {
             json!({"agent_alias": "test-agent", "session_id": "s-empty"}),
         )
         .await;
-        assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("environment differs"),
-            "{response}"
-        );
+        assert_eq!(response["result"]["session_id"], "s-empty", "{response}");
         assert!(
             Arc::ptr_eq(
                 &canonical,
                 &ctx.sessions.get_agent("s-empty").await.unwrap()
             ),
-            "the refused resume leaves the canonical incarnation in place"
+            "resume leaves the environment-free canonical incarnation in place"
         );
         let env = session_shell_env(&ctx, "s-empty").await;
         assert!(
