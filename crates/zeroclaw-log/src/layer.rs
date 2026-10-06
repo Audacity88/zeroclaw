@@ -195,8 +195,9 @@ where
 
         // Walk span scope leaf→root, merging every attribution snapshot
         // and every ScopeExtra stash along the way. Inner spans win
-        // because composite groups stay with their nearest contributing span
-        // and plain fields / extra attributes fill only absent keys.
+        // because explicit composite groups stay with their nearest source;
+        // type-only groups can inherit a matching outer instance. Plain fields
+        // and extra attributes fill only absent keys.
         if let Some(span_ref) = ctx.lookup_current() {
             let mut current = Some(span_ref);
             while let Some(span) = current {
@@ -737,6 +738,17 @@ mod e2e_tests {
                                         "nested composite dotted"
                                     );
                                 }).await;
+                                zeroclaw_log::scope!(
+                                    channel: "telegram",
+                                    model_provider: "anthropic",
+                                    => async {
+                                        zeroclaw_log::record!(
+                                            INFO,
+                                            Event::new(module_path!(), Action::Note),
+                                            "nested composite matching type"
+                                        );
+                                    }
+                                ).await;
                                 let span = zeroclaw_log::info_span!(
                                     target: "zeroclaw_log_internal_scope",
                                     "late_composite",
@@ -765,7 +777,7 @@ mod e2e_tests {
                     .is_some_and(|message| message.starts_with("nested composite "))
             })
             .collect();
-        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events.len(), 4, "{events:?}");
         let bare = &events[0];
         assert_eq!(bare["message"], "nested composite bare");
         let attribution = &bare["zeroclaw"];
@@ -787,7 +799,24 @@ mod e2e_tests {
         assert_eq!(dotted["zeroclaw"]["model_provider"], "anthropic.outer");
         assert_eq!(dotted["zeroclaw"]["model_provider_alias"], "outer");
 
-        let updated = &events[2];
+        let matching = &events[2];
+        assert_eq!(matching["message"], "nested composite matching type");
+        for (prefix, expected_type) in [("channel", "telegram"), ("model_provider", "anthropic")] {
+            assert_eq!(
+                matching["zeroclaw"][prefix],
+                format!("{expected_type}.outer")
+            );
+            assert_eq!(
+                matching["zeroclaw"][crate::event::type_field(prefix)],
+                expected_type
+            );
+            assert_eq!(
+                matching["zeroclaw"][crate::event::alias_field(prefix)],
+                "outer"
+            );
+        }
+
+        let updated = &events[3];
         assert_eq!(updated["message"], "nested composite same span update");
         assert_eq!(updated["zeroclaw"]["channel"], "webhook.updated");
         assert_eq!(updated["zeroclaw"]["channel_type"], "webhook");

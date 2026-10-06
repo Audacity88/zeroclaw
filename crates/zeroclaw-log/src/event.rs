@@ -270,11 +270,21 @@ impl ZeroclawAttribution {
             .iter()
             .copied()
             .filter(|prefix| {
-                self.fields.keys().any(|key| {
+                let owns_group = self.fields.keys().any(|key| {
                     key == prefix
                         || key.strip_suffix("_type") == Some(prefix)
                         || key.strip_suffix("_alias") == Some(prefix)
-                })
+                });
+                if !owns_group {
+                    return false;
+                }
+                let type_key = type_field(prefix);
+                let matching_type_only = self.get(prefix).is_none()
+                    && self.get(&alias_field(prefix)).is_none()
+                    && self
+                        .get(&type_key)
+                        .is_some_and(|ty| other.get(&type_key) == Some(ty));
+                !matching_type_only
             })
             .collect();
         for (key, value) in &other.fields {
@@ -688,6 +698,29 @@ mod tests {
             let mut inherited = ZeroclawAttribution::default();
             inherited.merge_scope_from(&parent);
             assert_eq!(inherited.fields, parent.fields);
+
+            let mut matching = ZeroclawAttribution::default();
+            matching.set(type_field(prefix), "outer");
+            matching.merge_scope_from(&parent);
+            assert_eq!(matching.fields, parent.fields);
+
+            let mut more_distant = ZeroclawAttribution::default();
+            more_distant.set_composite(prefix, "outer.distant");
+            matching.merge_scope_from(&more_distant);
+            assert_eq!(matching.fields, parent.fields);
+
+            let mut explicit = ZeroclawAttribution::default();
+            explicit.set_composite(prefix, "outer.child");
+            explicit.merge_scope_from(&parent);
+            assert_eq!(explicit.get(prefix), Some("outer.child"));
+            assert_eq!(explicit.get(&alias_field(prefix)), Some("child"));
+
+            let mut partial = ZeroclawAttribution::default();
+            partial.set(type_field(prefix), "outer");
+            partial.set(alias_field(prefix), "child");
+            partial.merge_scope_from(&parent);
+            assert!(partial.get(prefix).is_none());
+            assert_eq!(partial.get(&alias_field(prefix)), Some("child"));
         }
     }
 
