@@ -1314,7 +1314,10 @@ fn all_tools_with_runtime_on_thread(
         shell_tool,
         sandbox,
     } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
-    sandbox.check_initialization()?;
+    sandbox.check_initialization().map_err(|error| {
+        let context = format!("agents.{agent_alias}: {error}");
+        anyhow::Error::new(error).context(context)
+    })?;
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -2980,7 +2983,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Seatbelt initialization failed: Seatbelt root symlink limit exceeded")
+                .starts_with("agents.test-agent: Seatbelt initialization failed: Seatbelt root symlink limit exceeded")
         );
         assert!(build(tmp.path().to_path_buf(), true).is_ok());
         assert!(build(cycle, false).is_ok());
