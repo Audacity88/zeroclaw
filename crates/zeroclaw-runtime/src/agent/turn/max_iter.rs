@@ -6,11 +6,12 @@ use super::StreamDelta;
 use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
@@ -29,6 +30,12 @@ impl CompletionLimit {
             }
             Self::ExecutionTree => "Agent exhausted the execution-tree iteration budget".into(),
         }
+    }
+
+    /// The iteration-cap stop, shared by the `ErrorAtCap` exit and the
+    /// graceful-summary failure paths so all of them carry one code and one message.
+    fn stop(self) -> TurnStop {
+        TurnStop::close_out(TurnStopCode::MaxIterations, self.explanation())
     }
 }
 
@@ -82,6 +89,7 @@ pub(crate) async fn finish_after_max_iterations(
     security: Option<&crate::security::SecurityPolicy>,
     hooks: Option<&crate::hooks::HookRunner>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    provider_image_state: Option<&mut super::ProviderImageState>,
     context_limits_for_route: impl Fn(&str, &str) -> ResolvedContextLimits + Send + Sync,
     crumb_present: &mut bool,
     reported_usage: Option<super::ReportedRequestUsage>,
@@ -104,7 +112,7 @@ pub(crate) async fn finish_after_max_iterations(
     // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
     // control signal: bail instead of spending another LLM call on a summary.
     if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
@@ -185,6 +193,7 @@ pub(crate) async fn finish_after_max_iterations(
             )
             .await?
             .messages;
+            let prepared_message_count = messages.len();
             messages.push(summary_prompt_mirror.clone());
             let pre_hook_messages = messages.clone();
             let mut selected_model = model.to_string();
@@ -212,6 +221,25 @@ pub(crate) async fn finish_after_max_iterations(
             } else {
                 Vec::new()
             };
+            let summary_image_route =
+                super::ProviderImageState::route(provider_name, &selected_model);
+            let quarantined_image_ids = provider_image_state
+                .map(|state| state.quarantined(&summary_image_route))
+                .unwrap_or_default();
+            if !quarantined_image_ids.is_empty() {
+                if !suffix_only {
+                    anyhow::bail!(crate::i18n::get_required_cli_string(
+                        "turn-context-hook-mutation-unsafe-error",
+                    ));
+                }
+                let transient_suffix = messages.split_off(prepared_message_count);
+                messages = super::suppress_quarantined_provider_images(
+                    &messages,
+                    &quarantined_image_ids,
+                    false,
+                );
+                messages.extend(transient_suffix);
+            }
             let tokens_before =
                 token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
             let mut dropped_messages = 0;
@@ -244,6 +272,11 @@ pub(crate) async fn finish_after_max_iterations(
                     )
                     .await?
                     .messages;
+                    messages = super::suppress_quarantined_provider_images(
+                        &messages,
+                        &quarantined_image_ids,
+                        false,
+                    );
                     messages.push(summary_prompt_mirror.clone());
                     messages.extend(hook_suffix.iter().cloned());
                     continue;
@@ -379,7 +412,11 @@ pub(crate) async fn finish_after_max_iterations(
             return Err(ToolLoopCancelled.into());
         }
         SummaryCall::TimedOut(step_secs) => {
-            anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
+            return Err(TurnStop::close_out(
+                TurnStopCode::MaxIterations,
+                format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
+            )
+            .into());
         }
         SummaryCall::Done(Err(e)) => {
             ::zeroclaw_log::record!(
@@ -397,7 +434,12 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
-            return Err(e).context(exhaustion);
+            // The provider error stays the source; the stop rides alongside
+            // it so the exit is typed without losing what actually failed.
+            return Err(zeroclaw_api::turn_stop::tag(
+                e.context(exhaustion),
+                limit.stop(),
+            ));
         }
         SummaryCall::Done(Ok(resp)) => {
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
@@ -407,7 +449,7 @@ pub(crate) async fn finish_after_max_iterations(
 
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
@@ -441,7 +483,7 @@ pub(crate) async fn finish_after_max_iterations(
         display_text
     };
     if display_text.trim().is_empty() {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
@@ -578,6 +620,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
@@ -897,6 +940,7 @@ mod graceful_summary_metering_tests {
                 None,
                 Some(&hooks),
                 None,
+                None,
                 |provider, model| {
                     assert_eq!(provider, "custom");
                     assert_eq!(model, "summary-model");
@@ -940,6 +984,147 @@ mod graceful_summary_metering_tests {
     }
 
     #[tokio::test]
+    async fn graceful_summary_omits_quarantined_paired_tool_image_before_and_after_trim() {
+        struct SummaryRouteHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for SummaryRouteHook {
+            fn name(&self) -> &str {
+                "summary-route-hook"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                *model = "summary-model".into();
+                messages.push(ChatMessage::user("hook context ".repeat(20)));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_reference = format!("data:image/png;base64,{PNG_B64}");
+        let multimodal_config = MultimodalConfig::default();
+
+        for budget in [4096, 512] {
+            let assistant_content = super::super::parse_response::build_native_assistant_history(
+                "",
+                &[zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_image".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            );
+            let mut history = vec![
+                ChatMessage::user("obsolete context ".repeat(800)),
+                ChatMessage::assistant("obsolete answer"),
+                ChatMessage::user("capture the screenshot"),
+                ChatMessage::assistant(assistant_content),
+                ChatMessage::tool(
+                    serde_json::json!({
+                        "content": "captured screenshot",
+                        "tool_call_id": "toolu_image",
+                        "attachments": [{"kind": "image", "target": image_reference}],
+                    })
+                    .to_string(),
+                ),
+            ];
+            let prepared = super::super::vision_route::prepare_messages_for_iteration(
+                &history,
+                &multimodal_config,
+                false,
+                None,
+            )
+            .await
+            .expect("tool image prepares");
+            let submitted = zeroclaw_providers::multimodal::provider_image_ids(&prepared.messages);
+            assert_eq!(
+                submitted.len(),
+                1,
+                "the paired tool image must be provider-visible"
+            );
+
+            let mut provider_image_state = super::super::ProviderImageState::default();
+            provider_image_state.record_recovery(
+                super::super::ProviderImageState::route("custom", "summary-model"),
+                &[],
+                &submitted,
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                seen: Arc::clone(&seen),
+                vision: true,
+                expected_request: Some(("summary-model", budget)),
+            };
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryRouteHook(Arc::clone(&hook_calls))));
+            let mut crumb_present = false;
+            let mut memory_preamble = None;
+
+            let out = finish_after_max_iterations(
+                &mut memory_preamble,
+                &provider,
+                &mut history,
+                "custom",
+                "original-model",
+                "original-model",
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::LocalIterations(2),
+                String::new(),
+                "summary-quarantined-tool-image",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                None,
+                &multimodal_config,
+                None,
+                Some(&hooks),
+                None,
+                Some(&mut provider_image_state),
+                |provider, model| {
+                    assert_eq!(provider, "custom");
+                    assert_eq!(model, "summary-model");
+                    ResolvedContextLimits {
+                        model_context_window: budget,
+                        ..ResolvedContextLimits::legacy_fallback(budget)
+                    }
+                },
+                &mut crumb_present,
+                None,
+                &crate::observability::NoopObserver,
+            )
+            .await
+            .expect("graceful summary succeeds");
+
+            assert!(out.contains("wrap-up summary"));
+            assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+            let captured = seen.lock().unwrap();
+            assert!(captured[0].contains("hook context"));
+            assert!(
+                !captured[0].contains(PNG_B64),
+                "the quarantined paired tool image reached the summary provider: {}",
+                captured[0]
+            );
+            assert_eq!(crumb_present, budget == 512);
+            assert_eq!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains("obsolete")),
+                budget == 4096
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
         for disable_soft_budget in [false, true] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -975,6 +1160,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
                 None,
                 None,
                 None,
@@ -1072,6 +1258,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1151,6 +1338,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
@@ -1248,6 +1436,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
@@ -1558,6 +1747,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1643,6 +1833,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
@@ -1834,6 +2025,29 @@ mod graceful_summary_metering_tests {
         );
     }
 
+    // A summary that is only a terminal marker passes the semantic-empty
+    // check (which strips think tags, not markers) and is emptied by display
+    // cleanup; that exit must carry the same typed stop as the other cap exits.
+    #[tokio::test]
+    async fn graceful_summary_of_only_a_terminal_marker_is_a_typed_max_iterations_stop() {
+        let provider = RawTextProvider {
+            text: "<|eom|>".to_string(),
+        };
+        let error = run_summary(&provider)
+            .await
+            .expect_err("a marker-only summary is not a terminal answer");
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error)
+                .expect("marker-only exit must carry the typed stop")
+                .code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        assert_eq!(
+            error.to_string(),
+            "Agent exceeded maximum tool iterations (2)"
+        );
+    }
+
     #[tokio::test]
     async fn graceful_summary_chunk_suppresses_internal_tool_protocol_envelope() {
         let delta = emitted_chunk_for_raw_summary(
@@ -1880,6 +2094,36 @@ mod i18n_message_tests {
         assert!(
             msg.contains("maximum tool iterations"),
             "message should describe the limit: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::turn_stop::turn_stop;
+
+    #[test]
+    fn the_iteration_cap_stop_is_typed_and_says_what_it_always_said() {
+        let stop = CompletionLimit::LocalIterations(10).stop();
+        assert_eq!(stop.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            stop.to_string(),
+            "Agent exceeded maximum tool iterations (10)"
+        );
+        let err: anyhow::Error = stop.into();
+        assert_eq!(
+            turn_stop(&err)
+                .expect("stop must survive the anyhow hop")
+                .code,
+            TurnStopCode::MaxIterations
+        );
+
+        let tree = CompletionLimit::ExecutionTree.stop();
+        assert_eq!(tree.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            tree.to_string(),
+            "Agent exhausted the execution-tree iteration budget"
         );
     }
 }
