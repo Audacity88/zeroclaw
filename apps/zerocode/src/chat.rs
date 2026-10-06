@@ -763,6 +763,7 @@ struct PromptCompletion {
     turn_generation: u64,
     error: Option<String>,
     transport_closed: bool,
+    cancelled: bool,
 }
 
 /// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
@@ -2687,10 +2688,14 @@ impl Chat {
             if completion.error.is_some() {
                 state.remove_optimistic_user_message(completion.turn_generation);
             }
-            // The response proves the handler returned, but only the missing
-            // terminal notification distinguishes completed from cancelled or
-            // failed. Settle conservatively so queued work cannot auto-run.
-            let pause_reason = if completion.error.is_some() {
+            // Keep a known pause or cancellation reason. Other successful
+            // responses still cannot prove clean completion without a terminal
+            // notification, so queued work stays paused conservatively.
+            let pause_reason = if completion.error.is_some()
+                || completion.cancelled
+                || state.cancel_started_at.is_some()
+                || state.queue_paused == Some(QueuePauseReason::Generic)
+            {
                 QueuePauseReason::Generic
             } else {
                 QueuePauseReason::MissingCompletion
@@ -3525,6 +3530,9 @@ impl Chat {
                     client.connection_state(),
                     crate::client::ConnectionState::Disconnected { .. }
                 );
+            let cancelled = result
+                .as_ref()
+                .is_ok_and(|value| value["stop_reason"].as_str() == Some("cancelled"));
             let error = result.err().map(|e| format!("{} ({})", e.message, e.code));
             let _ = completion_tx
                 .send(PromptCompletion {
@@ -3532,6 +3540,7 @@ impl Chat {
                     turn_generation,
                     error,
                     transport_closed,
+                    cancelled,
                 })
                 .await;
         });
@@ -28486,16 +28495,19 @@ mod tests {
             "zc-queue-missing-completion-ghost",
             &[("key", &resume_queue_chord_label())],
         );
+        let dock_width = crate::config::SidebarSection::default().width;
         for width in [80, 120] {
             let area = Rect::new(0, 0, width, 24);
+            let conversation = Rect::new(0, 0, width - dock_width, area.height);
+            let queue = Rect::new(conversation.width, 0, dock_width, 3);
             let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
             terminal
-                .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+                .draw(|frame| chat.draw_with_dock(frame, conversation, Some(queue), None))
                 .unwrap();
             let rendered = overlay_text(&terminal, area);
             assert!(
                 rendered.contains(&hint),
-                "missing full recovery hint at {width}: {rendered}"
+                "missing full recovery hint at {width} with {dock_width}-column dock: {rendered}"
             );
             let row = rendered.lines().find(|row| row.contains(&hint)).unwrap();
             println!("{width}x24 terminal cells: {}", row.trim_end());
@@ -28511,6 +28523,123 @@ mod tests {
             next_rpc_request(&mut writer_rx, "explicit resume dispatches backlog").await;
         assert_eq!(follow_up["params"]["prompt"], "wait for explicit resume");
         assert!(!active_state(&mut chat).queue_paused());
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_preserves_known_pause_reasons() {
+        for (scenario, manual_pause, local_cancel, stop_reason) in [
+            ("manual pause", true, false, "end_turn"),
+            ("external cancellation", false, false, "cancelled"),
+            (
+                "local cancellation after streaming",
+                false,
+                true,
+                "end_turn",
+            ),
+        ] {
+            let (mut chat, mut writer_rx) = test_chat();
+            let mut active = state();
+            active
+                .enqueue_message("hello".to_string(), Vec::new())
+                .unwrap();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.pump_all_queues();
+            let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+            let active = active_state(&mut chat);
+            active
+                .enqueue_message("queued follow-up".to_string(), Vec::new())
+                .unwrap();
+            if manual_pause {
+                active.toggle_queue_pause();
+            }
+            if local_cancel {
+                active.enter_cancelling();
+                active.apply_update(SessionUpdate::AgentMessageChunk {
+                    session_id: "sess-1".to_string(),
+                    text: "last streamed chunk".to_string(),
+                });
+                assert!(!matches!(active.turn_status, TurnStatus::Cancelling));
+                assert!(active.cancel_started_at.is_some());
+            }
+            respond_ok(
+                &chat.rpc_out,
+                &request,
+                serde_json::json!({
+                    "session_id": "sess-1",
+                    "stop_reason": stop_reason,
+                    "content": ""
+                }),
+            );
+            tokio::task::yield_now().await;
+            chat.drain_prompt_completions();
+
+            let active = active_state(&mut chat);
+            assert!(!active.turn_in_flight, "{scenario}");
+            assert_eq!(
+                active.queue_paused,
+                Some(QueuePauseReason::Generic),
+                "{scenario}"
+            );
+            assert_eq!(active.queue_len(), 1, "{scenario}");
+            chat.pump_all_queues();
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "{scenario} must not dispatch backlog"
+            );
+            assert!(active_state(&mut chat).resume_queue());
+            chat.pump_all_queues();
+            let follow_up = next_rpc_request(&mut writer_rx, "resume dispatches backlog").await;
+            assert_eq!(
+                follow_up["params"]["prompt"], "queued follow-up",
+                "{scenario}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_cancelled_response_preserves_injection_override() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+        let active = active_state(&mut chat);
+        active
+            .enqueue_message("backlog".to_string(), Vec::new())
+            .unwrap();
+        active.enter_cancelling();
+        active
+            .inject_message("urgent".to_string(), Vec::new())
+            .unwrap();
+        respond_ok(
+            &chat.rpc_out,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "stop_reason": "cancelled",
+                "content": ""
+            }),
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(
+            active.turn_in_flight,
+            "injected work must dispatch after settlement"
+        );
+        assert!(!active.queue_paused());
+        assert_eq!(active.queue_len(), 1);
+        let urgent =
+            next_rpc_request(&mut writer_rx, "injection dispatches despite cancellation").await;
+        assert_eq!(urgent["params"]["prompt"], "urgent");
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "backlog waits for the injected turn"
+        );
     }
 
     #[tokio::test]
