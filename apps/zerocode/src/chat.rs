@@ -8070,12 +8070,26 @@ fn render_entry_into(
         Modifier::empty()
     };
     match entry {
-        ChatEntry::UserMessage { text, attachments } => {
-            let label_span = Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-you")),
-                theme::user_label_style().add_modifier(sel_mod),
-            );
+        ChatEntry::UserMessage {
+            text,
+            attachments,
+            source,
+        } => {
+            // A prompt injected by another agent is labelled with that
+            // agent's alias in the peer colour instead of "You:", so the
+            // pane never attributes a peer's words to its own operator.
+            let label_span = match source {
+                Some(source) => Span::styled(
+                    format!("{source}: "),
+                    theme::peer_label_style().add_modifier(sel_mod),
+                ),
+                None => Span::styled(
+                    format!("{} ", crate::i18n::t("zc-chat-label-you")),
+                    theme::user_label_style().add_modifier(sel_mod),
+                ),
+            };
             let body_style = theme::body_style().add_modifier(sel_mod);
+            let provenance_style = theme::dim_style().add_modifier(Modifier::ITALIC | sel_mod);
             let mut text_lines: Vec<&str> = match text {
                 Some(t) => t.split('\n').collect(),
                 None => Vec::new(),
@@ -8088,7 +8102,18 @@ fn render_entry_into(
                 if idx == 0 {
                     spans.push(label_span.clone());
                 }
-                spans.push(Span::styled((*line_text).to_string(), body_style));
+                // The runtime-stamped `[from agent …, session …]` line is
+                // metadata, not the peer's words: render it muted.
+                let is_provenance =
+                    idx == 0 && source.is_some() && line_text.starts_with("[from agent ");
+                spans.push(Span::styled(
+                    (*line_text).to_string(),
+                    if is_provenance {
+                        provenance_style
+                    } else {
+                        body_style
+                    },
+                ));
                 let mut line = Line::from(spans);
                 style_recognized_urls(std::slice::from_mut(&mut line));
                 lines.push(line);
@@ -10630,6 +10655,10 @@ pub enum ChatEntry {
     UserMessage {
         text: Option<Arc<str>>,
         attachments: Vec<Arc<str>>,
+        /// Alias of the agent that injected this prompt through
+        /// `sessions_prompt`. `None` for prompts typed in this pane.
+        /// Rendering uses it as the label; history refresh ignores it.
+        source: Option<Arc<str>>,
     },
     Tool {
         tool_call_id: Arc<str>,
@@ -10648,7 +10677,9 @@ pub enum ChatEntry {
 impl ChatEntry {
     fn refresh_matches(&self, canonical: &Self, strip_runtime_enrichment: bool) -> bool {
         if let (
-            Self::UserMessage { text, attachments },
+            Self::UserMessage {
+                text, attachments, ..
+            },
             Self::UserMessage {
                 text: Some(stored), ..
             },
@@ -10728,6 +10759,7 @@ impl ChatEntry {
                     })
                 }),
                 attachments: Vec::new(),
+                source: None,
             }),
             Self::AgentMessageContinuation(text) => {
                 Some(Self::AgentMessage(Arc::from(text.as_str())))
@@ -13768,25 +13800,20 @@ impl ChatState {
                 self.todo_tracker.set_plan(entries);
             }
             // Another agent injected this prompt (the sessions_prompt tool
-            // path). The pane never typed it, so it is appended here with
-            // its provenance label; the turn is already running daemon-side
-            // and its stream follows as ordinary turn events.
+            // path). The pane never typed it, so it is appended here as a
+            // user entry carrying the injecting agent as its `source`; the
+            // renderer labels it with that alias instead of "You:". The turn
+            // is already running daemon-side and its stream follows as
+            // ordinary turn events.
             SessionUpdate::UserMessage { text, source, .. } => {
                 self.freeze_prompt_settled_stream();
-                if let Some(source) = source.as_deref() {
-                    let notice = crate::i18n::t_args(
-                        "zc-chat-injected-prompt-source",
-                        &[("source", source)],
-                    );
-                    self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
-                }
                 if self.first_message.is_none() && !text.trim().is_empty() {
                     self.first_message = Some(text.clone());
                 }
                 self.entries.push(ChatEntry::UserMessage {
                     text: Some(Arc::<str>::from(text.as_str())),
                     attachments: Vec::new(),
+                    source: source.as_deref().map(Arc::<str>::from),
                 });
                 self.mark_dirty_append();
                 self.message_count = self.message_count.saturating_add(1);
@@ -13936,6 +13963,7 @@ impl ChatState {
         self.entries.push(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
+            source: None,
         });
         self.mark_dirty_append();
         let prior_message_count = self.message_count;
@@ -14952,6 +14980,7 @@ impl ChatState {
                     entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
                         attachments: vec![],
+                        source: None,
                     });
                 }
                 crate::client::MessageRole::Assistant => {
@@ -15094,7 +15123,9 @@ fn strip_refresh_enrichment_prefix(content: &str) -> &str {
 /// Body-only clipboard text.
 fn clipboard_text(entry: &ChatEntry) -> String {
     match entry {
-        ChatEntry::UserMessage { text, attachments } => {
+        ChatEntry::UserMessage {
+            text, attachments, ..
+        } => {
             let base = text.as_deref().unwrap_or("");
             if attachments.is_empty() {
                 base.to_string()
@@ -15340,6 +15371,7 @@ mod tests {
             &ChatEntry::UserMessage {
                 text: Some(Arc::from("visit https://example.com")),
                 attachments: Vec::new(),
+                source: None,
             },
             false,
             false,
@@ -15355,6 +15387,74 @@ mod tests {
             .expect("styled URL span");
         assert_eq!(url_span.style.fg, Some(theme::active().accent));
         assert!(url_span.style.add_modifier(Modifier::UNDERLINED) == url_span.style);
+    }
+
+    // A prompt injected by a peer agent must not read as the operator's own
+    // words: the label is the peer's alias in the peer colour, the runtime
+    // provenance stamp is muted, and the peer's actual text keeps body style.
+    #[test]
+    fn injected_user_message_renders_peer_label_and_muted_provenance() {
+        let mut lines = Vec::new();
+        render_entry_into(
+            &ChatEntry::UserMessage {
+                text: Some(Arc::from(
+                    "[from agent helper, session helper-1]\n\nplease summarize",
+                )),
+                attachments: Vec::new(),
+                source: Some(Arc::from("helper")),
+            },
+            false,
+            false,
+            ToolDisclosure::Collapsed,
+            80,
+            None,
+            &mut lines,
+        );
+        let label = &lines[0].spans[0];
+        assert_eq!(label.content.as_ref(), "helper: ");
+        assert_eq!(label.style.fg, Some(theme::active().tool));
+        assert!(
+            !lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content.contains(&crate::i18n::t("zc-chat-label-you"))),
+            "an injected prompt is never labelled as the operator's"
+        );
+        let provenance = &lines[0].spans[1];
+        assert!(provenance.content.starts_with("[from agent helper"));
+        assert_eq!(provenance.style.fg, Some(theme::active().dim));
+        assert!(provenance.style.add_modifier(Modifier::ITALIC) == provenance.style);
+        let body = lines
+            .last()
+            .and_then(|line| line.spans.last())
+            .expect("peer text line");
+        assert_eq!(body.content.as_ref(), "please summarize");
+        assert_eq!(body.style.fg, Some(theme::active().body));
+
+        let mut local = Vec::new();
+        render_entry_into(
+            &ChatEntry::UserMessage {
+                text: Some(Arc::from("[from agent nobody, session x] typed by hand")),
+                attachments: Vec::new(),
+                source: None,
+            },
+            false,
+            false,
+            ToolDisclosure::Collapsed,
+            80,
+            None,
+            &mut local,
+        );
+        assert_eq!(
+            local[0].spans[0].content.as_ref(),
+            format!("{} ", crate::i18n::t("zc-chat-label-you")),
+            "without a source the ordinary You: label is kept"
+        );
+        assert_eq!(
+            local[0].spans[1].style.fg,
+            Some(theme::active().body),
+            "a locally typed bracket is body text, not provenance"
+        );
     }
 
     #[test]
@@ -18849,6 +18949,7 @@ mod tests {
             state.entries.push(ChatEntry::UserMessage {
                 text: prompt.map(Arc::from),
                 attachments: vec!["photo.png".into(), "notes.txt".into()],
+                source: None,
             });
             state.entries.push(ChatEntry::AgentMessage("done".into()));
             state.browse_cursor = Some(0);
@@ -18891,10 +18992,12 @@ mod tests {
         let ordinary = ChatEntry::UserMessage {
             text: Some("look here".into()),
             attachments: Vec::new(),
+            source: None,
         };
         let marked = ChatEntry::UserMessage {
             text: Some("look here\n[IMAGE:/fixture/file.png]".into()),
             attachments: Vec::new(),
+            source: None,
         };
         assert!(!ordinary.refresh_matches(&marked, false));
     }
@@ -27757,12 +27860,13 @@ mod tests {
     }
 
     // An injected prompt arrives as an update the pane never typed: exactly
-    // one user entry, the source shown via the provenance label, and the
-    // turn tracked as in flight so the following stream renders normally.
+    // one user entry, the source carried on that entry (the renderer turns
+    // it into the peer label), and the turn tracked as in flight so the
+    // following stream renders normally.
     // The state object is the same one background sessions use, so routing
     // through drain_notifications needs no separate handling.
     #[test]
-    fn user_message_update_appends_one_user_entry_with_source_label() {
+    fn user_message_update_appends_one_user_entry_with_source() {
         let mut s = state();
         let prior_count = s.message_count;
         s.apply_update(SessionUpdate::UserMessage {
@@ -27777,25 +27881,31 @@ mod tests {
             .count();
         assert_eq!(user_entries, 1, "exactly one user entry must be appended");
         match s.entries.last() {
-            Some(ChatEntry::UserMessage { text, .. }) => assert_eq!(
-                text.as_deref(),
-                Some("[from agent helper, session helper-1]\n\nplease summarize")
-            ),
+            Some(ChatEntry::UserMessage { text, source, .. }) => {
+                assert_eq!(
+                    text.as_deref(),
+                    Some("[from agent helper, session helper-1]\n\nplease summarize")
+                );
+                assert_eq!(
+                    source.as_deref(),
+                    Some("helper"),
+                    "the entry must carry the injecting agent so it is not labelled You:"
+                );
+            }
             other => panic!("last entry must be the user message, got {other:?}"),
         }
         assert!(
-            s.entries.iter().any(|e| matches!(
-                e,
-                ChatEntry::SystemMessage(label) if label.contains("helper")
-            )),
-            "the source must be shown via the provenance label"
+            !s.entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::SystemMessage(_))),
+            "the source lives on the user entry; no separate notice row"
         );
         assert_eq!(s.message_count, prior_count + 1);
         assert!(s.turn_in_flight, "the injected turn must read as in flight");
     }
 
     #[test]
-    fn user_message_update_without_source_appends_without_label() {
+    fn user_message_update_without_source_keeps_you_label() {
         let mut s = state();
         s.apply_update(SessionUpdate::UserMessage {
             session_id: "sess-1".to_string(),
@@ -27807,6 +27917,13 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ChatEntry::SystemMessage(_))),
             "no source label when no source is given"
+        );
+        assert!(
+            matches!(
+                s.entries.last(),
+                Some(ChatEntry::UserMessage { source: None, .. })
+            ),
+            "a sourceless injected prompt keeps the ordinary You: label"
         );
         assert_eq!(
             s.entries

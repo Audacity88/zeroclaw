@@ -320,6 +320,16 @@ pub(crate) fn agent_label_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Label for a prompt another agent injected into this pane via
+/// `sessions_prompt` (`<alias>:`). Uses the tool role: it is the palette's
+/// "something external acted here" colour, already distinct from both the
+/// operator's `heading` and the agent's `title`.
+pub(crate) fn peer_label_style() -> Style {
+    Style::default()
+        .fg(active().tool)
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Error messages (error phase, etc.).
 pub(crate) fn error_style() -> Style {
     Style::default().fg(active().accent)
