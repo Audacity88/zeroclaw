@@ -130,7 +130,7 @@ impl SidebarPicker {
 pub(crate) struct AgentSidebar {
     /// Scroll offset into the session rows.
     scroll: u16,
-    /// User-selected display order across both panes, retained until UI exit.
+    /// User-selected display order within each pane, retained until UI exit.
     row_order: Vec<(PaneKind, String)>,
     /// Session identity captured by a row-body press, never a close control.
     drag: Option<(PaneKind, String)>,
@@ -228,8 +228,12 @@ impl AgentSidebar {
             return;
         }
         self.row_order.retain(|(pane, sid)| {
-            rows.iter()
-                .any(|row| row.pane_kind == *pane && row.session_id == *sid)
+            // An inactive pane is absent, not empty. Reconcile its membership
+            // only when the shell supplies that pane's current session rows.
+            ctx.active_pane != Some(*pane)
+                || rows
+                    .iter()
+                    .any(|row| row.pane_kind == *pane && row.session_id == *sid)
         });
         for row in rows {
             let key = (row.pane_kind, row.session_id.clone());
@@ -240,7 +244,7 @@ impl AgentSidebar {
         if self
             .drag
             .as_ref()
-            .is_some_and(|key| !self.row_order.contains(key))
+            .is_some_and(|key| ctx.active_pane != Some(key.0) || !self.row_order.contains(key))
         {
             self.cancel_drag();
         }
@@ -664,12 +668,18 @@ impl AgentSidebar {
             self.cancel_drag();
             return;
         };
+        let pane_positions: Vec<_> = self
+            .row_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (pane, _))| (*pane == key.0).then_some(index))
+            .collect();
         let area = self.rows_area;
         if area.height == 0 || col < area.x || col >= area.right() {
             return;
         }
         let visible = usize::from(area.height);
-        let max_scroll = self.row_order.len().saturating_sub(visible) as u16;
+        let max_scroll = pane_positions.len().saturating_sub(visible) as u16;
         // Dragging beyond either end reveals another row on each mouse event.
         let offset = if row < area.y {
             self.scroll = self.scroll.saturating_sub(1);
@@ -680,7 +690,7 @@ impl AgentSidebar {
         } else {
             usize::from(row - area.y)
         };
-        let to = (usize::from(self.scroll) + offset).min(self.row_order.len() - 1);
+        let to = pane_positions[(usize::from(self.scroll) + offset).min(pane_positions.len() - 1)];
         if from != to {
             let key = self.row_order.remove(from);
             self.row_order.insert(to, key);
@@ -799,6 +809,15 @@ mod tests {
     }
 
     fn draw_rows(sidebar: &mut AgentSidebar, rows: &[SidebarSessionSummary], height: u16) {
+        draw_rows_in_pane(sidebar, rows, height, PaneKind::Chat);
+    }
+
+    fn draw_rows_in_pane(
+        sidebar: &mut AgentSidebar,
+        rows: &[SidebarSessionSummary],
+        height: u16,
+        pane: PaneKind,
+    ) {
         let backend = ratatui::backend::TestBackend::new(30, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -808,7 +827,7 @@ mod tests {
                     Rect::new(0, 0, 30, height),
                     rows,
                     &SidebarCtx {
-                        active_pane: Some(PaneKind::Chat),
+                        active_pane: Some(pane),
                         connected: true,
                     },
                 );
@@ -836,12 +855,14 @@ mod tests {
         let mut rows = vec![
             summary("alpha", "chat-a", true),
             summary("beta", "chat-b", false),
-            summary("code", "code-a", true),
         ];
-        rows[2].pane_kind = PaneKind::Acp;
+        let code_rows = vec![
+            summary_in_pane("code", "code-a", PaneKind::Acp, true),
+            summary_in_pane("code", "code-b", PaneKind::Acp, false),
+        ];
         draw_rows(&mut sidebar, &rows, 10);
         let (_, _, first) = sidebar.row_rects[0].clone();
-        let (_, _, last) = sidebar.row_rects[2].clone();
+        let (_, _, last) = sidebar.row_rects[1].clone();
         assert_eq!(
             sidebar.handle_mouse(&click(first.x, first.y)),
             Some(SidebarEvent::FocusSession {
@@ -853,25 +874,44 @@ mod tests {
         draw_rows(&mut sidebar, &rows, 10);
         drag_to(&mut sidebar, last.x, last.y);
         draw_rows(&mut sidebar, &rows, 10);
-        assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-a"]);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "chat-a"]);
+
+        draw_rows_in_pane(&mut sidebar, &code_rows, 10, PaneKind::Acp);
+        assert!(sidebar.drag.is_none(), "switching panes ends capture");
+        assert_eq!(visible_sessions(&sidebar), ["code-a", "code-b"]);
+        let (_, _, code_first) = sidebar.row_rects[0].clone();
+        let (_, _, code_last) = sidebar.row_rects[1].clone();
+        sidebar.handle_mouse(&click(code_first.x, code_first.y));
+        drag_to(&mut sidebar, code_last.x, code_last.y);
+        draw_rows_in_pane(&mut sidebar, &code_rows, 10, PaneKind::Acp);
+        assert_eq!(visible_sessions(&sidebar), ["code-b", "code-a"]);
 
         sidebar.close_picker(); // Also runs while the daemon is disconnected.
         rows[0].status = SidebarStatus::Running;
         draw_rows(&mut sidebar, &rows, 10);
-        assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-a"]);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "chat-a"]);
         let (_, _, first) = sidebar.row_rects[0].clone();
-        let (_, _, last) = sidebar.row_rects[2].clone();
+        let (_, _, last) = sidebar.row_rects[1].clone();
         sidebar.handle_mouse(&click(last.x, last.y));
         drag_to(&mut sidebar, first.x, first.y);
         draw_rows(&mut sidebar, &rows, 10);
-        assert_eq!(visible_sessions(&sidebar), ["chat-a", "chat-b", "code-a"]);
+        assert_eq!(visible_sessions(&sidebar), ["chat-a", "chat-b"]);
 
         sidebar.handle_mouse(&click(first.x, first.y));
         rows.remove(0);
         rows.push(summary("new", "chat-c", false));
         draw_rows(&mut sidebar, &rows, 10);
-        assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-c"]);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "chat-c"]);
         assert!(sidebar.drag.is_none(), "removal ends the captured gesture");
+
+        draw_rows_in_pane(&mut sidebar, &code_rows, 10, PaneKind::Acp);
+        assert_eq!(visible_sessions(&sidebar), ["code-b", "code-a"]);
+        draw_rows(&mut sidebar, &[], 10);
+        assert!(visible_sessions(&sidebar).is_empty());
+        draw_rows_in_pane(&mut sidebar, &code_rows, 10, PaneKind::Acp);
+        assert_eq!(visible_sessions(&sidebar), ["code-b", "code-a"]);
+        draw_rows(&mut sidebar, &rows, 10);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "chat-c"]);
     }
 
     #[test]
@@ -903,6 +943,11 @@ mod tests {
     #[test]
     fn session_drag_scrolls_beyond_visible_rows_without_leaking_after_release() {
         let mut sidebar = sidebar();
+        let code_rows = vec![
+            summary_in_pane("code", "code-a", PaneKind::Acp, true),
+            summary_in_pane("code", "code-b", PaneKind::Acp, false),
+        ];
+        draw_rows_in_pane(&mut sidebar, &code_rows, 4, PaneKind::Acp);
         let rows: Vec<_> = (0..5)
             .map(|i| summary("alpha", &format!("s{i}"), i == 0))
             .collect();
@@ -931,6 +976,8 @@ mod tests {
         drag_to(&mut sidebar, first.x, below);
         draw_rows(&mut sidebar, &rows, 4);
         assert_eq!(visible_sessions(&sidebar), ["s0", "s1"]);
+        draw_rows_in_pane(&mut sidebar, &code_rows, 4, PaneKind::Acp);
+        assert_eq!(visible_sessions(&sidebar), ["code-a", "code-b"]);
     }
 
     #[test]

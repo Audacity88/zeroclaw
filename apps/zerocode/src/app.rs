@@ -4870,6 +4870,13 @@ mod tests {
         let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
         let mut acp_pane = acp::Acp::new(client.clone());
         chat_pane.activate_session_for_test("chat-session");
+        let mut entries = chat_pane.resume_entries();
+        let mut second = entries[0].clone();
+        second.session_id = "chat-second".into();
+        second.was_focused = false;
+        second.display_ordinal = 2;
+        entries.push(second);
+        chat_pane.set_resume_sessions(entries);
         acp_pane.activate_session_for_test("code-session");
         let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
         let area = Rect::new(70, 0, 30, 10);
@@ -4877,8 +4884,7 @@ mod tests {
             active_pane: Some(chat::PaneKind::Chat),
             connected: true,
         };
-        let mut rows = acp_pane.session_summaries();
-        rows.extend(chat_pane.session_summaries());
+        let rows = chat_pane.session_summaries();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
             .expect("test terminal");
         terminal
@@ -4902,8 +4908,8 @@ mod tests {
         assert_eq!(
             event,
             Some(crate::agent_sidebar::SidebarEvent::FocusSession {
-                pane: chat::PaneKind::Acp,
-                session_id: "code-session".into(),
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-session".into(),
             })
         );
         terminal
@@ -4939,8 +4945,21 @@ mod tests {
         reconnected_chat.set_resume_sessions(chat_pane.resume_entries());
         let mut reconnected_code = acp::Acp::new(client);
         reconnected_code.set_resume_sessions(acp_pane.resume_entries());
-        let mut rows = reconnected_code.session_summaries();
-        rows.extend(reconnected_chat.session_summaries());
+        let code_ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Acp),
+            connected: true,
+        };
+        terminal
+            .draw(|frame| {
+                sidebar.draw(
+                    frame,
+                    area,
+                    &reconnected_code.session_summaries(),
+                    &code_ctx,
+                )
+            })
+            .unwrap();
+        let rows = reconnected_chat.session_summaries();
         terminal
             .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
             .unwrap();
@@ -4958,7 +4977,7 @@ mod tests {
             event,
             Some(crate::agent_sidebar::SidebarEvent::FocusSession {
                 pane: chat::PaneKind::Chat,
-                session_id: "chat-session".into(),
+                session_id: "chat-second".into(),
             })
         );
     }
