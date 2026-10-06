@@ -3240,6 +3240,14 @@ impl RpcDispatcher {
             if result.is_ok() {
                 let accepted = Arc::new(commit.current_config());
                 publish_accepted_config_policy(&ctx.auth, &accepted);
+                // The daemon's cost tracker keeps its own copy of `[cost]`,
+                // taken when the daemon started. Hand it the accepted
+                // section so a raised or lowered limit binds the next budget
+                // check (including the next provider call of a turn already
+                // running) without a restart.
+                if let Some(tracker) = ctx.cost_tracker.as_ref() {
+                    tracker.update_config(accepted.cost.clone());
+                }
                 Self::apply_prepared_live_sessions_refresh(
                     Arc::clone(&ctx),
                     effects.prepared_sessions,
@@ -38330,6 +38338,73 @@ mod tests {
         let (mut dispatcher, rx, _sessions) = make_dispatcher_with_capture(config);
         dispatcher.set_authenticated_for_test();
         (dispatcher, rx)
+    }
+
+    /// A limit raised through `config/set` must bind the daemon's cost
+    /// tracker at its next budget check. The tracker keeps its own copy of
+    /// `[cost]`; before the accepted section was handed to it, RPC turns kept
+    /// enforcing the startup limit until the daemon restarted.
+    #[tokio::test]
+    async fn config_set_cost_limit_applies_to_live_cost_tracker() {
+        use zeroclaw_config::cost::types::{BudgetCheck, TokenUsage};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cost = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 1.0,
+            ..Default::default()
+        };
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            cost: cost.clone(),
+            ..Default::default()
+        };
+        config.save().await.expect("seed config.toml");
+        let tracker =
+            Arc::new(zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path()).unwrap());
+        // $3.00 recorded today against a $1.00 daily limit.
+        tracker
+            .record_usage(TokenUsage::new(
+                "test-model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        assert!(
+            matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ),
+            "precondition: the seeded spend trips the startup limit"
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, Arc::clone(&tracker));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set",
+            json!({"prop": "cost.daily_limit_usd", "value": 10.0}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "config/set: {response}");
+
+        assert_eq!(tracker.config().daily_limit_usd, 10.0);
+        assert!(
+            matches!(tracker.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the raised limit must apply without a restart"
+        );
     }
 
     /// Send one request through `process_line` (the wire dispatch path, not
