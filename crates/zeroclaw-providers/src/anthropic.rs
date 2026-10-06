@@ -10964,12 +10964,13 @@ data: {\"type\":\"message_stop\"}\n\n";
             // Thinking without a display beta takes the buffered request
             // inside `stream_chat`.
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                budget_tokens: 1024,
+                budget_tokens: Some(1024),
+                effort: None,
                 display: None,
             }),
         };
         let thinking: Vec<StreamResult<StreamEvent>> = provider
-            .stream_chat(request, "claude-fable-5", None, StreamOptions::new(true))
+            .stream_chat(request, "claude-sonnet-4-5", None, StreamOptions::new(true))
             .collect()
             .await;
         set_runtime_proxy_config(ProxyConfig::default());
