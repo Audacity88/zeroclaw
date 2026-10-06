@@ -6421,6 +6421,22 @@ impl RpcDispatcher {
             &self.rpc,
         )
         .await;
+        let owner_reached = owner_outbound.is_some();
+        let message = if owner_reached {
+            "turn notifications: fanning out to issuer and session owner"
+        } else {
+            "turn notifications: issuer only (owner absent, same connection, or not authorized)"
+        };
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "owner_fanout": owner_reached,
+                })),
+            message
+        );
         match owner_outbound {
             Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => {
                 fanout_outbound(vec![Arc::clone(&self.rpc), owner])
@@ -7077,7 +7093,29 @@ impl RpcDispatcher {
                     params,
                 ))
             {
-                let _ = turn_rpc.send_raw(frame).await;
+                // Record the handoff to the turn outbound. `send_raw` only
+                // reports that the frame entered the writer queue (the
+                // fanout, when the owner is a different connection); it
+                // says nothing about whether the owner pane could parse
+                // it. Whether the owner was reached at all is decided
+                // earlier, in `turn_notification_outbound`.
+                let queued = turn_rpc.send_raw(frame).await;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(if queued {
+                            ::zeroclaw_log::EventOutcome::Success
+                        } else {
+                            ::zeroclaw_log::EventOutcome::Failure
+                        })
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "injected_by": source,
+                            "prompt_chars": prompt.chars().count(),
+                        })),
+                    "turn dispatch: injected prompt user_message update queued to turn outbound"
+                );
             }
         }
         let checkpoint_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
