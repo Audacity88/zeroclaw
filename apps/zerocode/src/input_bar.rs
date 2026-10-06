@@ -1129,6 +1129,7 @@ impl InputBarState {
         use crate::keymap::InputBarAction as A;
         match A::from_chord(key) {
             Some(A::CopySelection | A::Cut) => self.has_selection(),
+            Some(A::HistoryPrev | A::HistoryNext) => !self.input.is_empty(),
             Some(
                 A::Undo
                 | A::Redo
