@@ -31496,7 +31496,9 @@ mod tests {
                 }
             );
             terminal
-                .draw(|frame| render_conversation(frame, &mut chat, area))
+                .draw(|frame| {
+                    render_conversation(frame, &mut chat, area);
+                })
                 .unwrap();
             assert!(
                 terminal
@@ -31512,7 +31514,9 @@ mod tests {
         chat.mark_dirty_full();
         chat.streaming_text = source("https://d.co");
         terminal
-            .draw(|frame| render_conversation(frame, &mut chat, area))
+            .draw(|frame| {
+                render_conversation(frame, &mut chat, area);
+            })
             .unwrap();
         assert!(
             terminal
