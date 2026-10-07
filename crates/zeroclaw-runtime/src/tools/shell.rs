@@ -1944,14 +1944,20 @@ mod tests {
             } else {
                 1
             });
+            // The descendant publishes its own PID, then becomes the sleep, so
+            // the PID file proves it is running and names the process to check.
             let task = zeroclaw_spawn::spawn!(async move {
                 tool.execute(json!({
-                    "command": "(sleep 2; printf survived > survivor) & printf ready > ready; wait"
+                    "command": "sh -c 'echo $$ > pid.tmp && mv pid.tmp descendant.pid && exec sleep 30' & wait"
                 }))
                 .await
             });
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !workspace.path().join("ready").exists() {
+            let pid_file = workspace.path().join("descendant.pid");
+            let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        break text.trim().parse().expect("descendant PID");
+                    }
                     assert!(
                         !task.is_finished(),
                         "shell exited before starting its descendant"
@@ -1970,13 +1976,42 @@ mod tests {
                 assert!(!result.success);
                 assert!(result.error.unwrap().contains("timed out"));
             }
-            tokio::time::sleep(Duration::from_millis(2200)).await;
+            let exited = tokio::time::timeout(Duration::from_secs(2), async {
+                while descendant_running(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !exited {
+                // SAFETY: kill only signals the PID the descendant reported.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
             assert!(
-                !workspace.path().join("survivor").exists(),
-                "descendant survived {}",
+                exited,
+                "descendant {pid} survived {}",
                 if cancel { "cancellation" } else { "timeout" }
             );
         }
+    }
+
+    /// True while `pid` names a live process. A killed descendant whose new
+    /// parent has not reaped it yet still answers `kill(pid, 0)`, so a zombie
+    /// counts as exited.
+    #[cfg(unix)]
+    fn descendant_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the PID exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        let Ok(state) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return true;
+        };
+        let state = String::from_utf8_lossy(&state.stdout);
+        !state.trim().is_empty() && !state.trim_start().starts_with('Z')
     }
 
     #[cfg(unix)]
