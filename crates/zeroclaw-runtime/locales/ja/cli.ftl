@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = {$url} でアプリを作成し、ボッ�
 cli-integrations-chat-configure = {$command} を起動して設定を開き、{$channel} のインスタンスと認証情報を設定します。
 cli-integrations-chat-bind = チャンネルのエイリアスをエージェントに関連付け、ピアグループのアクセス権を確認します。
 cli-integrations-chat-enable = 設定とアクセス権を確認してから、チャンネルのインスタンスを有効にします。
+cli-integrations-chat-imessage-transport = AppleScript オートメーションでメッセージを送信し、ローカルの「メッセージ」データベースを読み取って受信します。
+cli-integrations-chat-imessage-permissions = 「メッセージ」を操作するための macOS の「オートメーション」と、メッセージデータベースを読み取るための「フルディスクアクセス」を許可します。
+cli-integrations-chat-generic-setup = {$command} を実行して「設定」を開き、{$channel} に必要なフィールド、ルーティング、アクセス権を設定します。設定を確認してから有効にしてください。
 cli-skills-about = スキル (ユーザー定義機能) を管理
 cli-sop-about = 標準操作手順 (SOP) を管理
 cli-migrate-about = 他のエージェントランタイムからデータを移行
@@ -152,6 +155,15 @@ cli-auth-login-about = OAuth でログイン (OpenAI Codex、Gemini、または 
 cli-auth-refresh-about = リフレッシュトークンを使用して OAuth アクセストークンを更新
 cli-auth-logout-about = 認証プロファイルを削除
 cli-auth-use-about = プロバイダーのアクティブなプロファイルを設定
+cli-oidc-unknown-alias = 設定に [oidc.{ $alias }] エントリがありません。設定済みのエントリ: { $known }
+cli-oidc-device-visit = サインインするには { $uri } を開き、コード { $code } を入力してください
+cli-oidc-device-waiting = ID プロバイダーの承認を待っています(コードは { $seconds } 秒で失効します)...
+cli-oidc-device-expired = 承認前にデバイスコードが失効しました。コマンドを再実行してください。
+cli-oidc-enrolled = [oidc.{ $alias }] に登録しました。アクセストークンは標準出力にあります。RPC ハンドシェイクの auth_token として渡すか、ZEROCLAW_AUTH_TOKEN としてエクスポートしてください。
+cli-oidc-token-expiry = トークンは { $seconds } 秒で失効します。
+cli-oidc-browser-open = サインインのためにブラウザを開いています。開かない場合は次の URL にアクセスしてください:
+    { $uri }
+cli-oidc-browser-waiting = ブラウザでのサインイン完了を待っています...
 cli-auth-list-about = 認証プロファイルを一覧表示
 cli-auth-status-about = アクティブなプロファイルとトークン有効期限情報を表示
 cli-memory-list-about = オプションのフィルター付きでメモリエントリを一覧表示
@@ -428,6 +440,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 認証情報にサインインしていますが、それを使用するモデルプロバイダースロットがありません。OpenAI プロバイダースロットで `requires_openai_auth = true` を設定し、エージェントの `model_provider` をそこへ向けるか、`zeroclaw quickstart` を実行してください。
 cli-doctor-codex-auth-slot-no-profile = OpenAI スロット {$slots} は `requires_openai_auth = true` を設定していますが、OpenAI Codex 認証情報にサインインしていません。`zeroclaw auth login --provider openai-codex` を実行してください。
 cli-doctor-codex-auth-ok = OpenAI Codex 認証情報にサインインしており、モデルプロバイダースロットから参照されています。
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。このエージェントでは compact_context が有効です。各ブートストラップファイルは {$limit} 文字に制限されます。`[runtime_profiles.{$profile}]` で `compact_context = false` を設定するか、ファイルを短くしてください。
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。このエージェントでは compact_context が有効です（既定値、ランタイムプロファイルは未割り当て）。各ブートストラップファイルは {$limit} 文字に制限されます。`compact_context = false` を指定した `[runtime_profiles.<name>]` を追加し、エージェントに `runtime_profile = "<name>"` を設定してください。またはファイルを短くしてください。
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。各ブートストラップファイルは {$limit} 文字に制限されます。ファイルを短くしてください。
 cli-doctor-systemd-linger-enabled = systemd ユーザー linger は有効です
 cli-doctor-systemd-linger-disabled = systemd ユーザー linger は無効です。ログアウト後にユーザーサービスが停止する可能性があります。有効化: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = loginctl で systemd ユーザー linger を確認できませんでした
@@ -774,6 +789,7 @@ cli-desktop-not-installed = ZeroClaw コンパニオンアプリがインスト�
 cli-desktop-blurb1 = コンパニオンアプリは軽量なメニューバーアプリで、
 cli-desktop-blurb2 = CLI と同じゲートウェイに接続します。
 cli-config-all-configured = すべてのセクションは既に設定済みです。
+cli-config-initialized-sections = {$count} 個のセクションをデフォルト値で初期化しました:
 cli-config-schema-current = 設定は既に現在のスキーマバージョンです。
 cli-config-applied-ops = {$count} 件の操作を適用しました:
 cli-plugins-none = インストールされているプラグインはありません。
@@ -836,6 +852,8 @@ cli-config-secret-set = {$path} は設定されています(暗号化された�
 cli-config-secret-unset = {$path} は設定されていません(暗号化されたシークレット)
 cli-config-updated = {$path} を更新しました。
 cli-config-review-hint = `zeroclaw config list` を実行して確認し、必須フィールドを設定してください。
+cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを利用できません（{$error}）。モデル ID を手動で入力してください。
+model-switch-catalog-failed = 設定済みプロバイダープロファイル {$provider} のカタログを読み込めませんでした: {$error}
 cli-config-backed-up = {$path} にバックアップしました
 cli-plugin-name-version = プラグイン: {$name} v{$version}
 cli-plugin-description = 説明: {$desc}
@@ -909,7 +927,7 @@ turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }�
 turn-max-iterations-reached = *ターン停止: ツールの最大反復回数 ({ $max_iterations }) に達しました。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
-history-trim-reason-message-cap = 履歴メッセージ数の上限を超えました
+history-trim-reason-message-cap = 履歴ターン数の上限を超えました
 history-trim-reason-recovery = コンテキストウィンドウのオーバーフロー復旧
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
@@ -987,6 +1005,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` は利用できません — **{ $actual }**（`{ $model }`）からの応答
     モデル切り替え: /models
+channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
 delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
 turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
 delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]

@@ -2,41 +2,6 @@
 
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 
-/// A steering injection together with the ingress facts stamped by its
-/// producer. `None` is an explicit unknown/untrusted provenance state for
-/// legacy string callers; it is not a fallback to the enclosing turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SteeringMessage {
-    content: String,
-    ingress: Option<IngressContext>,
-}
-
-impl SteeringMessage {
-    #[must_use]
-    pub fn known(content: String, ingress: IngressContext) -> Self {
-        Self {
-            content,
-            ingress: Some(ingress),
-        }
-    }
-
-    #[must_use]
-    pub fn unknown(content: String) -> Self {
-        Self {
-            content,
-            ingress: None,
-        }
-    }
-
-    pub(crate) fn content(&self) -> &str {
-        &self.content
-    }
-
-    pub(crate) fn ingress(&self) -> Option<&IngressContext> {
-        self.ingress.as_ref()
-    }
-}
-
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TestPolicyObservation {
@@ -157,6 +122,7 @@ mod tests {
             },
             trust: TrustClass::Untrusted,
             origin: zeroclaw_api::ingress::TurnOrigin::Channel,
+            internal_principal: None,
         };
         let policy = IngressPolicy::default();
         assert_eq!(

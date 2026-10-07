@@ -151,7 +151,7 @@ fn build_linker(imports: crate::component::OptionalImports) -> Result<Linker<Plu
 ///   resolved from canonical config at request time.
 ///
 /// This is what closes the egress SSRF hole (issue 9395) for channels without
-/// withholding the surface: the ungoverned `wasmtime_wasi_http::p2::default_hooks()`
+/// withholding the surface: the ungoverned `wasmtime_wasi_http::default_hooks()`
 /// is never installed — [`PluginState`] hands `wasi:http` the policy hooks
 /// instead — so the host owns reach even though the guest links the import
 /// (issue 9582 threads `EgressHostService` through channel construction).
@@ -1140,8 +1140,12 @@ impl Channel for WasmChannel {
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
-        self.capabilities
-            .contains(ChannelCapabilities::SUPPORTS_MULTI_MESSAGE_STREAMING)
+        // WASM plugins only advertise a rendering capability; the ABI has no
+        // confirmed-delivery coordinate to reconcile against a sanitized final
+        // response. Keep the generic finalizer on the canonical-response path
+        // until that contract exists rather than treating attempted updates as
+        // confirmed paragraphs.
+        false
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
