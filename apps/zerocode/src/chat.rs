@@ -10827,8 +10827,10 @@ pub enum ChatEntry {
         text: Option<Arc<str>>,
         attachments: Vec<Arc<str>>,
         /// Alias of the agent that injected this prompt through
-        /// `sessions_prompt`. `None` for prompts typed in this pane.
-        /// Rendering uses it as the label; history refresh ignores it.
+        /// `sessions_prompt`. `None` for prompts typed in this pane. Set
+        /// from the live update, or recovered from the persisted
+        /// provenance stamp on reload. Rendering uses it as the label;
+        /// refresh identity ignores it.
         source: Option<Arc<str>>,
     },
     Tool {
@@ -14682,10 +14684,15 @@ impl ChatState {
             }
             match m.role() {
                 crate::client::MessageRole::User => {
+                    // Live injected prompts arrive with `source`; reloaded
+                    // ones only have the runtime's provenance stamp in the
+                    // persisted text. Recover it so the peer label survives
+                    // a session reload instead of reverting to "You:".
+                    let source = injected_source_from_content(&m.content);
                     entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
                         attachments: vec![],
-                        source: None,
+                        source,
                     });
                 }
                 crate::client::MessageRole::Assistant => {
@@ -14799,6 +14806,39 @@ fn strip_enrichment_prefix(content: &str) -> &str {
 }
 
 /// Strip the runtime envelope without discarding authored whitespace.
+/// Recover the injecting agent from a persisted user message.
+///
+/// The live `session/update` for an injected prompt carries `source`
+/// explicitly; the ACP store persists only role + content, so on reload the
+/// only trace is the runtime-stamped provenance line the `sessions_prompt`
+/// tool prepends: `[from agent <alias>, session <id>]` followed by a blank
+/// line, after the optional `[CURRENT DATE & TIME: …]` enrichment. Match
+/// that shape strictly (alias charset, exact separators) so ordinary prose
+/// is never relabelled.
+fn injected_source_from_content(content: &str) -> Option<Arc<str>> {
+    let body = strip_refresh_enrichment_prefix(content);
+    let rest = body.strip_prefix("[from agent ")?;
+    let alias_end = rest.find(", session ")?;
+    let alias = &rest[..alias_end];
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    let after_alias = &rest[alias_end + ", session ".len()..];
+    let bracket = after_alias.find(']')?;
+    let session = &after_alias[..bracket];
+    if session.is_empty() || session.contains(|c: char| c.is_whitespace() || c == '[') {
+        return None;
+    }
+    // Runtime inserts exactly two newlines after the stamp.
+    after_alias[bracket + 1..]
+        .starts_with("\n\n")
+        .then(|| Arc::<str>::from(alias))
+}
+
 fn strip_refresh_enrichment_prefix(content: &str) -> &str {
     let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
         return content;
@@ -33898,6 +33938,84 @@ mod tests {
             ChatEntry::UserMessage { text: Some(t), .. }
                 if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
         ));
+    }
+
+    // A reloaded injected prompt must keep its peer label: the store only
+    // has role + content, so the runtime's provenance stamp is the signal.
+    #[test]
+    fn load_history_recovers_injected_source_from_provenance_stamp() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session(
+            "sess-resume".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "[CURRENT DATE & TIME: 2026-10-07 09:03:14 +08:00]\n\n\
+                              [from agent experiment_fable, session 0f444de2-7537]\n\n\
+                              Ox — bounded request"
+                        .to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "received".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "typed by hand".to_string(),
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        let sources: Vec<Option<&str>> = s
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ChatEntry::UserMessage { source, .. } => Some(source.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec![Some("experiment_fable"), None]);
+    }
+
+    #[test]
+    fn injected_source_requires_the_exact_runtime_stamp_shape() {
+        let ok = |s: &str| {
+            injected_source_from_content(s)
+                .as_deref()
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            ok("[from agent helper, session abc-1]\n\nhi"),
+            Some("helper".to_string())
+        );
+        assert_eq!(
+            ok(
+                "[CURRENT DATE & TIME: 2026-01-01 00:00:00 UTC]\n\n[from agent a.b-c_d, session x]\n\nhi"
+            ),
+            Some("a.b-c_d".to_string())
+        );
+        // Prose that merely mentions the phrase, or a malformed stamp, is not provenance.
+        for text in [
+            "I got a note [from agent helper, session abc-1] yesterday",
+            "[from agent helper, session abc-1]\nhi",
+            "[from agent helper, session abc-1] hi",
+            "[from agent hel per, session abc-1]\n\nhi",
+            "[from agent helper, session ]\n\nhi",
+            "[from agent , session abc-1]\n\nhi",
+            "[from agent helper, session a b]\n\nhi",
+            "[from agent helper]\n\nhi",
+            "from agent helper, session abc-1\n\nhi",
+        ] {
+            assert_eq!(ok(text), None, "{text:?}");
+        }
     }
 
     #[tokio::test]
