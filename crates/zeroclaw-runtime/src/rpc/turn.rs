@@ -86,6 +86,7 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
     let prompt_runner = crate::tools::sessions_prompt::current_session_prompt_runner();
+    let injected_from = crate::tools::sessions_prompt::current_injected_from_session();
     let local_file_diffs = attribution.local_file_diffs;
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
@@ -128,7 +129,11 @@ where
                 })
                 .await
         });
-        crate::tools::sessions_prompt::scope_session_prompt_runner(prompt_runner, turn).await
+        crate::tools::sessions_prompt::scope_session_prompt_runner(
+            prompt_runner,
+            crate::tools::sessions_prompt::scope_injected_from_session(injected_from, turn),
+        )
+        .await
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));

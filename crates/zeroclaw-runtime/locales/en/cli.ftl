@@ -1448,6 +1448,7 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 tool-sessions-prompt-authenticated-turn-required = sessions_prompt requires a turn initiated by an authenticated RPC connection
+tool-sessions-prompt-reply-by-finishing-turn = session { $session } injected the prompt for this turn and is waiting on this turn's final response, which is delivered to it automatically as its tool result. To reply, finish this turn with the content you want it to receive. Prompting it back is refused: it stays busy until this turn ends, so retrying will not help.
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
