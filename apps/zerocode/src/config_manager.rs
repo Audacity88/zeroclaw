@@ -792,6 +792,30 @@ impl App {
     /// Handle a key event. Returns `Ok(true)` when the user wants to
     /// quit the entire TUI (never triggered from Config; use Ctrl+C at the app level).
     pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        match self.handle_key_inner(key, term).await {
+            Err(error) if self.absorb_rpc_timeout(&error) => Ok(false),
+            other => other,
+        }
+    }
+
+    /// A per-call RPC deadline (`DaemonRpcTimeout`) means the daemon is busy
+    /// on that one method, not that the connection is gone. Surfacing it as
+    /// a status line keeps the TUI alive; letting it unwind through
+    /// `app::run` used to exit the whole process (observed on `config/list`
+    /// while a route-affecting `config/set` was queued behind a running
+    /// turn). Returns `true` when the error was absorbed.
+    fn absorb_rpc_timeout(&mut self, error: &anyhow::Error) -> bool {
+        if crate::client::DaemonRpcTimeout::from_anyhow(error).is_none() {
+            return false;
+        }
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-load-failed",
+            &[("err", &format!("{error:#}"))],
+        ));
+        true
+    }
+
+    async fn handle_key_inner(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
         self.status_msg = None;
 
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
@@ -874,6 +898,18 @@ impl App {
 
     /// Handle a mouse event forwarded from the app event loop.
     pub(crate) async fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        term: &mut Term,
+    ) -> Result<()> {
+        match self.handle_mouse_inner(mouse, area, term).await {
+            Err(error) if self.absorb_rpc_timeout(&error) => Ok(()),
+            other => other,
+        }
+    }
+
+    async fn handle_mouse_inner(
         &mut self,
         mouse: MouseEvent,
         _area: Rect,
