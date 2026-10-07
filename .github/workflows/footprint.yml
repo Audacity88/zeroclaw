@@ -1,0 +1,98 @@
+name: Culling adapter footprint experiment
+
+on:
+  push:
+    branches: [codex/culling-footprint-20261008]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: culling-footprint-20261008
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  RUSTUP_TOOLCHAIN: 1.98.0
+  SOURCE_SHA: cb58607b8ea29c725d31bd44d629d80ec0bce41e
+  REPORTER_SHA: 40cb7be43e7db9b40cd5f720ee34d2ae964de415
+
+jobs:
+  measure:
+    if: github.repository == 'Audacity88/zeroclaw' && github.actor == 'Audacity88'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        profile: [full-dist, no-saas-coding, no-native-adapters]
+    steps:
+      - name: Check out experiment
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable measured source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: cb58607b8ea29c725d31bd44d629d80ec0bce41e
+          path: source
+          persist-credentials: false
+      - name: Check out immutable reporter
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: 40cb7be43e7db9b40cd5f720ee34d2ae964de415
+          path: reporter
+          persist-credentials: false
+      - name: Install fixed toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-unknown-linux-gnu
+      - name: Capture closure and measure one release binary
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          chmod +x harness/experiment.py
+          python3 harness/experiment.py measure "$PROFILE"
+      - name: Retain evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: footprint-${{ matrix.profile }}
+          path: harness/results/${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  summarize:
+    needs: measure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: 40cb7be43e7db9b40cd5f720ee34d2ae964de415
+          path: reporter
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: footprint-*
+          path: harness/results
+      - name: Validate controls and summarize capability costs
+        run: python3 harness/experiment.py summarize
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: footprint-summary
+          path: harness/results/summary.json
+          if-no-files-found: error
+          retention-days: 7
