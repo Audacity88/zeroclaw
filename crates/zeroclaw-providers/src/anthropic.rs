@@ -9497,8 +9497,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// `/same/v1/messages` answers with a same-host 307 to
     /// `/final/v1/messages`, which replies with a message (SSE when the
     /// request asked to stream) and records the `x-gateway-key` it received;
-    /// `/cross/v1/messages` answers with a 307 to `elsewhere`, which only
-    /// counts the requests that reach it.
+    /// `/cross/v1/messages` answers with a 307 to `elsewhere`, a second
+    /// server on another port, which only counts the requests that reach it.
+    ///
+    /// `/cross-host/v1/messages` answers with a 307 to the same port under
+    /// another hostname: a provider configured as `localhost:<port>` is sent
+    /// to `127.0.0.1:<port>/v1/messages`. The target is an IP literal, so a
+    /// followed hop needs no name lookup and lands on `origin`, where
+    /// `/v1/messages` counts it as an `elsewhere` hit. Only the host string
+    /// differs, so this case fails if the policy stops comparing hostnames.
     struct RedirectServers {
         origin: std::net::SocketAddr,
         elsewhere_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -9507,10 +9514,21 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     impl RedirectServers {
+        /// Provider whose base URL is `origin` as an IP literal.
         fn provider(&self, path: &str) -> AnthropicModelProvider {
+            self.provider_at(&self.origin.to_string(), path)
+        }
+
+        /// Provider whose base URL names `origin` as `localhost`, so a
+        /// redirect to the IP literal changes the host and keeps the port.
+        fn localhost_provider(&self, path: &str) -> AnthropicModelProvider {
+            self.provider_at(&format!("localhost:{}", self.origin.port()), path)
+        }
+
+        fn provider_at(&self, authority: &str, path: &str) -> AnthropicModelProvider {
             AnthropicModelProvider::builder("test")
                 .credential(Some("sk-ant-api-key"))
-                .base_url(&format!("http://{}{path}", self.origin))
+                .base_url(&format!("http://{authority}{path}"))
                 .extra_headers(&gateway_headers(&[("x-gateway-key", "gateway-secret")]))
                 .build()
         }
@@ -9557,32 +9575,42 @@ data: {\"type\":\"message_stop\"}\n\n";
             "data: {\"type\":\"message_stop\"}\n\n"
         );
 
-        async fn bind(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        async fn listen() -> (tokio::net::TcpListener, std::net::SocketAddr) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local addr");
-            let server = ::zeroclaw_spawn::spawn!(async move {
+            (listener, addr)
+        }
+
+        fn serve(listener: tokio::net::TcpListener, app: Router) -> tokio::task::JoinHandle<()> {
+            ::zeroclaw_spawn::spawn!(async move {
                 axum::serve(listener, app).await.expect("serve");
-            });
-            (addr, server)
+            })
         }
 
         let elsewhere_hits = Arc::new(AtomicUsize::new(0));
         let hits = Arc::clone(&elsewhere_hits);
-        let (elsewhere, elsewhere_server) = bind(Router::new().fallback(move || {
-            let hits = Arc::clone(&hits);
-            async move {
-                hits.fetch_add(1, Ordering::SeqCst);
-                StatusCode::OK
-            }
-        }))
-        .await;
+        let (elsewhere_listener, elsewhere) = listen().await;
+        let elsewhere_server = serve(
+            elsewhere_listener,
+            Router::new().fallback(move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
 
+        let (origin_listener, origin) = listen().await;
         let final_keys = Arc::new(Mutex::new(Vec::new()));
         let keys = Arc::clone(&final_keys);
+        let hits = Arc::clone(&elsewhere_hits);
         let cross_target = format!("http://{elsewhere}/v1/messages");
-        let (origin, origin_server) = bind(
+        let cross_host_target = format!("http://{origin}/v1/messages");
+        let origin_server = serve(
+            origin_listener,
             Router::new()
                 .route(
                     "/same/v1/messages",
@@ -9593,6 +9621,23 @@ data: {\"type\":\"message_stop\"}\n\n";
                     post(move || {
                         let target = cross_target.clone();
                         async move { Redirect::temporary(&target) }
+                    }),
+                )
+                .route(
+                    "/cross-host/v1/messages",
+                    post(move || {
+                        let target = cross_host_target.clone();
+                        async move { Redirect::temporary(&target) }
+                    }),
+                )
+                .route(
+                    "/v1/messages",
+                    post(move || {
+                        let hits = Arc::clone(&hits);
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
                     }),
                 )
                 .route(
@@ -9630,8 +9675,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                         }
                     }),
                 ),
-        )
-        .await;
+        );
 
         RedirectServers {
             origin,
@@ -9639,6 +9683,31 @@ data: {\"type\":\"message_stop\"}\n\n";
             final_keys,
             servers: [origin_server, elsewhere_server],
         }
+    }
+
+    async fn stream_hello(provider: AnthropicModelProvider) -> Vec<StreamResult<StreamEvent>> {
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        provider
+            .stream_chat(request, "claude-fable-5", None, StreamOptions::new(true))
+            .collect()
+            .await
+    }
+
+    fn streamed_text(events: &[StreamResult<StreamEvent>]) -> String {
+        let mut text = String::new();
+        for event in events {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(_) => {}
+                Err(error) => panic!("same-host redirect stream failed: {error:?}"),
+            }
+        }
+        text
     }
 
     #[tokio::test]
@@ -9677,33 +9746,16 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn extra_headers_streaming_redirects_stay_on_the_configured_host() {
-        async fn stream(provider: AnthropicModelProvider) -> Vec<StreamResult<StreamEvent>> {
-            let messages = vec![ChatMessage::user("hello")];
-            let request = ProviderChatRequest {
-                messages: messages.as_slice(),
-                tools: None,
-                thinking: None,
-            };
-            provider
-                .stream_chat(request, "claude-fable-5", None, StreamOptions::new(true))
-                .collect()
-                .await
-        }
-
         let servers = spawn_redirect_servers().await;
-        let same = stream(servers.provider("/same")).await;
-        let cross = stream(servers.provider("/cross")).await;
+        let same = stream_hello(servers.provider("/same")).await;
+        let cross = stream_hello(servers.provider("/cross")).await;
         servers.abort();
 
-        let mut text = String::new();
-        for event in &same {
-            match event {
-                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
-                Ok(_) => {}
-                Err(error) => panic!("same-host redirect stream failed: {error:?}"),
-            }
-        }
-        assert_eq!(text, "ok", "a same-host redirect is followed");
+        assert_eq!(
+            streamed_text(&same),
+            "ok",
+            "a same-host redirect is followed"
+        );
         assert_eq!(
             servers.final_keys(),
             vec![Some("gateway-secret".to_string())],
@@ -9717,6 +9769,70 @@ data: {\"type\":\"message_stop\"}\n\n";
             servers.elsewhere_hits(),
             0,
             "the cross-host target must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_headers_buffered_redirects_stop_at_another_hostname_on_the_same_port() {
+        // The extra-header client fails to build while another test holds
+        // an invalid runtime proxy; the guard serializes against it.
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let servers = spawn_redirect_servers().await;
+
+        let same = servers
+            .localhost_provider("/same")
+            .chat_with_system(None, "hello", "claude-fable-5", None)
+            .await;
+        let cross = servers
+            .localhost_provider("/cross-host")
+            .chat_with_system(None, "hello", "claude-fable-5", None)
+            .await;
+        servers.abort();
+
+        // The control proves `localhost` reached the server, so a stopped
+        // hop below is the policy's doing, not a failed lookup.
+        assert_eq!(same.expect("a same-host redirect is followed"), "ok");
+        assert_eq!(
+            servers.final_keys(),
+            vec![Some("gateway-secret".to_string())],
+            "the followed same-host hop keeps the configured header"
+        );
+        assert!(
+            cross.is_err(),
+            "a stopped redirect to another hostname must not read as success"
+        );
+        assert_eq!(
+            servers.elsewhere_hits(),
+            0,
+            "the same port under another hostname must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_headers_streaming_redirects_stop_at_another_hostname_on_the_same_port() {
+        let servers = spawn_redirect_servers().await;
+        let same = stream_hello(servers.localhost_provider("/same")).await;
+        let cross = stream_hello(servers.localhost_provider("/cross-host")).await;
+        servers.abort();
+
+        assert_eq!(
+            streamed_text(&same),
+            "ok",
+            "a same-host redirect is followed"
+        );
+        assert_eq!(
+            servers.final_keys(),
+            vec![Some("gateway-secret".to_string())],
+            "the followed same-host hop keeps the configured header"
+        );
+        assert!(
+            cross.iter().any(Result::is_err),
+            "a stopped redirect to another hostname must surface as a stream error: {cross:?}"
+        );
+        assert_eq!(
+            servers.elsewhere_hits(),
+            0,
+            "the same port under another hostname must receive no request"
         );
     }
 
