@@ -18591,7 +18591,7 @@ mod tests {
             prior
                 .enqueue_message("keep queue".into(), Vec::new())
                 .unwrap();
-            prior.queue_paused = true;
+            prior.queue_paused = Some(QueuePauseReason::Generic);
             prior.queue_sel = prior.message_queue.front().map(|message| message.id);
             let selected_queue = prior.queue_sel;
             prior.git_branch_last_fetch = Some(Instant::now());
@@ -18625,7 +18625,7 @@ mod tests {
             assert_eq!(state.input_bar.pending_attachments().len(), 1);
             assert!(path.exists());
             assert_eq!(state.message_queue.front().unwrap().text, "keep queue");
-            assert!(state.queue_paused);
+            assert!(state.queue_paused());
             assert_eq!(state.queue_sel, selected_queue);
             assert_eq!(state.message_count, 5);
             let mut output =
