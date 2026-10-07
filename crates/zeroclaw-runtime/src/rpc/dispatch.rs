@@ -7948,6 +7948,32 @@ impl RpcDispatcher {
             });
         }
 
+        // A running turn holds this session's `model_provider_update` guard
+        // for its whole duration (see `handle_session_prompt`), and the agent
+        // lock with it. Waiting for that guard here would park this
+        // connection's serial request loop until the turn ends — so a
+        // `session/cancel` sent to stop the turn would queue behind the very
+        // switch that is waiting on it, the client's RPC deadline would fire,
+        // and the switch would still commit silently after the turn. Refuse
+        // instead. Checked before `config_write_lock` so a refused switch
+        // never stalls other config writers either. Residual window: a turn
+        // admitted between this check and the guard acquisition below still
+        // makes configure wait for that turn. Closing it would need the
+        // admission and this check under one lock; the window is the few
+        // awaits between here and `lock_model_provider_update`.
+        if self
+            .ctx
+            .sessions
+            .inflight_turn_generation(&req.session_id)
+            .is_some()
+        {
+            return Err(rpc_err(
+                SESSION_BUSY,
+                "turn in progress: model and provider switches apply between turns; \
+                 switch after this turn ends, or cancel it first",
+            ));
+        }
+
         // Wait for a provisional binding to be confirmed, for the same reason
         // `session/prompt` does: a session rehydrated during a route-affecting
         // commit is live but unconfirmed, and committing an override against
@@ -10246,6 +10272,23 @@ impl RpcDispatcher {
                 if !in_scope {
                     continue;
                 }
+            }
+
+            // In scope and mid-turn: the turn holds this session's guard for
+            // its whole duration, so waiting here would park the issuing
+            // connection (and every config writer, since the caller holds
+            // `config_write_lock`) until the turn ends. Nothing has been
+            // saved yet — preparation runs before the commit — so refusing
+            // leaves both the stored and the live config untouched.
+            if ctx.sessions.inflight_turn_generation(&session_id).is_some() {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    format!(
+                        "turn in progress on live session `{session_id}`: this change \
+                         rebuilds its model provider, which happens between turns; \
+                         retry after the turn ends, or cancel it first"
+                    ),
+                ));
             }
 
             // Acquire the per-session ordering boundary. This serialises
@@ -39279,6 +39322,160 @@ mod tests {
             limits.model_context_window, 200_000,
             "limits must resolve against the committed generation for the served route"
         );
+    }
+
+    /// A model switch issued while the session's turn is running must not
+    /// park the connection. `handle_session_prompt` holds the session's
+    /// `model_provider_update` guard for the whole turn, and requests on one
+    /// connection are processed serially, so a configure that waited for the
+    /// guard would hold up every later request on that connection —
+    /// including the `session/cancel` the user sends to stop the turn.
+    /// Configure must answer SESSION_BUSY promptly and leave the overrides
+    /// untouched, and the following cancel must be processed.
+    #[tokio::test]
+    async fn model_switch_during_turn_is_refused_and_does_not_block_cancel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(
+            make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp))
+                .ctx
+                .clone(),
+            tx,
+            "test-peer".into(),
+        );
+        dispatcher.set_authenticated_for_test();
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Simulate a running turn the way `handle_session_prompt` does: a
+        // registered cancel token plus the held provider-update guard.
+        let turn_token = tokio_util::sync::CancellationToken::new();
+        let session_generation = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .expect("live session");
+        dispatcher
+            .ctx
+            .sessions
+            .register_cancel_token_for_generation_for_test(
+                &session_id,
+                session_generation,
+                turn_token.clone(),
+            );
+        let turn_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let configure = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/configure",
+            "params": {"session_id": session_id, "overrides": {"model": "new-model"}}
+        })
+        .to_string();
+        let cancel = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/cancel",
+            "params": {"session_id": session_id}
+        })
+        .to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            dispatcher.process_line(&configure).await;
+            dispatcher.process_line(&cancel).await;
+        })
+        .await
+        .expect("configure during a turn must not park the connection ahead of cancel");
+
+        let mut responses = std::collections::HashMap::new();
+        while responses.len() < 2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("response frame")
+                .expect("writer open");
+            let value: Value = serde_json::from_str(&frame).unwrap();
+            if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                responses.insert(id, value);
+            }
+        }
+        assert_eq!(
+            responses[&1]["error"]["code"].as_i64(),
+            Some(i64::from(SESSION_BUSY)),
+            "configure must be refused as busy: {}",
+            responses[&1]
+        );
+        assert!(
+            responses[&2].get("error").is_none(),
+            "cancel must succeed: {}",
+            responses[&2]
+        );
+        assert!(
+            turn_token.is_cancelled(),
+            "cancel must reach the running turn"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model),
+            None,
+            "a refused switch must not be recorded to apply later"
+        );
+        drop(turn_guard);
+    }
+
+    /// The config-screen form of the same hazard: a route-affecting
+    /// `config/set` whose scope includes a session that is mid-turn must be
+    /// refused promptly, with nothing saved, instead of holding
+    /// `config_write_lock` until that turn ends.
+    #[tokio::test]
+    async fn config_set_for_mid_turn_agent_is_refused_without_saving() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .sessions
+            .register_cancel_token(&session_id, tokio_util::sync::CancellationToken::new());
+        let turn_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            })),
+        )
+        .await
+        .expect("config/set must not wait for the running turn")
+        .expect_err("config/set must be refused while an in-scope turn runs");
+        assert_eq!(error.code, SESSION_BUSY, "{}", error.message);
+        assert!(error.message.contains(&session_id), "{}", error.message);
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .and_then(|entry| entry.model.clone())
+                .as_deref(),
+            Some("old-model"),
+            "a refused edit must not be committed"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        drop(turn_guard);
     }
 
     #[tokio::test]
