@@ -761,6 +761,35 @@ impl std::fmt::Display for DaemonRpcError {
 
 impl std::error::Error for DaemonRpcError {}
 
+/// A single RPC did not get a reply within its client-side deadline. The
+/// connection is still up; the daemon is busy or wedged on this method.
+/// Callers that own a UI surface should report this and stay alive — a
+/// stalled `config/list` is not a reason to exit the TUI.
+#[derive(Debug)]
+pub struct DaemonRpcTimeout {
+    pub method: String,
+    pub timeout: Duration,
+}
+
+impl DaemonRpcTimeout {
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
+impl fmt::Display for DaemonRpcTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RPC {}: timed out after {}s",
+            self.method,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DaemonRpcTimeout {}
+
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
     server_version: String,
@@ -2389,10 +2418,10 @@ impl RpcClient {
         let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
             .await
             .map_err(|_| {
-                anyhow::Error::msg(format!(
-                    "RPC {method}: timed out after {}s",
-                    timeout.as_secs()
-                ))
+                anyhow::Error::new(DaemonRpcTimeout {
+                    method: method.to_string(),
+                    timeout,
+                })
             })?
             .map_err(|e| {
                 anyhow::Error::new(DaemonRpcError {
