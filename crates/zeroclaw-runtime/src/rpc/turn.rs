@@ -735,6 +735,142 @@ mod tests {
         assert!(crate::tools::sessions_prompt::current_session_prompt_runner().is_none());
     }
 
+    /// Records what `current_injected_from_session()` returns at the moment a
+    /// tool runs inside the spawned turn body.
+    struct OriginProbeTool {
+        seen: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl Tool for OriginProbeTool {
+        fn name(&self) -> &str {
+            "origin_probe"
+        }
+        fn description(&self) -> &str {
+            "origin_probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            *self.seen.lock().unwrap() =
+                Some(crate::tools::sessions_prompt::current_injected_from_session());
+            Ok(ToolResult {
+                success: true,
+                output: "probed".into(),
+                error: None,
+            })
+        }
+    }
+
+    zeroclaw_api::tool_attribution!(
+        OriginProbeTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    // Sibling of the runner-scope test above: the injected-from origin is a
+    // task-local too, and `execute_turn` must capture it before `spawn!` and
+    // re-scope it around the turn body. Without that, the tier-1 refusal in
+    // `sessions_prompt` would see `None` from inside every real turn and the
+    // origin session would get the generic busy refusal again.
+    #[tokio::test]
+    async fn execute_turn_carries_injected_origin_scope_into_its_spawned_worker() {
+        use crate::tools::sessions_prompt::{
+            SessionPromptFn, SessionPromptOutcome, SessionsPromptTool, scope_injected_from_session,
+            scope_session_prompt_runner,
+        };
+        let runner_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner_seen = Arc::clone(&runner_calls);
+        let runner: SessionPromptFn = Box::new(move |_sid, _message, _alias| {
+            runner_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(SessionPromptOutcome {
+                    content: "must not be reached".into(),
+                    stop_reason: "end_turn".into(),
+                })
+            })
+        });
+        let probed = Arc::new(std::sync::Mutex::new(None));
+        let provider = TwoCallToolProvider {
+            first: ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "probe-call".into(),
+                        name: "origin_probe".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    // Aimed back at the session that injected this turn.
+                    ToolCall {
+                        id: "reply-back".into(),
+                        name: "sessions_prompt".into(),
+                        arguments: r#"{"session_id":"origin","message":"got it"}"#.into(),
+                        extra_content: None,
+                    },
+                ],
+                usage: None,
+                reasoning_content: None,
+            },
+            second: ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            done: std::sync::atomic::AtomicBool::new(false),
+            alias: "origin-scope-test",
+        };
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![
+                    Box::new(OriginProbeTool {
+                        seen: Arc::clone(&probed),
+                    }),
+                    Box::new(SessionsPromptTool::new("receiver")),
+                ],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(NoopObserver))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .unwrap();
+        scope_injected_from_session(
+            Some("origin".into()),
+            scope_session_prompt_runner(
+                Some(Arc::new(runner)),
+                execute_turn(
+                    Arc::new(Mutex::new(agent)),
+                    "prompt".into(),
+                    CancellationToken::new(),
+                    TurnAttribution {
+                        session_key: Some("target".into()),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                    noop,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            probed.lock().unwrap().take().expect("probe tool must run"),
+            Some("origin".to_string()),
+            "the spawned turn body must see the injecting session as its origin"
+        );
+        assert_eq!(
+            runner_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a sessions_prompt aimed back at the origin must be refused before the runner"
+        );
+        assert!(crate::tools::sessions_prompt::current_injected_from_session().is_none());
+    }
+
     fn token_usage(input: u64, output: u64) -> TokenUsage {
         TokenUsage {
             input_tokens: Some(input),

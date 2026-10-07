@@ -169,6 +169,11 @@ pub(crate) async fn run_sessions_prompt(
     // on this turn's result: that result *is* the reply path. Prompting it
     // back would only hit the busy refusal, and "retry later" would be
     // wrong advice — it cannot become idle before this turn ends. Say so.
+    //
+    // Known limit: this covers one hop. In a chain A→B→C the origin seen
+    // inside C is B, so C→A still gets the generic busy refusal with its
+    // retry advice even though A is blocked on B. Fixing that needs the
+    // whole injection stack, not one origin; deferred.
     if current_injected_from_session().as_deref() == Some(session_id.as_str()) {
         ::zeroclaw_log::record!(
             INFO,
