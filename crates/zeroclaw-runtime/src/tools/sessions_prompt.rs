@@ -31,6 +31,11 @@ pub type SessionPromptFn = Box<
 
 tokio::task_local! {
     static SESSION_PROMPT_RUNNER: Option<Arc<SessionPromptFn>>;
+    /// Session id of the caller whose `sessions_prompt` invocation started
+    /// the current turn, when the turn is an injected one. The injected
+    /// turn's final content is returned to that caller as its tool result,
+    /// so prompting it back from inside the turn can only ever find it busy.
+    static INJECTED_FROM_SESSION: Option<String>;
 }
 
 pub(crate) fn current_session_prompt_runner() -> Option<Arc<SessionPromptFn>> {
@@ -42,6 +47,20 @@ pub(crate) async fn scope_session_prompt_runner<F: Future>(
     future: F,
 ) -> F::Output {
     SESSION_PROMPT_RUNNER.scope(runner, future).await
+}
+
+pub(crate) fn current_injected_from_session() -> Option<String> {
+    INJECTED_FROM_SESSION.try_with(Clone::clone).ok().flatten()
+}
+
+/// Re-establish the injected-turn origin inside a spawned task. Task-locals
+/// do not cross `spawn`, so [`crate::rpc::turn::execute_turn`] captures the
+/// value before spawning and scopes it again around the turn body.
+pub(crate) async fn scope_injected_from_session<F: Future>(
+    origin: Option<String>,
+    future: F,
+) -> F::Output {
+    INJECTED_FROM_SESSION.scope(origin, future).await
 }
 
 /// Prompt another agent's live session. Bound to a single calling agent's
@@ -146,6 +165,32 @@ pub(crate) async fn run_sessions_prompt(
         })?
         .to_string();
 
+    // Inside an injected turn, the session that sent the prompt is blocked
+    // on this turn's result: that result *is* the reply path. Prompting it
+    // back would only hit the busy refusal, and "retry later" would be
+    // wrong advice — it cannot become idle before this turn ends. Say so.
+    if current_injected_from_session().as_deref() == Some(session_id.as_str()) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "caller_alias": caller_alias,
+                    "reason": "target is the injecting session of the current turn",
+                })),
+            "sessions_prompt refused: reply by finishing the turn"
+        );
+        return Ok(ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(crate::i18n::get_required_cli_string_with_args(
+                "tool-sessions-prompt-reply-by-finishing-turn",
+                &[("session", session_id.as_str())],
+            )),
+        });
+    }
+
     let Some(hook) = hook else {
         return Ok(ToolResult {
             success: false,
@@ -166,7 +211,14 @@ pub(crate) async fn run_sessions_prompt(
         .unwrap_or_else(|| "<unknown>".to_string());
     let injected = format!("[from agent {caller_alias}, session {caller_session_id}]\n\n{message}");
 
-    match hook(session_id.clone(), injected, caller_alias.to_string()).await {
+    // The target turn runs under this scope so that, from inside it, the
+    // tool knows which session is waiting on its result.
+    let outcome = scope_injected_from_session(
+        Some(caller_session_id),
+        hook(session_id.clone(), injected, caller_alias.to_string()),
+    )
+    .await;
+    match outcome {
         Ok(outcome) => {
             let mut output = outcome.content;
             if outcome.stop_reason != "end_turn" {
@@ -245,6 +297,116 @@ mod tests {
             "the runtime prefix must be prepended verbatim, whatever the \
              caller put in `message`"
         );
+    }
+
+    #[tokio::test]
+    async fn target_turn_runs_under_the_injecting_session_scope() {
+        // The hook stands in for the target turn: whatever it observes as
+        // the injected-from origin is what the target's tools will observe.
+        let observed = Arc::new(Mutex::new(None));
+        let hook: SessionPromptFn = {
+            let observed = Arc::clone(&observed);
+            Box::new(move |_session_id, _message, _caller_alias| {
+                let observed = Arc::clone(&observed);
+                Box::pin(async move {
+                    *observed.lock().unwrap() = Some(current_injected_from_session());
+                    Ok(SessionPromptOutcome {
+                        content: "ok".to_string(),
+                        stop_reason: "end_turn".to_string(),
+                    })
+                })
+            })
+        };
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("caller-sess".to_string()), async {
+                run_sessions_prompt(
+                    Some(&hook),
+                    json!({"session_id": "target-sess", "message": "hi"}),
+                    "caller-a",
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            observed.lock().unwrap().take().expect("hook must run"),
+            Some("caller-sess".to_string()),
+            "the target turn must see the injecting session as its origin"
+        );
+        assert_eq!(
+            current_injected_from_session(),
+            None,
+            "the scope must not leak past the injected turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompting_the_injecting_session_back_is_refused_with_reply_guidance() {
+        // Inside a turn that session "origin-sess" injected, the hook must
+        // never be reached for a prompt aimed back at "origin-sess": the
+        // caller is blocked on this turn's result, so the right move is to
+        // finish the turn, and the refusal has to say that rather than
+        // "retry later".
+        let captured = Arc::new(Mutex::new(None));
+        let hook = capture_hook(Arc::clone(&captured), Err("must not be called".to_string()));
+        let result = scope_injected_from_session(Some("origin-sess".to_string()), async {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .scope(Some("target-sess".to_string()), async {
+                    run_sessions_prompt(
+                        Some(&hook),
+                        json!({"session_id": "origin-sess", "message": "got it"}),
+                        "agent-b",
+                    )
+                    .await
+                })
+                .await
+        })
+        .await
+        .unwrap();
+        assert!(!result.success, "re-prompting the origin must be refused");
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "the hook must not run for a refused self-referential prompt"
+        );
+        let error = result.error.expect("refusal must carry a message");
+        assert!(
+            error.contains("origin-sess"),
+            "refusal must name the waiting session, got: {error:?}"
+        );
+        assert!(
+            error.contains("finish") && error.contains("turn"),
+            "refusal must tell the agent to reply by finishing the turn, got: {error:?}"
+        );
+        assert!(
+            !error.contains("retry later"),
+            "refusal must not suggest retrying — the origin is busy until this turn ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_sessions_are_still_reachable_from_an_injected_turn() {
+        let captured = Arc::new(Mutex::new(None));
+        let hook = capture_hook(
+            Arc::clone(&captured),
+            Ok(SessionPromptOutcome {
+                content: "third party ok".to_string(),
+                stop_reason: "end_turn".to_string(),
+            }),
+        );
+        let result = scope_injected_from_session(Some("origin-sess".to_string()), async {
+            run_sessions_prompt(
+                Some(&hook),
+                json!({"session_id": "third-sess", "message": "hi"}),
+                "agent-b",
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let (session_id, _, _) = captured.lock().unwrap().take().expect("hook must run");
+        assert_eq!(session_id, "third-sess");
     }
 
     #[tokio::test]
