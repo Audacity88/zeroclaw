@@ -5,10 +5,11 @@ use std::sync::Arc;
 use ratatui::text::Line;
 
 use super::{
-    CachedCodeBlock, ChatEntry, MAX_RENDERED_ENTRIES, ToolDisclosure, TranscriptRowBreak,
-    UrlLineRegion, fenced_text, header_fence_lang, label_cells, offset_url_line_regions,
-    render_entry_into, row_breaks_for_lines, url_line_regions_for_lines, wrapped_rows,
+    CachedCodeBlock, CachedUrlLineRegion, ChatEntry, MAX_RENDERED_ENTRIES, ToolDisclosure,
+    TranscriptRowBreak, actionable_url_ranges, fenced_text, header_fence_lang, label_cells,
+    new_thought_layout, render_entry_into, row_breaks_for_lines,
 };
+use crate::thought_layout::{ThoughtLayout, WrappedLineLayout};
 
 /// Tracks which committed entries need to be rendered again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +30,11 @@ pub(super) struct EntryLayoutInput<'a> {
     pub entry: &'a ChatEntry,
     pub highlighted: bool,
     pub disclosure: ToolDisclosure,
+    pub local_diff: Option<&'a zeroclaw_api::local_file_diff::LocalFileDiff>,
 }
 
 /// Coupled committed layout indexes. Production consumers only borrow this view.
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(super) struct TranscriptLayoutView {
     pub cached_lines: Vec<Line<'static>>,
     /// Source-derived separator before each wrapped screen row.
@@ -44,12 +45,16 @@ pub(super) struct TranscriptLayoutView {
     pub cached_tool_footer_lines: BTreeMap<usize, usize>,
     /// Wrapped row spans for individual lines and committed entries.
     pub cached_line_screen_ranges: Vec<(u16, u16)>,
+    /// Physical-row geometry for non-thought lines, aligned with cached_lines.
+    pub cached_line_layouts: Vec<Option<WrappedLineLayout>>,
+    /// URL-aware committed thought layouts, indexed by their cached line.
+    pub cached_thought_layouts: BTreeMap<usize, ThoughtLayout>,
     /// Entry index, wrapped row range, and width used to exclude adjacent blank cells.
     pub cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
     /// Full copy text shared by visible fence targets without steady-state rescanning.
     pub cached_code_blocks: Vec<CachedCodeBlock>,
-    /// Tagged logical URL lines with transcript-relative row extents.
-    pub cached_url_regions: Vec<UrlLineRegion>,
+    /// URL runs from the physical layouts; idle frames only project visible runs.
+    pub cached_url_regions: Vec<CachedUrlLineRegion>,
     pub dirty: LinesDirty,
     /// Number of source entries in the cached window, including hidden thoughts.
     pub cached_entry_count: usize,
@@ -74,6 +79,8 @@ impl TranscriptLayoutCache {
                 cached_line_ranges: Vec::new(),
                 cached_tool_footer_lines: BTreeMap::new(),
                 cached_line_screen_ranges: Vec::new(),
+                cached_line_layouts: Vec::new(),
+                cached_thought_layouts: BTreeMap::new(),
                 cached_screen_ranges: Vec::new(),
                 cached_code_blocks: Vec::new(),
                 cached_url_regions: Vec::new(),
@@ -129,18 +136,25 @@ impl TranscriptLayoutCache {
     }
 
     pub(super) fn reset(&mut self) {
+        self.clear_rendered();
+        self.layout.cached_render_start = 0;
+        self.layout.cached_render_width = 0;
+    }
+
+    /// Drop rendered payloads without moving the browse window on local-diff expiry.
+    pub(super) fn clear_rendered(&mut self) {
         self.layout.cached_lines.clear();
         self.layout.cached_row_breaks.clear();
         self.layout.cached_line_ranges.clear();
         self.layout.cached_tool_footer_lines.clear();
         self.layout.cached_line_screen_ranges.clear();
+        self.layout.cached_line_layouts.clear();
+        self.layout.cached_thought_layouts.clear();
         self.layout.cached_screen_ranges.clear();
         self.layout.cached_code_blocks.clear();
         self.layout.cached_url_regions.clear();
         self.layout.dirty = LinesDirty::Full;
         self.layout.cached_entry_count = 0;
-        self.layout.cached_render_start = 0;
-        self.layout.cached_render_width = 0;
         self.layout.cached_total_rows = 0;
     }
 
@@ -180,8 +194,9 @@ impl TranscriptLayoutCache {
         width: u16,
         range: Range<usize>,
         show_thoughts: bool,
-        mut inputs: impl Iterator<Item = EntryLayoutInput<'a>>,
+        mut inputs: impl Iterator<Item = EntryLayoutInput<'a>> + Clone,
     ) {
+        let geometry_inputs = inputs.clone();
         if self.layout.cached_render_width != width {
             self.invalidate_full();
             self.layout.cached_render_width = width;
@@ -199,7 +214,6 @@ impl TranscriptLayoutCache {
             && range_pos + 1 == self.layout.cached_line_ranges.len()
         {
             let line_start = self.layout.cached_line_ranges[range_pos].1;
-            let row_start = self.layout.cached_line_screen_ranges[line_start].0;
             self.layout.cached_lines.truncate(line_start);
             self.layout.cached_line_ranges.truncate(range_pos);
             self.layout.cached_tool_footer_lines.remove(&entry_index);
@@ -207,19 +221,6 @@ impl TranscriptLayoutCache {
                 self.append_entry(input, show_thoughts, width);
             }
             self.layout.cached_row_breaks = row_breaks_for_lines(&self.layout.cached_lines, width);
-            if row_start == u16::MAX {
-                // Saturated offsets cannot distinguish the unchanged prefix.
-                self.layout.cached_url_regions =
-                    url_line_regions_for_lines(&self.layout.cached_lines, width);
-            } else {
-                self.layout
-                    .cached_url_regions
-                    .retain(|region| region.row < row_start);
-                let mut regions =
-                    url_line_regions_for_lines(&self.layout.cached_lines[line_start..], width);
-                offset_url_line_regions(&mut regions, row_start);
-                self.layout.cached_url_regions.extend(regions);
-            }
         } else if self.layout.dirty == LinesDirty::Appended
             && range.start == self.layout.cached_render_start
         {
@@ -231,9 +232,6 @@ impl TranscriptLayoutCache {
             self.layout
                 .cached_row_breaks
                 .extend(row_breaks_for_lines(new_lines, width));
-            let mut regions = url_line_regions_for_lines(new_lines, width);
-            offset_url_line_regions(&mut regions, self.layout.cached_total_rows);
-            self.layout.cached_url_regions.extend(regions);
         } else {
             self.layout.cached_lines.clear();
             self.layout.cached_line_ranges.clear();
@@ -242,13 +240,11 @@ impl TranscriptLayoutCache {
                 self.append_entry(input, show_thoughts, width);
             }
             self.layout.cached_row_breaks = row_breaks_for_lines(&self.layout.cached_lines, width);
-            self.layout.cached_url_regions =
-                url_line_regions_for_lines(&self.layout.cached_lines, width);
         }
 
         self.layout.cached_entry_count = range.len();
         self.layout.cached_render_start = range.start;
-        self.rebuild_screen_ranges(width);
+        self.rebuild_screen_ranges(width, geometry_inputs);
         self.layout.dirty = LinesDirty::Clean;
     }
 
@@ -262,6 +258,7 @@ impl TranscriptLayoutCache {
             show_thoughts,
             input.disclosure,
             width,
+            input.local_diff,
             &mut self.layout.cached_lines,
         );
         let after = self.layout.cached_lines.len();
@@ -277,20 +274,84 @@ impl TranscriptLayoutCache {
         }
     }
 
-    /// Recompute all screen and copy indexes together after committed lines change.
-    fn rebuild_screen_ranges(&mut self, width: u16) {
+    /// Recompute every screen-space index derived from `cached_lines`.
+    /// Cache rebuilds may remain history-sized; steady-state frames use these
+    /// ordered indexes without rescanning committed entries or lines.
+    fn rebuild_screen_ranges<'a>(
+        &mut self,
+        width: u16,
+        inputs: impl Iterator<Item = EntryLayoutInput<'a>>,
+    ) {
+        let mut inputs = inputs.peekable();
+        let mut previous = std::mem::take(&mut self.layout.cached_thought_layouts);
+        for &(entry_idx, lo, hi) in &self.layout.cached_line_ranges {
+            while inputs.peek().is_some_and(|input| input.index < entry_idx) {
+                let _ = inputs.next();
+            }
+            let Some(input) = inputs.next() else {
+                continue;
+            };
+            if hi == lo + 1
+                && let ChatEntry::AgentThought(text) = input.entry
+            {
+                let layout = previous
+                    .remove(&lo)
+                    .filter(|layout| layout.matches(text, width))
+                    .unwrap_or_else(|| new_thought_layout(Arc::clone(text), width));
+                self.layout.cached_thought_layouts.insert(lo, layout);
+            }
+        }
         self.layout.cached_line_screen_ranges.clear();
+        self.layout.cached_line_layouts = self
+            .layout
+            .cached_lines
+            .iter()
+            .enumerate()
+            .map(|(line_index, line)| {
+                (!self.layout.cached_thought_layouts.contains_key(&line_index))
+                    .then(|| WrappedLineLayout::new(line, width))
+            })
+            .collect();
         self.layout.cached_screen_ranges.clear();
         self.layout.cached_code_blocks.clear();
+        self.layout.cached_url_regions.clear();
         let mut screen_cursor = 0u16;
         let mut pending_fence: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
 
-        for line in &self.layout.cached_lines {
+        for (line_index, line) in self.layout.cached_lines.iter().enumerate() {
             let line_start = screen_cursor;
-            screen_cursor = screen_cursor.saturating_add(wrapped_rows(line, width));
+            let rows = self
+                .layout
+                .cached_thought_layouts
+                .get(&line_index)
+                .map_or_else(
+                    || {
+                        self.layout.cached_line_layouts[line_index]
+                            .as_ref()
+                            .expect("normal cached line layout")
+                            .row_count()
+                    },
+                    ThoughtLayout::row_count,
+                );
+            screen_cursor = screen_cursor.saturating_add(rows);
             self.layout
                 .cached_line_screen_ranges
                 .push((line_start, screen_cursor));
+
+            if !self.layout.cached_thought_layouts.contains_key(&line_index) {
+                let (_, urls) = actionable_url_ranges(line);
+                if !urls.is_empty() {
+                    let layout = self.layout.cached_line_layouts[line_index]
+                        .as_ref()
+                        .expect("normal cached line layout");
+                    self.layout.cached_url_regions.push(CachedUrlLineRegion {
+                        row: line_start,
+                        rows,
+                        runs: layout.range_runs(&urls),
+                        urls,
+                    });
+                }
+            }
 
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
@@ -334,7 +395,11 @@ impl TranscriptLayoutCache {
             if lo >= hi {
                 continue;
             }
-            // Wrapping fills the viewport; short entries exclude adjacent blank cells.
+            // Widest rendered column extent of the entry, clamped to the
+            // viewport. Lines wider than `width` wrap to full-width rows, so the
+            // clamp yields the true on-screen extent. Hit-testing uses this so
+            // the blank space beside a short message is treated as outside the
+            // entry.
             let content_width = self.layout.cached_lines[lo..hi]
                 .iter()
                 .map(|l| l.width() as u16)

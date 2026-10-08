@@ -614,11 +614,26 @@ mod tests {
                 "zc-chat-status-awaiting-approval",
                 "zc-chat-status-awaiting-input",
                 "zc-chat-status-cancelling",
+                "zc-dashboard-label-context",
+                "zc-dashboard-label-code-context",
+                "zc-dashboard-label-chat-context",
+                "zc-dashboard-context-idle",
+                "zc-dashboard-context-working",
+                "zc-dashboard-context-blocked",
+                "zc-dashboard-context-done",
             ] {
                 assert!(
                     format_ftl_message(&bundle, key, &[]).is_some(),
                     "{key} must format for {locale}"
                 );
+            }
+            for key in [
+                "zc-dashboard-context-client-queue",
+                "zc-dashboard-context-client-queue-paused",
+            ] {
+                let queue = format_ftl_message(&bundle, key, &[("count", "2")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(queue.contains('2'), "{key} must interpolate for {locale}");
             }
             let calling_tool = format_ftl_message(
                 &bundle,
@@ -635,6 +650,36 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("sidebar picker error must format for {locale}"));
             assert!(picker_error.contains("socket closed"));
+        }
+    }
+
+    #[test]
+    fn missing_completion_hint_fits_default_queue_dock_in_all_locales() {
+        use unicode_width::UnicodeWidthStr;
+
+        let available_cells = 80 - crate::config::SidebarSection::default().width as usize - 2;
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            for chord in ["Alt+p", "Option+p"] {
+                let hint = format_ftl_message(
+                    &bundle,
+                    "zc-queue-missing-completion-ghost",
+                    &[("key", chord)],
+                )
+                .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
+                assert!(hint.contains(chord), "{locale}: {hint}");
+                assert!(
+                    hint.width() <= available_cells,
+                    "{locale}/{chord}: {} cells exceed {available_cells}: {hint}",
+                    hint.width()
+                );
+            }
         }
     }
 
@@ -730,6 +775,82 @@ mod tests {
                 timeout.contains("--config-dir"),
                 "`{locale}` lost the --config-dir guidance: {timeout}"
             );
+        }
+    }
+
+    #[test]
+    fn picker_and_thinking_control_keys_present_in_all_builtin_catalogues() {
+        // The picker modals and the session thinking controls read these
+        // keys; every shipped catalogue must define them so a picker row or an
+        // info-bar note never falls back to a bare `{key}` placeholder.
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        const PLAIN_KEYS: &[&str] = &[
+            "zc-picker-current",
+            "zc-picker-search",
+            "zc-picker-no-results",
+            "zc-sidebar-date-placeholder",
+            "zc-config-description",
+            "zc-config-help-scroll-description",
+            "zc-chat-help-resume-session",
+            "zc-effort-picker-title",
+            "zc-display-picker-title",
+            "zc-thinking-switch-applying",
+            "zc-effort-none-for-model",
+            "zc-display-none-for-model",
+        ];
+        // Keys that embed a value: (key, argument name).
+        const ARG_KEYS: &[(&str, &str)] = &[
+            ("zc-dock-config-unavailable", "error"),
+            ("zc-effort-ok", "level"),
+            ("zc-effort-reset", "level"),
+            ("zc-display-ok", "display"),
+            ("zc-display-reset", "display"),
+            ("zc-thinking-switch-failed", "error"),
+            ("zc-thinking-options-failed", "error"),
+            ("zc-thinking-remembered-skipped", "value"),
+        ];
+
+        for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
+            for key in PLAIN_KEYS {
+                let value = format_ftl_message(&bundle, key, &[])
+                    .unwrap_or_else(|| panic!("{key} must be defined for {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be blank for {locale}"
+                );
+            }
+            for (key, arg) in ARG_KEYS {
+                let value = format_ftl_message(&bundle, key, &[(arg, "xhigh-marker")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(
+                    value.contains("xhigh-marker"),
+                    "{key} must embed ${arg} for {locale}: {value}"
+                );
+            }
+            for (key, args) in [
+                (
+                    "zc-dock-config-summary",
+                    [("side", "side-marker"), ("width", "width-marker")],
+                ),
+                (
+                    "zc-config-description-scroll",
+                    [("up", "up-marker"), ("down", "down-marker")],
+                ),
+            ] {
+                let value = format_ftl_message(&bundle, key, &args)
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                for (_, marker) in args {
+                    assert!(value.contains(marker), "{key} lost {marker} for {locale}");
+                }
+            }
         }
     }
 

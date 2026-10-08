@@ -7,6 +7,7 @@ pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod startup_warmup;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -2691,7 +2692,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 None
             }
         }
-        "/thinking" => {
+        "/effort" | "/thinking" | "/think" => {
             let arg = parts.next();
             if parts.next().is_some() {
                 Some(ChannelRuntimeCommand::InvalidThinking(
@@ -15961,6 +15962,34 @@ fn enabled_agent_aliases(config: &Config) -> Vec<String> {
     aliases
 }
 
+/// Select retained contexts from enabled explicit owners, or one legacy owner.
+fn channel_runtime_agent_aliases(config: &Config, enabled_agents: &[String]) -> Vec<String> {
+    if config
+        .agents
+        .values()
+        .any(|agent| !agent.channels.is_empty())
+    {
+        return enabled_agents
+            .iter()
+            .filter(|alias| {
+                config
+                    .agents
+                    .get(alias.as_str())
+                    .is_some_and(|agent| !agent.channels.is_empty())
+            })
+            .cloned()
+            .collect();
+    }
+
+    config
+        .resolved_runtime_agent_alias()
+        .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
+        .map(ToString::to_string)
+        .or_else(|| enabled_agents.first().cloned())
+        .into_iter()
+        .collect()
+}
+
 /// Canonical explicit owner decision shared by channel construction and the
 /// inbound router. Sorted aliases preserve the router's established
 /// last-writer-wins behavior for duplicate bindings.
@@ -16511,6 +16540,14 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     if enabled_agents.is_empty() {
         anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
     }
+    let runtime_agent_aliases = channel_runtime_agent_aliases(&config, &enabled_agents);
+    // Approval routes may need listeners even when every explicit owner is
+    // disabled. Construct shared channels without retaining an unbound context.
+    let construction_agent_aliases = if runtime_agent_aliases.is_empty() {
+        enabled_agents.first().cloned().into_iter().collect()
+    } else {
+        runtime_agent_aliases.clone()
+    };
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -16569,7 +16606,8 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
-    for agent_alias in &enabled_agents {
+    let mut startup_warmups = startup_warmup::StartupWarmups::new(cancel.clone());
+    for agent_alias in &construction_agent_aliases {
         if cancel.is_cancelled() {
             return Ok(());
         }
@@ -16611,17 +16649,21 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             .await?,
         );
 
-        if let Err(e) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"error": format!("{}", e), "agent": agent_alias})
-                    ),
-                "ModelProvider warmup failed (non-fatal)"
-            );
-        }
+        let warmup_provider = Arc::clone(&model_provider);
+        let warmup_agent = agent_alias.clone();
+        startup_warmups.schedule(agent_alias.clone(), async move {
+            if let Err(e) = ProviderDispatch::from_ref(&*warmup_provider).warmup().await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "agent": warmup_agent})
+                        ),
+                    "ModelProvider warmup failed (non-fatal)"
+                );
+            }
+        });
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
@@ -17145,7 +17187,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             sop_driver_sink: sop_driver_sink.clone(),
         });
 
-        agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
+        if runtime_agent_aliases.contains(agent_alias) {
+            agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
+        }
         #[cfg(test)]
         if agent_ctxs.len() == 1
             && let Ok(probe) = CHANNEL_STARTUP_PROBE.try_with(Arc::clone)
@@ -21157,6 +21201,7 @@ temperature = 0.3
                 model_provider: "custom.startup".into(),
                 risk_profile: "default".into(),
                 runtime_profile: "default".into(),
+                channels: vec!["discord.default".into()],
                 ..Default::default()
             },
         );
@@ -21169,6 +21214,7 @@ temperature = 0.3
             if scenario == "later-agent-failure" {
                 let mut invalid = attempt_config.agents["first"].clone();
                 invalid.model_provider = "custom.missing".into();
+                invalid.channels = vec!["discord.second".into()];
                 attempt_config.agents.insert("second".into(), invalid);
             }
             let authority = LiveConfigAuthority::new(attempt_config);
@@ -22089,6 +22135,123 @@ temperature = 0.3
             Some("alpha")
         );
         assert_eq!(owners.get("mattermost").map(String::as_str), Some("alpha"));
+    }
+
+    #[test]
+    fn channel_runtime_agents_include_only_enabled_explicit_owners() {
+        let mut config = Config::default();
+        config.agents.clear();
+        for index in 0..20 {
+            config.agents.insert(
+                format!("idle_{index:02}"),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec![],
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "owner_z".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["matrix.ops".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "owner_a".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.default".into()],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let runtime_agents = channel_runtime_agent_aliases(&config, &enabled_agents);
+
+        assert_eq!(runtime_agents, vec!["owner_a", "owner_z"]);
+    }
+
+    #[test]
+    fn channel_runtime_agents_use_one_deterministic_legacy_fallback() {
+        let mut config = Config::default();
+        config.agents.clear();
+        for alias in ["zeta", "default", "alpha"] {
+            config.agents.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec![],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert_eq!(
+            channel_runtime_agent_aliases(&config, &enabled_agents),
+            vec!["default"]
+        );
+
+        config
+            .agents
+            .get_mut("default")
+            .expect("default agent exists")
+            .enabled = false;
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert_eq!(
+            channel_runtime_agent_aliases(&config, &enabled_agents),
+            vec!["alpha"]
+        );
+    }
+
+    #[test]
+    fn channel_runtime_agents_exclude_disabled_bound_agents() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "keeper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.a".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "disabled_owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "idle".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert_eq!(
+            channel_runtime_agent_aliases(&config, &enabled_agents),
+            vec!["keeper"]
+        );
+
+        config
+            .agents
+            .get_mut("keeper")
+            .expect("keeper agent exists")
+            .enabled = false;
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert!(
+            channel_runtime_agent_aliases(&config, &enabled_agents).is_empty(),
+            "an unbound enabled agent must not become a retained runtime fallback"
+        );
     }
 
     #[test]
@@ -43735,6 +43898,21 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::SetThinking(Some(
                 ThinkingLevel::High
             )))
+        );
+        // The shared command is named `effort`; both older spellings stay.
+        assert_eq!(
+            parse_runtime_command("telegram", "/effort xhigh"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(
+                ThinkingLevel::XHigh
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think max"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(ThinkingLevel::Max)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/effort@zeroclaw_bot reset"),
+            Some(ChannelRuntimeCommand::SetThinking(None))
         );
     }
 

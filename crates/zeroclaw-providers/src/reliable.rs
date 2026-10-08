@@ -1017,12 +1017,14 @@ struct ProviderErrorDiagnostic {
     phase: &'static str,
     hint: &'static str,
     endpoint: Option<String>,
+    refusal: Option<zeroclaw_api::model_provider::RefusalCategory>,
 }
 
 /// A terminal Reliable failure that can be rendered safely at a user-facing
 /// delivery boundary without exposing retry-attempt diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReliableProviderTerminalFailureKind {
+    Refused(zeroclaw_api::model_provider::RefusalCategory),
     ContextWindow,
     CredentialsMissing,
     Authentication,
@@ -1036,6 +1038,13 @@ pub enum ReliableProviderTerminalFailureKind {
 }
 
 impl ReliableProviderTerminalFailureKind {
+    fn from_diagnostic(diagnostic: &ProviderErrorDiagnostic) -> Self {
+        if let Some(category) = diagnostic.refusal {
+            return Self::Refused(category);
+        }
+        Self::from_diagnostic_kind(diagnostic.kind)
+    }
+
     fn from_diagnostic_kind(kind: &str) -> Self {
         match kind {
             "context_window" => Self::ContextWindow,
@@ -1085,7 +1094,7 @@ impl ReliableProviderTerminalFailure {
     pub fn from_error(error: &anyhow::Error) -> Self {
         let diagnostic = provider_error_diagnostic(error);
         Self::new(
-            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
             diagnostic.endpoint,
             format!(
                 "provider error: kind={}; phase={}; hint={}",
@@ -1101,7 +1110,7 @@ impl ReliableProviderTerminalFailure {
         terminal_cause: anyhow::Error,
     ) -> Self {
         Self {
-            kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            kind: ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
             provider: provider
                 .filter(|provider| !provider.is_empty())
                 .map(str::to_owned),
@@ -1274,6 +1283,7 @@ fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorD
         phase: "http_response",
         hint,
         endpoint,
+        refusal: None,
     }
 }
 
@@ -1313,6 +1323,18 @@ fn has_model_not_found_hint(message: &str) -> bool {
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
+    if let Some(refusal) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<AnthropicRefusalError>())
+    {
+        return ProviderErrorDiagnostic {
+            kind: "refusal",
+            phase: "safety_classifier",
+            hint: "the model declined this request; rephrase it, pick another model, or configure a fallback",
+            endpoint: None,
+            refusal: Some(refusal.refusal_category()),
+        };
+    }
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
     let endpoint = err
@@ -1337,6 +1359,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "request_validation",
             hint: "reduce context or use a larger-context model",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1346,6 +1369,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "configuration",
             hint: "configure provider credentials",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1355,6 +1379,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "check provider credentials",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1364,6 +1389,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "wait, change key/quota, or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1375,6 +1401,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "provider returned a server error; retry or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1389,6 +1416,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 phase: "tls_or_connect",
                 hint: "connection reached the host but timed out during connect/TLS; check VPN, firewall, routing, or switch provider",
                 endpoint,
+                refusal: None,
             };
         }
 
@@ -1398,6 +1426,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 phase: "request",
                 hint: "provider request timed out; retry or switch provider",
                 endpoint,
+                refusal: None,
             };
         }
 
@@ -1407,6 +1436,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 phase: "connect",
                 hint: "could not open provider connection; check network, VPN, or firewall",
                 endpoint,
+                refusal: None,
             };
         }
     }
@@ -1420,6 +1450,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "tls_or_connect",
             hint: "connection reached the host but timed out during connect/TLS; check VPN, firewall, routing, or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1429,6 +1460,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "connect",
             hint: "could not open provider connection; check network, VPN, or firewall",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1438,6 +1470,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "request",
             hint: "provider request timed out; retry or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1447,6 +1480,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "dns",
             hint: "DNS resolution failed; check network or provider host",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1456,6 +1490,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "check the configured model id for this provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1464,6 +1499,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         phase: "unknown",
         hint: "inspect provider error or switch provider",
         endpoint,
+        refusal: None,
     }
 }
 
@@ -1843,7 +1879,7 @@ fn reliable_terminal_error_with_cause(
     {
         let terminal_failure = anyhow::Error::new(
             ReliableProviderTerminalFailure::new(
-                ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+                ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
                 diagnostic.endpoint,
                 failure_aggregate(&failures),
             )
@@ -2292,6 +2328,7 @@ impl ReliableModelProvider {
             phase: "cooldown",
             hint: "wait for provider cooldown or switch provider",
             endpoint: None,
+            refusal: None,
         };
         push_failure(
             failures,
@@ -8153,6 +8190,7 @@ mod tests {
             phase: "tls_or_connect",
             hint: "check network, VPN, or firewall",
             endpoint: Some("https://api.deepseek.com/chat/completions".to_string()),
+            refusal: None,
         };
         let mut failures = FailureEvents::default();
 

@@ -105,6 +105,7 @@ pub enum CronJobClaim<'a> {
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[field_metadata = "crate::setup::annotate_fields"]
 pub struct Config {
     /// Shared instance data directory (databases, hygiene state, cost
     /// records, daemon state files). Computed from `ZEROCLAW_CONFIG_DIR`
@@ -950,7 +951,7 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise. When set above 300 it also raises the provider's streaming idle bound (default 300 s, the maximum gap between stream reads) on OpenAI-compatible and OpenAI Responses providers.
+    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise. When set above 300 it also raises the provider's streaming idle bound (default 300 s, the maximum gap between stream reads) on OpenAI-compatible, OpenAI Responses and Anthropic providers.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
@@ -1311,9 +1312,45 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// How much of the model's reasoning comes back inside thinking blocks.
+/// Applies to the Claude generations that think adaptively; older ones ignore
+/// it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingDisplay {
+    /// Blocks arrive signed but with their text withheld, which is the API's
+    /// own default.
+    #[default]
+    Omitted,
+    /// Blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer models only.
+    Updates,
+}
+
+impl From<AnthropicThinkingDisplay> for zeroclaw_api::model_provider::ThinkingDisplay {
+    fn from(display: AnthropicThinkingDisplay) -> Self {
+        match display {
+            AnthropicThinkingDisplay::Omitted => Self::Omitted,
+            AnthropicThinkingDisplay::Summarized => Self::Summarized,
+            AnthropicThinkingDisplay::Updates => Self::Updates,
+        }
+    }
+}
+
+impl AnthropicThinkingDisplay {
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        zeroclaw_api::model_provider::ThinkingDisplay::from(self).wire_value()
+    }
+}
+
+/// Anthropic-specific native reasoning visibility and server-side fallback controls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1333,6 +1370,10 @@ pub struct AnthropicModelProviderConfig {
     /// sends no fallback parameter and no beta value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_fallback_models: Vec<String>,
+    /// Adaptive reasoning visibility. Request-level display wins over this alias setting.
+    /// Unsupported displays are fitted to the selected model generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -3798,6 +3839,9 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
+/// Default fraction of the whole-turn history cap retained after a count trim.
+pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
+
 /// Runtime tunables resolved from the agent's runtime profile. Populated
 /// by `Config::resolved_agent_config`; never deserialized from the agent
 /// table. The runtime profile is the sole config surface for these.
@@ -3809,6 +3853,8 @@ pub struct ResolvedRuntime {
     /// History retention limit. Structured Agent and legacy loop sessions
     /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
+    /// Fraction of the complete-turn cap retained after trimming; 1.0 disables hysteresis.
+    pub history_trim_low_water: f32,
     /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
     /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
     /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
@@ -4013,6 +4059,7 @@ impl Default for ResolvedRuntime {
             max_tool_iterations: 10,
             max_execution_tree_iterations: None,
             max_history_messages: 50,
+            history_trim_low_water: DEFAULT_HISTORY_TRIM_LOW_WATER,
             max_context_tokens: None,
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
@@ -4189,11 +4236,13 @@ pub struct AliasedAgentConfig {
     /// listed bundle.
     #[tab(Bundles)]
     #[serde(default)]
+    #[alias_source(SkillBundles)]
     pub skill_bundles: Vec<String>,
     /// Knowledge bundle aliases. Additive: the agent loads every listed
     /// bundle.
     #[tab(Bundles)]
     #[serde(default)]
+    #[alias_source(KnowledgeBundles)]
     pub knowledge_bundles: Vec<String>,
     /// MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
     /// group of MCP servers. Secure by default: an agent is granted only the
@@ -4202,6 +4251,7 @@ pub struct AliasedAgentConfig {
     /// `Config::mcp_servers_for_agent`.
     #[tab(Bundles)]
     #[serde(default)]
+    #[alias_source(McpBundles)]
     pub mcp_bundles: Vec<String>,
     /// Initialize this agent's `mcp_bundles` tools when it serves an ACP
     /// (`session/new`) session.
@@ -4422,7 +4472,8 @@ impl Config {
     /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
     /// return bare alias keys. The single resolver every surface uses for
-    /// `PropKind::AliasRef` pickers and validation.
+    /// reference scalar/array pickers and validation. MCP server IDs come
+    /// from the natural `name` keys of `mcp.servers`.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
         let section = source.section_path();
@@ -4638,6 +4689,14 @@ impl Config {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_history_messages)
             .unwrap_or(50)
+    }
+
+    /// Resolve count-trim headroom from the runtime profile, measured in complete turns.
+    #[must_use]
+    pub fn effective_history_trim_low_water(&self, agent_alias: &str) -> f32 {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.history_trim_low_water)
+            .unwrap_or(DEFAULT_HISTORY_TRIM_LOW_WATER)
     }
 
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
@@ -4907,6 +4966,7 @@ impl Config {
             max_execution_tree_iterations: self
                 .effective_max_execution_tree_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            history_trim_low_water: self.effective_history_trim_low_water(agent_alias),
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
@@ -14686,6 +14746,9 @@ pub struct RuntimeProfileConfig {
     /// sessions count complete turns; channel caches count message rows. `None`
     /// inherits the default of 50.
     pub max_history_messages: Option<usize>,
+    /// Fraction of the complete-turn cap retained after a count trim.
+    /// Valid range (0.0, 1.0]; 1.0 disables hysteresis. None uses 0.7.
+    pub history_trim_low_water: Option<f32>,
     /// Maximum estimated tokens before proactive history trimming. `None`
     /// preserves the legacy 32,000-token default when `context_compact_ratio`
     /// is unset. In ratio mode this remains an optional downward cap. Every
@@ -14751,6 +14814,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
+            history_trim_low_water: None,
             max_context_tokens: None,
             context_compact_ratio: None,
             compact_context: None,
@@ -14831,9 +14895,11 @@ pub struct KnowledgeBundleConfig {
 #[serde(default)]
 pub struct McpBundleConfig {
     /// MCP server IDs (`[mcp.servers].name`) granted by this bundle.
+    #[alias_source(McpServers)]
     pub servers: Vec<String>,
     /// MCP server IDs removed from the grant. Deny wins: a name listed here is
     /// excluded even if another referenced bundle includes it.
+    #[alias_source(McpServers)]
     pub exclude: Vec<String>,
 }
 
@@ -24540,7 +24606,12 @@ impl Config {
 
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let required = crate::setup::route_required_fields(
+                &route.hint,
+                &route.model_provider,
+                &route.model,
+            );
+            if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
@@ -24548,7 +24619,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if mp.is_empty() {
+            if required.model_provider.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model_provider"),
@@ -24575,7 +24646,7 @@ impl Config {
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if required.model.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model"),
@@ -24586,7 +24657,12 @@ impl Config {
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let required = crate::setup::route_required_fields(
+                &route.hint,
+                &route.model_provider,
+                &route.model,
+            );
+            if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].hint"),
@@ -24594,7 +24670,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if mp.is_empty() {
+            if required.model_provider.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
@@ -24619,7 +24695,7 @@ impl Config {
                     "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if required.model.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model"),
@@ -25203,6 +25279,22 @@ impl Config {
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
+        }
+
+        // Sorted profile iteration keeps validation error ordering stable.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let Some(low_water) = self.runtime_profiles[palias].history_trim_low_water else {
+                continue;
+            };
+            if !low_water.is_finite() || low_water <= 0.0 || low_water > 1.0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{palias}.history_trim_low_water"),
+                    "runtime_profiles.{palias}.history_trim_low_water must be a finite number in (0.0, 1.0] (got {low_water})",
+                );
+            }
         }
 
         // Per-profile validation: the context-compression summarizer provider
@@ -33572,6 +33664,50 @@ reasoning_enabled = false
     }
 
     #[test]
+    async fn anthropic_thinking_display_round_trips_through_toml() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+thinking_display = "summarized"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config
+            .providers
+            .models
+            .anthropic
+            .get("fable")
+            .expect("alias should exist");
+        assert_eq!(
+            entry.thinking_display,
+            Some(AnthropicThinkingDisplay::Summarized)
+        );
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(rendered.contains("thinking_display = \"summarized\""));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_is_absent_when_unset() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config.providers.models.anthropic.get("fable").unwrap();
+        assert_eq!(entry.thinking_display, None);
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(!rendered.contains("thinking_display"));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_rejects_an_unknown_value() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+thinking_display = "verbose"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
     async fn runtime_reasoning_effort_deserializes() {
         let raw = r#"
 default_temperature = 0.7
@@ -33910,6 +34046,105 @@ runtime_profile = "long_turn"
             50
         );
     }
+    #[test]
+    async fn default_history_trim_low_water_is_seven_tenths() {
+        let raw = r#"
+[runtime_profiles.plain]
+
+[agents.default]
+runtime_profile = "plain"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.7);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.7);
+    }
+
+    #[test]
+    async fn runtime_profile_history_trim_low_water_is_honored() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.9
+
+[agents.default]
+runtime_profile = "mem_saver"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.9);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.9);
+    }
+
+    #[test]
+    async fn validate_accepts_history_trim_low_water_of_one() {
+        let raw = r#"
+[runtime_profiles.no_hysteresis]
+history_trim_low_water = 1.0
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed
+                .runtime_profiles
+                .get("no_hysteresis")
+                .and_then(|p| p.history_trim_low_water),
+            Some(1.0)
+        );
+        parsed
+            .validate()
+            .expect("history_trim_low_water = 1.0 must be accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_zero_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water = 0.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_history_trim_low_water_above_one() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 1.5
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water above 1.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_non_finite_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = nan
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("non-finite history_trim_low_water must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
     #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {
         let cfg = PacingConfig::default();
@@ -49258,6 +49493,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-fable-5".to_string()],
+                thinking_display: None,
             },
         );
 
@@ -49278,6 +49514,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-opus-4-8".to_string()],
+                thinking_display: None,
             },
         );
 

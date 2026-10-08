@@ -92,6 +92,8 @@ pub struct TurnAttribution {
     pub model_provider: String,
     pub model: String,
     pub channel: &'static str,
+    /// Minted only by the native local RPC connection for transient UI delivery.
+    pub local_file_diffs: bool,
 }
 
 pub async fn execute_turn<F, Fut>(
@@ -101,6 +103,7 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
+    thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
     admission: Option<TurnAdmission>,
     on_event: F,
@@ -112,6 +115,8 @@ where
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
+    let prompt_runner = crate::tools::sessions_prompt::current_session_prompt_runner();
+    let local_file_diffs = attribution.local_file_diffs;
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
@@ -133,7 +138,7 @@ where
             });
         }
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+        let turn = crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
@@ -144,21 +149,28 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            steering_rx.as_mut(),
+            zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .scope(thinking, async move {
+                    zeroclaw_api::local_file_diff::LOCAL_FILE_DIFFS_ALLOWED
+                        .scope(
+                            local_file_diffs,
+                            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                                cost_context,
+                                guard
+                                    .turn_streamed_with_steering_state(
+                                        &prompt,
+                                        event_tx,
+                                        Some(cancel_clone),
+                                        steering_rx.as_mut(),
+                                    )
+                                    .instrument(span),
+                            ),
                         )
-                        .instrument(span),
-                )
+                        .await
+                })
                 .await
-        })
-        .await
+        });
+        crate::tools::sessions_prompt::scope_session_prompt_runner(prompt_runner, turn).await
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
@@ -542,6 +554,183 @@ impl TurnUsageFold {
 }
 
 #[cfg(test)]
+mod thinking_scope_tests {
+    use super::*;
+    use crate::agent::agent::Agent;
+    use crate::agent::dispatcher::NativeToolDispatcher;
+    use crate::observability::{NoopObserver, Observer};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{
+        ModelProvider, NativeThinkingParams, ThinkingDisplay, ThinkingEffort,
+    };
+    use zeroclaw_memory::Memory;
+    use zeroclaw_providers::ChatRequest;
+
+    /// Records the thinking request each call carried.
+    #[derive(Default)]
+    struct ThinkingRecordingProvider {
+        seen: StdMutex<Vec<Option<NativeThinkingParams>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.seen.lock().unwrap().push(request.thinking);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for ThinkingRecordingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "recording-provider"
+        }
+    }
+
+    fn agent_with(provider: Arc<ThinkingRecordingProvider>) -> Agent {
+        struct Shared(Arc<ThinkingRecordingProvider>);
+
+        #[async_trait]
+        impl ModelProvider for Shared {
+            async fn chat_with_system(
+                &self,
+                system_prompt: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.0
+                    .chat_with_system(system_prompt, message, model, temperature)
+                    .await
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+
+        impl Attributable for Shared {
+            fn role(&self) -> Role {
+                self.0.role()
+            }
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        Agent::builder()
+            .model_provider(Box::new(Shared(provider)))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("recording-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed")
+    }
+
+    async fn noop(_event: TurnEvent) {}
+
+    #[tokio::test]
+    async fn execute_turn_scopes_native_thinking_override() {
+        let provider = Arc::new(ThinkingRecordingProvider::default());
+        let agent = Arc::new(Mutex::new(agent_with(Arc::clone(&provider))));
+        let attribution = TurnAttribution {
+            session_key: Some("s1".into()),
+            agent_alias: "rpc-agent".into(),
+            model_provider: "recording-provider".into(),
+            model: "test-model".into(),
+            channel: "rpc",
+            local_file_diffs: false,
+        };
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: Some(ThinkingDisplay::Summarized),
+        };
+
+        execute_turn(
+            Arc::clone(&agent),
+            "hello".to_string(),
+            CancellationToken::new(),
+            attribution.clone(),
+            None,
+            None,
+            Some(params),
+            None,
+            None,
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        execute_turn(
+            agent,
+            "again".to_string(),
+            CancellationToken::new(),
+            attribution,
+            None,
+            None,
+            None,
+            None,
+            None,
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some(params), None],
+            "the thinking request must be scoped inside the spawned turn task, \
+             and must not leak into the next turn"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
@@ -722,6 +911,80 @@ mod tests {
     }
 
     zeroclaw_api::tool_attribution!(CountingTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[tokio::test]
+    async fn execute_turn_carries_session_prompt_scope_into_its_spawned_worker() {
+        use crate::tools::sessions_prompt::{
+            SessionPromptFn, SessionPromptOutcome, SessionsPromptTool, scope_session_prompt_runner,
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let runner: SessionPromptFn = Box::new(move |_sid, message, alias| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(alias, "caller");
+            assert!(message.starts_with("[from agent caller, session source]"));
+            Box::pin(async {
+                Ok(SessionPromptOutcome {
+                    content: "delivered".into(),
+                    stop_reason: "end_turn".into(),
+                })
+            })
+        });
+        let provider = TwoCallToolProvider {
+            first: ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "prompt-call".into(),
+                    name: "sessions_prompt".into(),
+                    arguments: r#"{"session_id":"target","message":"hello"}"#.into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            second: ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            done: std::sync::atomic::AtomicBool::new(false),
+            alias: "scope-test",
+        };
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SessionsPromptTool::new("caller"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(NoopObserver))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .unwrap();
+        scope_session_prompt_runner(
+            Some(Arc::new(runner)),
+            execute_turn(
+                Arc::new(Mutex::new(agent)),
+                "prompt".into(),
+                CancellationToken::new(),
+                TurnAttribution {
+                    session_key: Some("source".into()),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+                None,
+                None,
+                noop,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(crate::tools::sessions_prompt::current_session_prompt_runner().is_none());
+    }
 
     fn token_usage(input: u64, output: u64) -> TokenUsage {
         TokenUsage {
@@ -1280,8 +1543,10 @@ mod tests {
                 model_provider: "mock-provider".into(),
                 model: "test-model".into(),
                 channel: "rpc",
+                local_file_diffs: false,
             },
             Some(cost_context),
+            None,
             None,
             None,
             None,
@@ -1308,6 +1573,110 @@ mod tests {
             agent_summary.request_count, 1,
             "the agent alias must flow through to the persisted cost record"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_turn_scopes_local_file_diffs_inside_spawn_without_history_payload() {
+        for local_file_diffs in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().canonicalize().unwrap();
+            let previous = "private-old-sentinel\n";
+            let written = "replacement\n";
+            std::fs::write(workspace.join("note.txt"), previous).unwrap();
+            let security = Arc::new(crate::security::SecurityPolicy {
+                autonomy: zeroclaw_config::autonomy::AutonomyLevel::Supervised,
+                workspace_dir: workspace.clone(),
+                ..crate::security::SecurityPolicy::default()
+            });
+            let provider = TwoCallToolProvider {
+                first: ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "write-1".into(),
+                        name: "file_write".into(),
+                        arguments: serde_json::json!({"path": "note.txt", "content": written})
+                            .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                second: ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                done: std::sync::atomic::AtomicBool::new(false),
+                alias: "local-diff-test",
+            };
+            let agent = Agent::builder()
+                .model_provider(Box::new(provider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![
+                        Box::new(crate::tools::FileWriteTool::new(security.clone())),
+                        Box::new(crate::tools::FileReadTool::new(security)),
+                    ],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace)
+                .build()
+                .unwrap();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let received = events.clone();
+            // An outer true scope must not grant permission to a false
+            // attribution. Conversely the spawned task must receive true.
+            let outcome = zeroclaw_api::local_file_diff::LOCAL_FILE_DIFFS_ALLOWED
+                .scope(
+                    true,
+                    execute_turn(
+                        Arc::new(Mutex::new(agent)),
+                        "write note".into(),
+                        CancellationToken::new(),
+                        TurnAttribution {
+                            local_file_diffs,
+                            ..TurnAttribution::default()
+                        },
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        move |event| {
+                            received.lock().unwrap().push(event);
+                            std::future::ready(())
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            let TurnOutcome::Completed { messages, .. } = outcome else {
+                panic!("file write turn must complete");
+            };
+            assert!(!format!("{messages:?}").contains("private-old-sentinel"));
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, TurnEvent::LocalFileDiff { .. }))
+                    .count(),
+                usize::from(local_file_diffs)
+            );
+            for event in events.iter() {
+                match event {
+                    TurnEvent::LocalFileDiff { diff, .. } => {
+                        assert_eq!(diff.previous(), previous);
+                        assert_eq!(diff.written(), written);
+                    }
+                    TurnEvent::ToolResult { output, .. } => {
+                        assert!(!output.contains("private-old-sentinel"))
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Regression: the drain callback must resolve `model_context_window`
@@ -1436,7 +1805,9 @@ mod tests {
                 model_provider: "openai.default".into(),
                 model: "test-model".into(),
                 channel: "rpc",
+                local_file_diffs: false,
             },
+            None,
             None,
             None,
             None,
@@ -1611,7 +1982,9 @@ mod tests {
                     model_provider: cell.provider_ref.into(),
                     model: "matrix-model".into(),
                     channel: "rpc",
+                    local_file_diffs: false,
                 },
+                None,
                 None,
                 None,
                 None,
@@ -1877,7 +2250,9 @@ mod tests {
                 model_provider: "openai.default".into(),
                 model: "w1-model".into(),
                 channel: "rpc",
+                local_file_diffs: false,
             },
+            None,
             None,
             None,
             None,
@@ -2156,9 +2531,11 @@ mod tests {
                     model_provider: "held-provider".into(),
                     model: "test-model".into(),
                     channel: "rpc",
+                    local_file_diffs: false,
                 },
                 None,
                 Some(activity),
+                None,
                 None,
                 None,
                 noop,

@@ -8,7 +8,8 @@ use serde_json::Value;
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
-pub use crate::rpc::session::SessionOverrides;
+pub use crate::rpc::session::{SessionOverrideField, SessionOverrides};
+pub use crate::rpc::thinking_options::ThinkingOptions;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
 pub use zeroclaw_api::runtime_status::{
@@ -282,6 +283,13 @@ rpc_type! {
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub attachments: Vec<FileEntry>,
+        /// Set by the runtime when this prompt was injected by another agent
+        /// via the `sessions_prompt` tool: the calling agent's alias.
+        /// Human-typed prompts never set it. Drives the `user_message`
+        /// session update so the owner pane renders the injected prompt
+        /// before the turn streams.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub injected_by: Option<String>,
     }
 }
 
@@ -298,6 +306,9 @@ rpc_type! {
         pub session_id: String,
         #[serde(default)]
         pub overrides: SessionOverrides,
+        /// Overrides to clear before `overrides` applies.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub reset: Vec<SessionOverrideField>,
     }
 }
 
@@ -305,6 +316,19 @@ rpc_type! {
     pub struct SessionConfigureResult {
         pub session_id: String,
         pub overrides: SessionOverrides,
+        /// What the session can adjust about the reasoning after this call,
+        /// computed for the merged model.
+        pub thinking_options: ThinkingOptions,
+    }
+}
+
+rpc_type! {
+    /// `session/thinking-options`: the block `session/configure` returns,
+    /// without changing anything.
+    pub struct SessionThinkingOptionsResult {
+        pub session_id: String,
+        pub overrides: SessionOverrides,
+        pub thinking_options: ThinkingOptions,
     }
 }
 
@@ -1784,6 +1808,18 @@ pub enum SessionUpdateEvent {
         /// turn never reached a model call (refusals, missing sessions).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Box<TurnUsageTotals>>,
+    },
+    /// A user message was appended to the session by something other than
+    /// the owning client — e.g. another agent prompted this session via the
+    /// `sessions_prompt` tool. Emitted before the injected turn starts so
+    /// the owner pane renders the prompt it is about to see stream.
+    /// `source` names the injecting agent. Human-typed prompts do not emit
+    /// this: the typing client already renders its own message.
+    UserMessage {
+        session_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context

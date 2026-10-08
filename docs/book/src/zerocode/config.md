@@ -13,6 +13,14 @@ instruction to open the file in an editor. Hand editing is a fallback for
 headless hosts and scripted provisioning, where the docs call it out
 explicitly.
 
+## Save and cancel drafts
+
+The editor shows your current Save and Cancel shortcuts and whether edits are pending. Save works for text, choices, arrays, personality files, and Skills. Enter also saves text and choices; in multiline editors it inserts a newline. Cancel discards the current edit without saving. In a filtered choice list, Cancel clears the filter first.
+
+Switching to another pane parks your draft. Navigation that would replace a pending draft asks you to stay or discard it. Failed saves keep the draft for retry. Saving an inline personality file keeps its content open for further edits.
+
+Before opening an external personality or Skills editor, Config explains that a successful editor exit imports and saves changed content. You can cancel before launch and continue in the inline editor.
+
 ## Keybinding modifiers
 
 Keybindings use canonical modifier names: `control` is literal Control, `primary` is Command on macOS and Control elsewhere, and `super` is literal Super/Command. For example, `control+c`, `primary+r`, and `alt+shift+up` are portable persisted values. Older `ctrl+...` values are migrated once when the config loads and rewritten to the corresponding canonical spelling.
@@ -27,6 +35,12 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
 - **Registry-backed lists.** Provider, channel, model, and theme choices come
   from the backend registry, so the options you see are exactly the ones this
   build supports.
+
+## Field labels and full details
+
+Config field rows use readable labels and keep long values to a one-line preview. Open Help while a field is selected to read its exact configuration path, complete description, and current value. The help view scrolls, including long array values and paths. Filtering continues to match the configuration path.
+
+An unset field is shown as `<unset>`, secret values remain hidden, and environment overrides are marked. Unit and default explanations come from the field description. A current value does not establish whether you explicitly configured it or inherited a default.
 
 ## Local UI settings (`zerocode-config.toml`)
 
@@ -64,6 +78,17 @@ narrow terminal widths. Selecting an existing agent from the sidebar starts a
 new Chat or Code session without replacing the other sessions already tracked
 by that pane.
 
+Each Chat or Code pane tracks at most eight sessions by default, including the focused session, background sessions, and retained reconnect entries. Headless and scripted setups can change this client-side bound in `zerocode-config.toml`; the Config pane does not expose this field yet:
+
+```toml
+[sessions]
+max_tracked_per_pane = 8 # valid range: 1 through 32
+```
+
+The daemon enforces its session limits independently. Increasing this value cannot exceed a lower server-side limit. ZeroCode resolves it at startup; reconnects within the same run keep the original value. Malformed or out-of-range values prevent startup instead of silently falling back.
+
+The Config pane shows the selected field's description below the editor. Use the description's displayed scroll bindings or the mouse wheel over it to read longer text. The Todo tracker section also shows the effective shared dock side and width; dock geometry remains shell-owned rather than a numeric Todo editor.
+
 TodoWrite values are re-read at every session boundary, so an edit made in the
 Config pane applies to the next session you start, restart, or switch to, with
 no zerocode restart needed.
@@ -78,6 +103,7 @@ as `__`:
 ZEROCODE_todotracker__enabled=false zerocode
 ZEROCODE_todotracker__location=bottom zerocode
 ZEROCODE_sidebar__visible=false zerocode
+ZEROCODE_sessions__max_tracked_per_pane=12 zerocode
 ```
 
 These overrides are process-transient: they affect the running instance only and

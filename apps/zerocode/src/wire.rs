@@ -218,7 +218,7 @@ impl PropKind {
     }
 }
 
-/// Alias namespace for `PropKind::AliasRef` fields. Wire mirror of
+/// Alias namespace for reference scalars and arrays. Wire mirror of
 /// `zeroclaw_config::traits::AliasSource`; zerocode does not depend on
 /// `zeroclaw-config`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,6 +234,7 @@ pub enum AliasSource {
     SkillBundles,
     KnowledgeBundles,
     McpBundles,
+    McpServers,
 }
 
 /// Schema-defined config tab grouping. Mirrors
@@ -303,6 +304,13 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Setup facts supplied by the canonical config owner. Absence of this
+/// metadata means requirements are unknown, not that a field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFieldSetup {
+    pub missing: bool,
+}
+
 /// Single config-property descriptor returned by `config/list` and
 /// `config/sections`. Mirrors `zeroclaw_config::traits::ConfigFieldEntry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +334,8 @@ pub struct ConfigFieldEntry {
     pub tab: ConfigTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_source: Option<AliasSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 /// Section-page shape returned by `config/sections`. Mirrors
@@ -626,5 +636,17 @@ mod plan_wire_tests {
         assert!(v.get("activeForm").is_none());
         let back: PlanEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back, entry);
+    }
+}
+
+#[cfg(test)]
+mod alias_source_wire_tests {
+    use super::AliasSource;
+
+    #[test]
+    fn mcp_servers_alias_source_round_trips() {
+        let source: AliasSource = serde_json::from_str("\"mcp_servers\"").unwrap();
+        assert_eq!(source, AliasSource::McpServers);
+        assert_eq!(serde_json::to_string(&source).unwrap(), "\"mcp_servers\"");
     }
 }

@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -17,6 +17,11 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
+
+pub(crate) const LOCAL_FILE_DIFF_TTL: Duration = Duration::from_secs(5 * 60);
+const LOCAL_FILE_DIFF_SESSION_BYTES: usize = 64 * 1024;
+const LOCAL_FILE_DIFF_SESSION_COUNT: usize = 16;
+const LOCAL_FILE_DIFF_SESSIONS: usize = 16;
 
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
@@ -115,6 +120,7 @@ pub mod method {
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CONFIGURE: &str = "session/configure";
+    pub const SESSION_THINKING_OPTIONS: &str = "session/thinking-options";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
@@ -129,6 +135,7 @@ pub mod method {
     pub const COST_ORG: &str = "cost/org";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
+    pub const AGENTS_LIST: &str = "agents/list";
     pub const AGENTS_STATUS: &str = "agents/status";
     pub const CRON_LIST: &str = "cron/list";
     pub const CRON_RUNS: &str = "cron/runs";
@@ -244,9 +251,12 @@ pub struct RpcInboundRequest {
 ///
 /// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
 /// background sessions live): chunk volume multiplies between draw-loop
-/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
-/// session's status dot in "running" forever.
-pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+/// drains, and a `Lagged` receiver forces a durable transcript reload of
+/// every tracked session, during which their live stream is gated. The draw
+/// loop wakes early to drain pending notifications; this capacity is the
+/// headroom for draw stalls (resize storms, full transcript rebuilds, the
+/// process being descheduled) on top of that.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 4096;
 
 // ── Typed session updates ────────────────────────────────────────
 
@@ -270,6 +280,13 @@ pub enum SessionUpdate {
         session_id: String,
         tool_call_id: String,
         raw_output: String,
+    },
+    /// Live local evidence only; never reconstructed from saved history.
+    LocalFileDiff {
+        session_id: String,
+        tool_call_id: String,
+        diff: zeroclaw_api::local_file_diff::LocalFileDiff,
+        expires: Instant,
     },
     ApprovalRequest {
         session_id: String,
@@ -329,6 +346,15 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+    /// A user message was injected into the session by another agent (the
+    /// `sessions_prompt` tool path); `source` names the injecting agent.
+    /// The pane never typed it, so it arrives as an update instead of being
+    /// rendered locally.
+    UserMessage {
+        session_id: String,
+        text: String,
+        source: Option<String>,
+    },
 }
 
 impl SessionUpdate {
@@ -340,11 +366,13 @@ impl SessionUpdate {
             | SessionUpdate::AgentThoughtChunk { session_id, .. }
             | SessionUpdate::ToolCall { session_id, .. }
             | SessionUpdate::ToolResult { session_id, .. }
+            | SessionUpdate::LocalFileDiff { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::UserMessage { session_id, .. } => session_id,
         }
     }
 }
@@ -390,6 +418,15 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
             raw_output: params.get("raw_output")?.as_str()?.to_string(),
+        }),
+        "local_file_diff" => Some(SessionUpdate::LocalFileDiff {
+            session_id: sid,
+            tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
+            diff: zeroclaw_api::local_file_diff::LocalFileDiff::new(
+                params.get("previous")?.as_str()?.to_string(),
+                params.get("written")?.as_str()?.to_string(),
+            )?,
+            expires: Instant::now() + LOCAL_FILE_DIFF_TTL,
         }),
         "approval_request" => Some(SessionUpdate::ApprovalRequest {
             session_id: sid,
@@ -447,6 +484,14 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 entries,
             })
         }
+        "user_message" => Some(SessionUpdate::UserMessage {
+            session_id: sid,
+            text: params.get("text")?.as_str()?.to_string(),
+            source: params
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
         _ => None,
     }
 }
@@ -473,6 +518,104 @@ pub fn spawn_notification_router(
             }
         }
     })
+}
+
+/// Private payloads never enter the generic notification broadcast ring.
+/// That ring has subscribers which may remain idle for an entire session.
+#[derive(Debug, Default)]
+struct LocalFileDiffInbox {
+    retired: bool,
+    next_token: u64,
+    pending: std::collections::VecDeque<(u64, SessionUpdate)>,
+}
+
+impl LocalFileDiffInbox {
+    fn close(&mut self) {
+        self.retired = true;
+        self.pending.clear();
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.pending.retain(|(_, update)| {
+            matches!(update,
+            SessionUpdate::LocalFileDiff { expires, .. } if *expires > now)
+        });
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending
+            .iter()
+            .filter_map(|(_, update)| match update {
+                SessionUpdate::LocalFileDiff { expires, .. } => Some(*expires),
+                _ => None,
+            })
+            .min()
+    }
+
+    fn route(&mut self, mut frame: Value) -> Option<Value> {
+        if frame.get("method").and_then(Value::as_str) != Some("session/update")
+            || frame.pointer("/params/type").and_then(Value::as_str) != Some("local_file_diff")
+        {
+            return Some(frame);
+        }
+        if self.retired {
+            return None;
+        }
+        let update = parse_session_update(frame.get("params")?)?;
+        let sid = update.session_id().to_owned();
+        self.expire(Instant::now());
+        self.next_token = self.next_token.checked_add(1)?;
+        let token = self.next_token;
+        self.pending.push_back((token, update));
+        while self
+            .pending
+            .iter()
+            .filter(|(_, update)| update.session_id() == sid)
+            .count()
+            > LOCAL_FILE_DIFF_SESSION_COUNT
+            || self
+                .pending
+                .iter()
+                .filter_map(|(_, update)| match update {
+                    SessionUpdate::LocalFileDiff {
+                        session_id, diff, ..
+                    } if session_id == &sid => Some(diff.previous().len() + diff.written().len()),
+                    _ => None,
+                })
+                .sum::<usize>()
+                > LOCAL_FILE_DIFF_SESSION_BYTES
+        {
+            let index = self
+                .pending
+                .iter()
+                .position(|(_, update)| update.session_id() == sid)?;
+            self.pending.remove(index);
+        }
+        while self
+            .pending
+            .iter()
+            .map(|(_, update)| update.session_id())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > LOCAL_FILE_DIFF_SESSIONS
+        {
+            let oldest = self.pending.front()?.1.session_id().to_owned();
+            self.pending
+                .retain(|(_, update)| update.session_id() != oldest);
+        }
+        frame["params"] =
+            serde_json::json!({"type":"local_file_diff_ready", "session_id":sid, "token":token});
+        Some(frame)
+    }
+
+    fn take(&mut self, token: u64, session_id: &str) -> Option<SessionUpdate> {
+        self.expire(Instant::now());
+        let index = self
+            .pending
+            .iter()
+            .position(|(id, update)| *id == token && update.session_id() == session_id)?;
+        self.pending.remove(index).map(|(_, update)| update)
+    }
 }
 
 // ── Transport ────────────────────────────────────────────────────
@@ -584,6 +727,39 @@ impl fmt::Display for DaemonInitializeTimeout {
 }
 
 impl std::error::Error for DaemonInitializeTimeout {}
+
+/// A JSON-RPC error the daemon answered a call with. Carried as the typed
+/// source of the `anyhow` chain (its display text is the same `RPC <method>:
+/// <message> (<code>)` line as before) so callers can branch on the code, such
+/// as an older daemon answering METHOD_NOT_FOUND for a method it lacks, and
+/// quote the daemon's message verbatim instead of the wrapped line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonRpcError {
+    pub method: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl DaemonRpcError {
+    /// The typed daemon error behind `error`, when the failure was a JSON-RPC
+    /// error rather than a timeout, a transport fault or an undecodable result.
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+
+    /// The daemon does not implement the method (an older daemon).
+    pub fn is_method_not_found(&self) -> bool {
+        self.code == crate::jsonrpc::error_codes::METHOD_NOT_FOUND
+    }
+}
+
+impl std::fmt::Display for DaemonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RPC {}: {} ({})", self.method, self.message, self.code)
+    }
+}
+
+impl std::error::Error for DaemonRpcError {}
 
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
@@ -721,6 +897,11 @@ fn route_inbound_frame(
         // Notification: method present, no id (or null id).
         (None, Some(method)) => {
             let params = frame.get("params").cloned().unwrap_or(Value::Null);
+            if method == "session/update"
+                && params.get("type").and_then(Value::as_str) == Some("local_file_diff")
+            {
+                return None;
+            }
             let _ = notif_tx.send(RpcNotification { method, params });
         }
         _ => {}
@@ -829,6 +1010,7 @@ pub struct RpcClient {
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
+    local_file_diff_inbox: Arc<Mutex<LocalFileDiffInbox>>,
     /// Single-consumer queue for server-initiated requests that expect a
     /// response (today: `elicitation/create`). Keeping the receiver here until
     /// the app claims it preserves requests that arrive during pane startup.
@@ -1669,6 +1851,8 @@ impl RpcClient {
         let conn_state_for_reader = conn_state.clone();
         let rpc_for_writer = Arc::downgrade(&rpc);
         let conn_state_for_writer = conn_state.clone();
+        let local_file_diff_inbox = Arc::new(Mutex::new(LocalFileDiffInbox::default()));
+        let inbox_for_writer = Arc::clone(&local_file_diff_inbox);
         let writer_task = tokio::spawn(async move {
             let mut writer = write_half;
             while let Some(message) = writer_rx.recv().await {
@@ -1681,6 +1865,9 @@ impl RpcClient {
                             if let Some(rpc) = rpc_for_writer.upgrade() {
                                 disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
                             }
+                            if let Ok(mut inbox) = inbox_for_writer.lock() {
+                                inbox.close();
+                            }
                             break;
                         }
                     }
@@ -1692,10 +1879,23 @@ impl RpcClient {
         });
 
         let rpc_for_reader = rpc.clone();
+        let inbox_for_reader = Arc::clone(&local_file_diff_inbox);
         let (reader_control_tx, mut reader_control_rx) = mpsc::unbounded_channel::<ReaderControl>();
         let read_task = tokio::spawn(async move {
             let mut lines = BufReader::new(read_half).lines();
             loop {
+                let deadline = inbox_for_reader
+                    .lock()
+                    .ok()
+                    .and_then(|inbox| inbox.deadline());
+                let expiry = async {
+                    match deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 let line = tokio::select! {
                     biased;
                     control = reader_control_rx.recv() => {
@@ -1703,7 +1903,12 @@ impl RpcClient {
                             break;
                         };
                         inbound_tx_for_reader.take();
+                        if let Ok(mut inbox) = inbox_for_reader.lock() { inbox.close(); }
                         let _ = ack.send(());
+                        continue;
+                    }
+                    () = expiry => {
+                        if let Ok(mut inbox) = inbox_for_reader.lock() { inbox.expire(Instant::now()); }
                         continue;
                     }
                     line = lines.next_line() => line,
@@ -1727,6 +1932,13 @@ impl RpcClient {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                let Some(frame) = inbox_for_reader
+                    .lock()
+                    .ok()
+                    .and_then(|mut inbox| inbox.route(frame))
+                else {
+                    continue;
+                };
                 if let Some(request) = route_inbound_frame(
                     &rpc_for_reader,
                     &notif_tx_for_reader,
@@ -1739,6 +1951,9 @@ impl RpcClient {
                         request,
                     );
                 }
+            }
+            if let Ok(mut inbox) = inbox_for_reader.lock() {
+                inbox.close();
             }
         });
 
@@ -1798,6 +2013,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
+            local_file_diff_inbox,
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             inbound_responses,
             connection_state: conn_state,
@@ -2092,6 +2308,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
+            local_file_diff_inbox: Arc::new(Mutex::new(LocalFileDiffInbox::default())),
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             inbound_responses,
             connection_state: conn_state,
@@ -2177,7 +2394,13 @@ impl RpcClient {
                     timeout.as_secs()
                 ))
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                anyhow::Error::new(DaemonRpcError {
+                    method: method.to_string(),
+                    code: e.code,
+                    message: e.message,
+                })
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -2226,6 +2449,26 @@ impl RpcClient {
     /// Get a receiver for server-initiated notifications.
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
         self.notifications_bcast.subscribe()
+    }
+
+    pub(crate) fn take_local_file_diff(
+        &self,
+        token: u64,
+        session_id: &str,
+    ) -> Option<SessionUpdate> {
+        let mut inbox = self.local_file_diff_inbox.lock().ok()?;
+        if !matches!(self.connection_state(), ConnectionState::Connected) {
+            inbox.close();
+        }
+        inbox.take(token, session_id)
+    }
+
+    pub(crate) fn clear_local_file_diffs(&self, session_id: &str) {
+        if let Ok(mut inbox) = self.local_file_diff_inbox.lock() {
+            inbox
+                .pending
+                .retain(|(_, update)| update.session_id() != session_id);
+        }
     }
 
     /// Claim the sole receiver for server-initiated JSON-RPC requests that
@@ -2322,11 +2565,9 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn config_delete(&self, prop: &str) -> Result<()> {
-        let _: ConfigDeleteResult = self
-            .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
-            .await?;
-        Ok(())
+    pub async fn config_delete(&self, prop: &str) -> Result<ConfigDeleteResult> {
+        self.call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
+            .await
     }
 
     /// Signal the daemon to reload in place. Mirrors `POST /admin/reload`.
@@ -2395,14 +2636,44 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn config_map_key_delete(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
-            .call(
-                method::CONFIG_MAP_KEY_DELETE,
+    pub async fn config_map_key_delete(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyDeleteResult> {
+        self.call(
+            method::CONFIG_MAP_KEY_DELETE,
+            serde_json::json!({ "path": path, "key": key }),
+        )
+        .await
+    }
+
+    /// Older daemons do not expose the canonical cascade preview over RPC.
+    /// Only METHOD_NOT_FOUND means unavailable; permission and transport errors
+    /// must not silently turn into an allowed delete.
+    pub async fn config_delete_plan(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<Option<ConfigDeletePlan>> {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.rpc.request(
+                "config/delete-plan",
                 serde_json::json!({ "path": path, "key": key }),
-            )
-            .await?;
-        Ok(())
+            ),
+        )
+        .await
+        .context("config/delete-plan timed out")?;
+        match result {
+            Err(error) if error.code == jsonrpc::error_codes::METHOD_NOT_FOUND => Ok(None),
+            Err(error) => {
+                anyhow::bail!("RPC config/delete-plan: {} ({})", error.message, error.code)
+            }
+            Ok(value) => Ok(Some(
+                serde_json::from_value(value).context("deserializing config/delete-plan result")?,
+            )),
+        }
     }
 
     pub async fn config_map_key_rename(
@@ -2797,18 +3068,37 @@ impl RpcClient {
         .await
     }
 
-    /// Apply session-scoped overrides (model, model_provider, temperature) to a
-    /// live session. The daemon applies them immediately and returns the merged
-    /// set. A `model_provider` override triggers a live provider-box rebuild
-    /// daemon-side.
+    /// Apply session-scoped overrides (model, model_provider, temperature,
+    /// thinking level and display) to a live session. The daemon applies them
+    /// immediately and returns the merged set plus the thinking options the
+    /// session offers afterwards. A `model_provider` override triggers a live
+    /// provider-box rebuild daemon-side. `reset` names the thinking overrides
+    /// to drop (`thinking_level` / `thinking_display`); it stays off the wire
+    /// when empty so an older daemon sees exactly the request it knows.
     pub async fn session_configure(
         &self,
         session_id: &str,
         overrides: SessionOverrides,
+        reset: &[&str],
+    ) -> Result<SessionConfigureResult> {
+        let mut params = serde_json::json!({ "session_id": session_id, "overrides": overrides });
+        if !reset.is_empty() {
+            params["reset"] = serde_json::json!(reset);
+        }
+        self.call(method::SESSION_CONFIGURE, params).await
+    }
+
+    /// The thinking levels and displays the session's model offers, with the
+    /// values currently in force and where each comes from. Shares the
+    /// `session/configure` result envelope. An older daemon answers
+    /// METHOD_NOT_FOUND; see [`DaemonRpcError`].
+    pub async fn session_thinking_options(
+        &self,
+        session_id: &str,
     ) -> Result<SessionConfigureResult> {
         self.call(
-            method::SESSION_CONFIGURE,
-            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+            method::SESSION_THINKING_OPTIONS,
+            serde_json::json!({ "session_id": session_id }),
         )
         .await
     }
@@ -2930,6 +3220,11 @@ impl RpcClient {
     pub async fn acp_session_list(&self) -> Result<SessionListResult> {
         self.call(method::SESSION_LIST_ACP, serde_json::json!({}))
             .await
+    }
+
+    /// Fetch configured agents without waiting for session counts.
+    pub async fn agents_list(&self) -> Result<AgentsListResult> {
+        self.call(method::AGENTS_LIST, serde_json::json!({})).await
     }
 
     pub async fn agents_status(&self) -> Result<AgentsStatusResult> {
@@ -3095,6 +3390,7 @@ impl RpcClient {
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
+            local_file_diff_inbox: Arc::new(Mutex::new(LocalFileDiffInbox::default())),
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             inbound_responses: Arc::new(InboundResponseTracker::default()),
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
@@ -3116,6 +3412,20 @@ impl RpcClient {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_local_file_diff_for_test(&self, params: Value) -> Option<(u64, Instant)> {
+        let mut inbox = self.local_file_diff_inbox.lock().ok()?;
+        let frame = inbox.route(serde_json::json!({"method":"session/update", "params":params}))?;
+        let token = frame.pointer("/params/token")?.as_u64()?;
+        let expires = inbox.pending.iter().find_map(|(id, update)| match update {
+            SessionUpdate::LocalFileDiff { expires, .. } if *id == token => Some(*expires),
+            _ => None,
+        })?;
+        drop(inbox);
+        self.push_notification_for_test("session/update", frame["params"].clone());
+        Some((token, expires))
+    }
+
     /// Stop this client's transport and release everything it holds open.
     ///
     /// A replaced client is not idle: its reader still owns the socket, its
@@ -3129,6 +3439,9 @@ impl RpcClient {
     /// adopted, and on a new client whose adoption failed. It is idempotent:
     /// aborting a finished task is a no-op.
     pub fn shutdown(&self) {
+        if let Ok(mut inbox) = self.local_file_diff_inbox.lock() {
+            inbox.close();
+        }
         self.read_task.abort();
         self.router_task.abort();
         if let Some(writer) = &self.writer_task {
@@ -3279,7 +3592,36 @@ mod initialize_timeout_tests {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigDeleteResult {}
+pub struct ConfigDeleteResult {
+    pub prop: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigMapKeyDeleteResult {
+    pub path: String,
+    pub key: String,
+    pub deleted: bool,
+    #[serde(default)]
+    pub warnings: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigDeleteRefSite {
+    pub path: String,
+}
+
+/// Wire projection of the daemon-owned delete planner, without secret values.
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigDeletePlan {
+    pub path: String,
+    pub key: String,
+    pub allowed: bool,
+    pub blockers: Vec<ConfigDeleteRefSite>,
+    pub scrubs: Vec<ConfigDeleteRefSite>,
+    pub live_acp_sessions: Option<usize>,
+    pub cascades_owned_state: bool,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4389,7 +4731,7 @@ pub struct SessionStateResult {
 /// Session-scoped overrides mirror of
 /// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
 /// `session/configure`; every field is optional and omitted when `None`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4398,6 +4740,43 @@ pub struct SessionOverrides {
     pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Lowercase thinking level token (`low`, `high`, ...); the daemon
+    /// validates it against the session's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    /// Lowercase thinking display token (`omitted`, `summarized`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<String>,
+}
+
+impl SessionOverrides {
+    /// An override request carrying only `value` for `control`.
+    pub fn thinking(control: ThinkingControl, value: String) -> Self {
+        let mut overrides = Self::default();
+        match control {
+            ThinkingControl::Level => overrides.thinking_level = Some(value),
+            ThinkingControl::Display => overrides.thinking_display = Some(value),
+        }
+        overrides
+    }
+}
+
+/// Which session thinking override a request targets. The wire token doubles
+/// as the override field name and as the `reset` entry of `session/configure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    Level,
+    Display,
+}
+
+impl ThinkingControl {
+    /// The `reset` token for this control.
+    pub const fn reset_token(self) -> &'static str {
+        match self {
+            Self::Level => "thinking_level",
+            Self::Display => "thinking_display",
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4405,6 +4784,360 @@ pub struct SessionOverrides {
 pub struct SessionConfigureResult {
     #[serde(default)]
     pub overrides: SessionOverrides,
+    /// The thinking options the session offers after the change. Absent from
+    /// daemons that predate the thinking controls, so their result still
+    /// parses.
+    #[serde(default)]
+    pub thinking_options: Option<ThinkingOptionsResult>,
+}
+
+/// Where a thinking value in force comes from. `Unknown` absorbs sources a
+/// newer daemon may add; only `Session` changes TUI behavior (it gates the
+/// picker's reset row).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingSource {
+    Session,
+    Profile,
+    Alias,
+    ModelDefault,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// The `thinking_options` block shared by `session/configure` and
+/// `session/thinking-options`, mirrored down to what the TUI reads (the
+/// daemon also echoes the resolved model_provider and model). Every field
+/// defaults so a partial or older payload parses as "nothing adjustable".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ThinkingOptionsResult {
+    /// Levels the model accepts; empty when nothing is adjustable.
+    #[serde(default)]
+    pub levels: Vec<String>,
+    /// Display choices the model accepts; empty when nothing is adjustable.
+    #[serde(default)]
+    pub displays: Vec<String>,
+    /// Present exactly when `levels` is non-empty.
+    #[serde(default)]
+    pub current_level: Option<String>,
+    #[serde(default)]
+    pub level_source: ThinkingSource,
+    /// Present exactly when `displays` is non-empty.
+    #[serde(default)]
+    pub current_display: Option<String>,
+    #[serde(default)]
+    pub display_source: ThinkingSource,
+}
+
+impl ThinkingOptionsResult {
+    /// The offered values, the value in force and its source for `control`.
+    pub fn control(&self, control: ThinkingControl) -> (&[String], Option<&str>, ThinkingSource) {
+        match control {
+            ThinkingControl::Level => (
+                &self.levels,
+                self.current_level.as_deref(),
+                self.level_source,
+            ),
+            ThinkingControl::Display => (
+                &self.displays,
+                self.current_display.as_deref(),
+                self.display_source,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_thinking_wire_tests {
+    use super::*;
+
+    fn client_with_channel() -> (RpcClient, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        (RpcClient::with_rpc(Arc::clone(&rpc)), rpc, rx)
+    }
+
+    async fn next_request(rx: &mut mpsc::Receiver<String>) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the call should send a request")
+            .expect("the request channel should stay open");
+        serde_json::from_str(&line).expect("the request should be JSON")
+    }
+
+    fn contract_options() -> Value {
+        serde_json::json!({
+            "model_provider": "anthropic.default",
+            "model": "claude-fable-5-1",
+            "levels": ["low", "medium", "high", "xhigh", "max"],
+            "displays": ["omitted", "summarized", "updates"],
+            "current_level": "high",
+            "level_source": "session",
+            "current_display": "summarized",
+            "display_source": "session"
+        })
+    }
+
+    #[test]
+    fn thinking_overrides_serialize_only_when_set() {
+        assert_eq!(
+            serde_json::to_value(SessionOverrides::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(SessionOverrides::thinking(
+                ThinkingControl::Level,
+                "high".into()
+            ))
+            .unwrap(),
+            serde_json::json!({ "thinking_level": "high" })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionOverrides::thinking(
+                ThinkingControl::Display,
+                "summarized".into()
+            ))
+            .unwrap(),
+            serde_json::json!({ "thinking_display": "summarized" })
+        );
+        let combined = SessionOverrides {
+            model: Some("claude-fable-5-1".into()),
+            thinking_level: Some("high".into()),
+            thinking_display: Some("summarized".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(combined).unwrap(),
+            serde_json::json!({
+                "model": "claude-fable-5-1",
+                "thinking_level": "high",
+                "thinking_display": "summarized"
+            })
+        );
+    }
+
+    #[test]
+    fn reset_tokens_match_the_wire_contract() {
+        assert_eq!(ThinkingControl::Level.reset_token(), "thinking_level");
+        assert_eq!(ThinkingControl::Display.reset_token(), "thinking_display");
+    }
+
+    #[tokio::test]
+    async fn session_configure_keeps_reset_off_the_wire_when_empty() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move {
+            client
+                .session_configure(
+                    "sess-1",
+                    SessionOverrides::thinking(ThinkingControl::Level, "high".into()),
+                    &[],
+                )
+                .await
+        });
+
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        assert_eq!(
+            request["params"],
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "thinking_level": "high" }
+            })
+        );
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "thinking_level": "high" }
+            })),
+            None,
+        );
+
+        let result = call.await.unwrap().expect("configure should succeed");
+        assert_eq!(result.overrides.thinking_level.as_deref(), Some("high"));
+        assert!(result.thinking_options.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_configure_sends_the_reset_list_and_parses_echoed_options() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move {
+            client
+                .session_configure(
+                    "sess-1",
+                    SessionOverrides::default(),
+                    &[ThinkingControl::Display.reset_token()],
+                )
+                .await
+        });
+
+        let request = next_request(&mut rx).await;
+        assert_eq!(
+            request["params"],
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {},
+                "reset": ["thinking_display"]
+            })
+        );
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {
+                    "model": "claude-fable-5-1",
+                    "model_provider": "anthropic.default",
+                    "thinking_level": "high"
+                },
+                "thinking_options": contract_options()
+            })),
+            None,
+        );
+
+        let result = call.await.unwrap().expect("configure should succeed");
+        assert_eq!(result.overrides.thinking_display, None);
+        let options = result.thinking_options.expect("options are echoed");
+        assert_eq!(options.current_level.as_deref(), Some("high"));
+        assert_eq!(options.level_source, ThinkingSource::Session);
+    }
+
+    #[tokio::test]
+    async fn session_thinking_options_uses_the_shared_envelope() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move { client.session_thinking_options("sess-1").await });
+
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(
+            request["params"],
+            serde_json::json!({ "session_id": "sess-1" })
+        );
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "model": "claude-fable-5-1" },
+                "thinking_options": contract_options()
+            })),
+            None,
+        );
+
+        let result = call.await.unwrap().expect("options should load");
+        let options = result.thinking_options.expect("options block present");
+        assert_eq!(options.levels, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(options.displays, ["omitted", "summarized", "updates"]);
+    }
+
+    #[test]
+    fn configure_result_from_an_older_daemon_still_parses() {
+        let result: SessionConfigureResult = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-1",
+            "overrides": { "model": "gpt-5" }
+        }))
+        .expect("pre-thinking result parses");
+
+        assert_eq!(result.overrides.model.as_deref(), Some("gpt-5"));
+        assert_eq!(result.overrides.thinking_level, None);
+        assert_eq!(result.overrides.thinking_display, None);
+        assert!(result.thinking_options.is_none());
+    }
+
+    #[test]
+    fn thinking_options_contract_parses() {
+        let options: ThinkingOptionsResult =
+            serde_json::from_value(contract_options()).expect("contract parses");
+
+        assert_eq!(options.levels, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(options.displays, ["omitted", "summarized", "updates"]);
+        assert_eq!(options.current_level.as_deref(), Some("high"));
+        assert_eq!(options.level_source, ThinkingSource::Session);
+        assert_eq!(options.current_display.as_deref(), Some("summarized"));
+        assert_eq!(options.display_source, ThinkingSource::Session);
+
+        let (levels, current, source) = options.control(ThinkingControl::Level);
+        assert_eq!(levels, options.levels.as_slice());
+        assert_eq!(current, Some("high"));
+        assert_eq!(source, ThinkingSource::Session);
+        let (displays, current, source) = options.control(ThinkingControl::Display);
+        assert_eq!(displays, options.displays.as_slice());
+        assert_eq!(current, Some("summarized"));
+        assert_eq!(source, ThinkingSource::Session);
+    }
+
+    #[test]
+    fn thinking_options_parse_permissively() {
+        let empty: ThinkingOptionsResult =
+            serde_json::from_value(serde_json::json!({})).expect("empty block parses");
+        assert_eq!(empty, ThinkingOptionsResult::default());
+        assert!(empty.levels.is_empty());
+        assert!(empty.displays.is_empty());
+        assert_eq!(empty.level_source, ThinkingSource::Unknown);
+
+        // Opus 4.6: levels without displays.
+        let opus: ThinkingOptionsResult = serde_json::from_value(serde_json::json!({
+            "levels": ["low", "medium", "high", "max"],
+            "displays": [],
+            "current_level": "high",
+            "level_source": "model_default"
+        }))
+        .expect("levels-only block parses");
+        assert_eq!(opus.level_source, ThinkingSource::ModelDefault);
+        assert_eq!(opus.display_source, ThinkingSource::Unknown);
+        assert_eq!(opus.current_display, None);
+
+        // A source token from a newer daemon is absorbed rather than rejected.
+        let newer: ThinkingOptionsResult = serde_json::from_value(serde_json::json!({
+            "levels": ["low"],
+            "current_level": "low",
+            "level_source": "galaxy",
+            "display_source": "alias"
+        }))
+        .expect("unknown source parses");
+        assert_eq!(newer.level_source, ThinkingSource::Unknown);
+        assert_eq!(newer.display_source, ThinkingSource::Alias);
+    }
+
+    #[tokio::test]
+    async fn daemon_errors_keep_their_code_and_verbatim_message() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move { client.session_thinking_options("sess-1").await });
+
+        let request = next_request(&mut rx).await;
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                message: "method not found: session/thinking-options".to_string(),
+                data: None,
+            }),
+        );
+
+        let error = call
+            .await
+            .unwrap()
+            .expect_err("a daemon error should propagate");
+        let daemon = DaemonRpcError::from_anyhow(&error).expect("typed daemon error");
+        assert!(daemon.is_method_not_found());
+        assert_eq!(daemon.message, "method not found: session/thinking-options");
+        assert_eq!(
+            error.to_string(),
+            "RPC session/thinking-options: method not found: session/thinking-options (-32601)"
+        );
+
+        let invalid = DaemonRpcError {
+            method: method::SESSION_CONFIGURE.to_string(),
+            code: crate::jsonrpc::error_codes::INVALID_PARAMS,
+            message: "thinking_level \"xhigh\" is not supported".to_string(),
+        };
+        assert!(!invalid.is_method_not_found());
+        assert_eq!(
+            anyhow::Error::new(invalid.clone()).to_string(),
+            invalid.to_string()
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4529,6 +5262,19 @@ pub struct SessionEntry {
 #[serde(rename_all = "snake_case")]
 pub struct SessionListResult {
     pub sessions: Vec<SessionEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentEntry {
+    pub alias: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentsListResult {
+    pub agents: Vec<AgentEntry>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -6294,6 +7040,71 @@ mod notification_tests {
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
     }
 
+    #[tokio::test]
+    async fn local_file_diff_inbox_keeps_idle_generic_subscribers_payload_free() {
+        let (writer_tx, _) = mpsc::channel(2);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let (notifications, mut idle_logs) = broadcast::channel(4);
+        let frame = serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params":{"type":"local_file_diff", "session_id":"s", "tool_call_id":"id", "previous":"private-old-sentinel", "written":"new"}});
+        let mut inbox = LocalFileDiffInbox::default();
+        let safe = inbox.route(frame.clone()).unwrap();
+        assert!(!safe.to_string().contains("private-old-sentinel"));
+        let token = safe["params"]["token"].as_u64().unwrap();
+        route_inbound_frame(&rpc, &notifications, None, safe);
+        assert!(!format!("{:?}", idle_logs.recv().await.unwrap()).contains("private-old-sentinel"));
+        assert!(inbox.take(token, "foreign").is_none());
+        let update = inbox.take(token, "s").unwrap();
+        assert!(
+            matches!(update, SessionUpdate::LocalFileDiff { diff, .. } if diff.previous() == "private-old-sentinel")
+        );
+        assert!(inbox.take(token, "s").is_none());
+        // A remote/raw frame bypassing the local inbox must be discarded.
+        route_inbound_frame(&rpc, &notifications, None, frame);
+        assert!(idle_logs.try_recv().is_err());
+        inbox.close();
+        assert!(inbox.route(serde_json::json!({"method":"session/update", "params":{"type":"local_file_diff", "session_id":"s", "tool_call_id":"id", "previous":"private", "written":"new"}})).is_none());
+        assert!(inbox.pending.is_empty());
+    }
+
+    #[test]
+    fn local_file_diff_inbox_bounds_pending_payload_and_preserves_deadline() {
+        let frame = |sid: &str, content: &str| serde_json::json!({"method":"session/update", "params":{"type":"local_file_diff", "session_id":sid, "tool_call_id":"id", "previous":content, "written":content}});
+        let mut inbox = LocalFileDiffInbox::default();
+        for _ in 0..17 {
+            inbox.route(frame("s", "")).unwrap();
+        }
+        assert_eq!(inbox.pending.len(), 16);
+        let mut inbox = LocalFileDiffInbox::default();
+        let text = "x".repeat(zeroclaw_api::local_file_diff::MAX_FILE_DIFF_BYTES);
+        for _ in 0..3 {
+            inbox.route(frame("s", &text)).unwrap();
+        }
+        assert_eq!(inbox.pending.len(), 2);
+        let mut inbox = LocalFileDiffInbox::default();
+        for i in 0..17 {
+            inbox.route(frame(&i.to_string(), "")).unwrap();
+        }
+        assert_eq!(inbox.pending.len(), 16);
+        let deadline = inbox.deadline().unwrap();
+        inbox.expire(deadline + LOCAL_FILE_DIFF_TTL);
+        assert!(inbox.pending.is_empty());
+    }
+
+    #[test]
+    fn local_file_diff_notification_is_bounded_and_debug_redacted() {
+        let mut params = serde_json::json!({"type":"local_file_diff", "session_id":"s", "tool_call_id":"id", "previous":"private-old", "written":"new"});
+        let update = parse_session_update(&params).unwrap();
+        assert_eq!(update.session_id(), "s");
+        assert!(!format!("{update:?}").contains("private-old"));
+        params["previous"] =
+            serde_json::json!("x".repeat(zeroclaw_api::local_file_diff::MAX_FILE_DIFF_BYTES + 1));
+        assert!(parse_session_update(&params).is_none());
+        params["previous"] = serde_json::json!("bad\0");
+        assert!(parse_session_update(&params).is_none());
+        params.as_object_mut().unwrap().remove("previous");
+        assert!(parse_session_update(&params).is_none());
+    }
+
     #[test]
     fn parse_context_usage_keeps_budget_and_model_window_distinct() {
         let params = serde_json::json!({
@@ -6622,6 +7433,50 @@ mod plan_parse_tests {
     fn plan_update_missing_entries_is_none() {
         let params = serde_json::json!({ "type": "plan", "session_id": "s" });
         assert!(parse_session_update(&params).is_none());
+    }
+
+    #[test]
+    fn parse_user_message_round_trips_source_and_text() {
+        let update = parse_session_update(&serde_json::json!({
+            "type": "user_message",
+            "session_id": "s1",
+            "text": "[from agent helper, session helper-1]\n\nhi",
+            "source": "helper",
+        }))
+        .expect("user message parses");
+        assert!(matches!(
+            update,
+            SessionUpdate::UserMessage {
+                ref session_id,
+                ref text,
+                ref source,
+            } if session_id == "s1"
+                && text.starts_with("[from agent helper")
+                && source.as_deref() == Some("helper")
+        ));
+
+        let sourceless = parse_session_update(&serde_json::json!({
+            "type": "user_message",
+            "session_id": "s1",
+            "text": "hi",
+        }))
+        .expect("user message without source parses");
+        assert!(matches!(
+            sourceless,
+            SessionUpdate::UserMessage { source: None, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_unknown_update_type_is_none() {
+        let params = serde_json::json!({
+            "type": "definitely_not_a_real_update_kind",
+            "session_id": "s1",
+        });
+        assert!(
+            parse_session_update(&params).is_none(),
+            "an unknown update kind must stay a no-op for older clients"
+        );
     }
 }
 

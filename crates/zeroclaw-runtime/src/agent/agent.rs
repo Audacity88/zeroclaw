@@ -42,25 +42,28 @@ type SessionModelProvider = (
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
 
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
+fn split_model_provider_ref(model_provider_ref: &str) -> Result<(String, String)> {
+    model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
         .ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
             ))
-        })?;
+        })
+}
 
+fn resolve_session_model(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let (model_provider_name, model_provider_alias) = split_model_provider_ref(model_provider_ref)?;
     let entry = config
         .providers
         .models
         .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
+    model_override
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
@@ -76,7 +79,44 @@ pub fn build_session_model_provider(
                 "model_provider `{model_provider_ref}` has no `model` configured and no model \
                  override was supplied"
             ))
-        })?;
+        })
+}
+
+/// Resolve the same model identity as provider construction without building
+/// a provider or waiting for the session's live Agent.
+pub fn resolve_session_model_identity(
+    config: &Config,
+    agent_alias: &str,
+    model_provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<(String, String)> {
+    let model_provider_ref = match model_provider_override
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+    {
+        Some(reference) => reference.to_string(),
+        None => config
+            .agent(agent_alias)
+            .map(|agent| agent.model_provider.as_str().to_string())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("Agent `{agent_alias}` is not configured"))
+            })?,
+    };
+    let model = resolve_session_model(config, &model_provider_ref, model_override)?;
+    Ok((model_provider_ref, model))
+}
+
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
+    let (model_provider_name, model_provider_alias) = split_model_provider_ref(model_provider_ref)?;
+    let model_name = resolve_session_model(config, model_provider_ref, model_override)?;
+    let entry = config
+        .providers
+        .models
+        .find(&model_provider_name, &model_provider_alias);
 
     let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
@@ -474,10 +514,10 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history turn limit from canonical config at use time.
+    /// Resolves the structured-history cap and low-water fraction together.
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
-    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_trim_policy_resolver: Option<Arc<dyn Fn() -> (usize, f32) + Send + Sync>>,
     /// Resolves limits from canonical config for the provider/model route that
     /// is active when a turn starts. The route itself remains the source of truth.
     context_limits_resolver: Option<ContextLimitsResolver>,
@@ -736,7 +776,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_trim_policy_resolver: Option<Arc<dyn Fn() -> (usize, f32) + Send + Sync>>,
     context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -801,7 +841,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_turn_limit_resolver: None,
+            structured_history_trim_policy_resolver: None,
             context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
@@ -906,11 +946,11 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_turn_limit_resolver(
+    fn structured_history_trim_policy_resolver(
         mut self,
-        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
+        resolver: Arc<dyn Fn() -> (usize, f32) + Send + Sync>,
     ) -> Self {
-        self.structured_history_turn_limit_resolver = Some(resolver);
+        self.structured_history_trim_policy_resolver = Some(resolver);
         self
     }
 
@@ -921,7 +961,7 @@ impl AgentBuilder {
 
     #[cfg(test)]
     pub(crate) fn structured_max_history_turns(self, max: usize) -> Self {
-        self.structured_history_turn_limit_resolver(Arc::new(move || max))
+        self.structured_history_trim_policy_resolver(Arc::new(move || (max, 1.0)))
     }
 
     pub fn multimodal_config(
@@ -1279,7 +1319,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_turn_limit_resolver: self.structured_history_turn_limit_resolver,
+            structured_history_trim_policy_resolver: self.structured_history_trim_policy_resolver,
             context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
@@ -1393,6 +1433,18 @@ impl Agent {
         self.provider_switch_config
             .as_ref()
             .and_then(|cfg| cfg.config.as_deref())
+    }
+
+    fn turn_pacing(&self) -> zeroclaw_config::schema::PacingConfig {
+        self.provider_switch_config
+            .as_ref()
+            .and_then(|config| config.live_config.as_ref())
+            .map(|config| config.read().pacing.clone())
+            .or_else(|| self.full_config().map(|config| config.pacing.clone()))
+            .unwrap_or_else(|| zeroclaw_config::schema::PacingConfig {
+                loop_detection_enabled: false,
+                ..zeroclaw_config::schema::PacingConfig::default()
+            })
     }
 
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
@@ -2183,6 +2235,7 @@ impl Agent {
                 activated_tools: self.activated_tools.as_ref(),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &super::turn::TurnMeta {
                 agent_alias: Some(&self.agent_alias),
@@ -3095,17 +3148,22 @@ impl Agent {
                 })
             };
 
-        let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
+        let structured_history_trim_policy_resolver: Arc<dyn Fn() -> (usize, f32) + Send + Sync> =
             if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
-                    cap_config
-                        .read()
-                        .effective_structured_max_history_messages(&cap_agent_alias)
+                    let config = cap_config.read();
+                    (
+                        config.effective_structured_max_history_messages(&cap_agent_alias),
+                        config.effective_history_trim_low_water(&cap_agent_alias),
+                    )
                 })
             } else {
-                let max = config.effective_structured_max_history_messages(agent_alias);
-                Arc::new(move || max)
+                let policy = (
+                    config.effective_structured_max_history_messages(agent_alias),
+                    config.effective_history_trim_low_water(agent_alias),
+                );
+                Arc::new(move || policy)
             };
 
         let builder = Agent::builder();
@@ -3133,7 +3191,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_turn_limit_resolver(structured_history_turn_limit_resolver)
+            .structured_history_trim_policy_resolver(structured_history_trim_policy_resolver)
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
@@ -3205,20 +3263,44 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max_turns = self
-            .structured_history_turn_limit_resolver
+        let (max_turns, low_water) = self
+            .structured_history_trim_policy_resolver
             .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
+            .map_or(
+                (
+                    self.config.resolved.max_history_messages,
+                    self.config.resolved.history_trim_low_water,
+                ),
+                |resolve| resolve(),
+            );
+        let target_turns = crate::agent::history_trim::history_trim_target(max_turns, low_water);
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max_turns,
+            target_turns,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
         if !result.trimmed {
             return None;
+        }
+
+        if zeroclaw_providers::claude_models::claude_keeps_prior_thinking(&self.model_name) {
+            let stripped = crate::agent::history_trim::strip_all_reasoning_from_conversation(
+                &mut self.history,
+            );
+            if stripped > 0 {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "model": self.model_name,
+                            "messages": stripped,
+                        })),
+                    "dropped replayed reasoning after a turn-boundary history trim"
+                );
+            }
         }
 
         crate::agent::history_trim::insert_conversation_breadcrumb(&mut self.history);
@@ -3251,6 +3333,7 @@ impl Agent {
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "max_history_turns": max_turns,
+                        "trim_target_turns": target_turns,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -3834,6 +3917,10 @@ impl Agent {
         // reports come from the same generation.
         self.sync_config_generation();
 
+        let pacing = self.turn_pacing();
+        let repetition_guard =
+            std::sync::Mutex::new(super::turn::repetition::RepetitionGuard::default());
+
         let effective_model = self.classify_model(user_message);
         let selected_route = self.model_route_resolver.resolve(&effective_model);
         let context_limits =
@@ -3962,13 +4049,6 @@ impl Agent {
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
-        // E3 never had pattern-based loop detection; default pacing turns it
-        // on. Keep the embedder contract (an N-step identical-args tool chain
-        // completes) until the Agent surface grows a pacing config of its own.
-        let pacing = zeroclaw_config::schema::PacingConfig {
-            loop_detection_enabled: false,
-            ..zeroclaw_config::schema::PacingConfig::default()
-        };
 
         // Keep the loop call as a plain `.await` on this task. Caller-scoped
         // task-locals (session key, cost tracking, tool choice / thinking
@@ -3984,7 +4064,7 @@ impl Agent {
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
                 receipt_scope.clone(),
-                Box::pin(crate::agent::loop_::run_tool_call_loop(
+                Box::pin(super::turn::run_tool_call_loop_with_guard(
                     crate::agent::loop_::ToolLoop {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
@@ -4077,6 +4157,7 @@ impl Agent {
                             })
                         }),
                     },
+                    Some(&repetition_guard),
                 )),
             ),
         );
@@ -4330,6 +4411,9 @@ impl Agent {
         // route, so a mid-turn `model_switch` rebuilds the provider from the
         // same generation the limits below are resolved from.
         self.sync_config_generation();
+        let pacing = self.turn_pacing();
+        let repetition_guard =
+            std::sync::Mutex::new(super::turn::repetition::RepetitionGuard::default());
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
@@ -4478,13 +4562,6 @@ impl Agent {
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
-        // The streaming engine never had pattern-based loop detection; default
-        // pacing turns it on. Keep the embedder contract until this surface
-        // grows a pacing config of its own (matches `Agent::turn`).
-        let pacing = zeroclaw_config::schema::PacingConfig {
-            loop_detection_enabled: false,
-            ..zeroclaw_config::schema::PacingConfig::default()
-        };
 
         let cost_context = self.tool_loop_cost_tracking_context();
         let agent_alias_for_loop = self.observer_agent_alias();
@@ -4559,7 +4636,7 @@ impl Agent {
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    Box::pin(crate::agent::loop_::run_tool_call_loop(
+                    Box::pin(super::turn::run_tool_call_loop_with_guard(
                         crate::agent::loop_::ToolLoop {
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
@@ -4666,6 +4743,7 @@ impl Agent {
                                 })
                             }),
                         },
+                        Some(&repetition_guard),
                     )),
                 ),
             );
@@ -4788,6 +4866,10 @@ impl Agent {
                     let tree_budget_finalized = execution_tree_budget
                         .as_ref()
                         .is_some_and(|budget| budget.remaining() == 0);
+                    let repetition_exhausted = repetition_guard
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_exhausted();
                     // Pending steering is prepared here, where it decides
                     // whether another round runs. Each message is judged
                     // before its own memory write and all of them again after
@@ -4798,7 +4880,7 @@ impl Agent {
                     // between. A cancelled turn prepares nothing: the next
                     // round's top records the interruption if steering is
                     // pending, and no cancelled message is written to memory.
-                    if !tree_budget_finalized {
+                    if !tree_budget_finalized && !repetition_exhausted {
                         let cancelled = cancel_token
                             .as_ref()
                             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
@@ -6341,11 +6423,16 @@ mod tests {
 
         let message = crate::agent::terminal_completion_error_message(&error, None)
             .expect("an exhausted refusal projects a user-facing message");
+        let category =
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-refused-category-other");
         assert_eq!(
             message,
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-refusal")
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-agent-error-provider-refused",
+                &[("category", category.as_str())],
+            )
         );
-        assert!(message.contains("safety system"), "{message}");
+        assert!(message.contains(category.as_str()), "{message}");
         assert!(!message.contains("private-category"));
         assert!(
             zeroclaw_providers::reliable::transient_error_hint(&error)
@@ -11279,6 +11366,60 @@ mod tests {
     }
 
     #[test]
+    fn history_rewrite_strips_reasoning_only_after_trim_on_prior_thinking_models() {
+        for (model, strips) in [
+            ("claude-opus-4-5", true),
+            ("claude-sonnet-4-5", false),
+            ("claude-haiku-4-6", false),
+        ] {
+            let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver {});
+            let mut agent = trim_history_test_agent(1, observer);
+            agent.model_name = model.into();
+            agent.history = vec![
+                ConversationMessage::Chat(ChatMessage::system("system")),
+                ConversationMessage::Chat(ChatMessage::user("newest request")),
+            ];
+            push_trim_history_tool_exchange(&mut agent, 1);
+            if let ConversationMessage::AssistantToolCalls {
+                reasoning_content, ..
+            } = &mut agent.history[2]
+            {
+                *reasoning_content = Some("signed prior thinking".into());
+            }
+            let before = serde_json::to_value(&agent.history).unwrap();
+            assert!(agent.trim_history(None).is_none());
+            assert_eq!(serde_json::to_value(&agent.history).unwrap(), before);
+            agent.history.splice(
+                1..1,
+                [
+                    ConversationMessage::Chat(ChatMessage::user("old request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            );
+            assert!(agent.trim_history(None).is_some());
+            assert_eq!(
+                agent.history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls {
+                        reasoning_content: Some(_),
+                        ..
+                    }
+                )),
+                !strips,
+                "{model}"
+            );
+            assert!(agent.history.iter().any(|message| matches!(message,
+                ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                    if tool_calls[0].id == "trim-history-call-1"
+            )));
+            assert!(agent.history.iter().any(|message| matches!(message,
+                ConversationMessage::ToolResults(results)
+                    if results[0].tool_call_id == "trim-history-call-1"
+            )));
+        }
+    }
+
+    #[test]
     fn trim_history_drops_old_turn_with_breadcrumb_and_observer_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -13321,8 +13462,9 @@ mod tests {
         let answer_a = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 1_024,
+                    budget_tokens: Some(1_024),
                     display: None,
+                    effort: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -13331,8 +13473,9 @@ mod tests {
         let answer_b = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 2_048,
+                    budget_tokens: Some(2_048),
                     display: None,
+                    effort: None,
                 }),
                 agent_b.turn("same request"),
             )
@@ -16844,11 +16987,15 @@ model_provider = "custom.only"
         .await
         .expect("direct Agent construction");
 
-        live.publish(
-            live.next_revision().unwrap(),
-            direct_live_generation_config(temp.path(), "new", "new-model", 8_000, 3),
-        )
-        .unwrap();
+        let mut next_config =
+            direct_live_generation_config(temp.path(), "new", "new-model", 8_000, 3);
+        next_config
+            .runtime_profiles
+            .get_mut("default")
+            .unwrap()
+            .history_trim_low_water = Some(0.5);
+        live.publish(live.next_revision().unwrap(), next_config)
+            .unwrap();
         retained.sync_config_generation();
 
         let (_, retained_provider, retained_model) = retained.attribution_fields();
@@ -16874,10 +17021,10 @@ model_provider = "custom.only"
         );
         assert_eq!(
             retained
-                .structured_history_turn_limit_resolver
+                .structured_history_trim_policy_resolver
                 .as_ref()
                 .expect("direct Agent history resolver")(),
-            3,
+            (3, 0.5),
             "independently live history policy must adopt the reload while route state stays pinned"
         );
         assert_eq!(

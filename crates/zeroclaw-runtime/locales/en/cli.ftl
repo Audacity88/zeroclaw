@@ -1334,6 +1334,13 @@ cli-agent-error-provider-connection-remote = Cannot reach the model provider at 
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
+cli-agent-error-provider-refused = The model provider declined this request ({$category}). It was not retried on that model. Rephrase the request, choose another model, or configure a fallback model.
+cli-agent-error-provider-refused-category-cyber = cyber safety policy
+cli-agent-error-provider-refused-category-bio = biological safety policy
+cli-agent-error-provider-refused-category-reasoning-extraction = reasoning extraction policy
+cli-agent-error-provider-refused-category-frontier-llm = frontier model policy
+cli-agent-error-provider-refused-category-unspecified = unspecified safety policy
+cli-agent-error-provider-refused-category-other = another safety policy
 cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
@@ -1454,3 +1461,11 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+tool-sessions-prompt-authenticated-turn-required = sessions_prompt requires a turn initiated by an authenticated RPC connection
+
+# Result-aware Agent loop recovery
+turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
+turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
+turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
+turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.

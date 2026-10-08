@@ -176,8 +176,17 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
+                let refused = matches!(
+                    &err,
+                    zeroclaw_api::model_provider::StreamError::ModelRefusal(_)
+                );
+                let provider_error = match &err {
+                    zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal) => {
+                        anyhow::Error::new((**refusal).clone())
+                    }
+                    _ => anyhow::Error::msg(message.clone()),
+                };
                 if visible_event_output {
-                    let provider_error = anyhow::Error::msg(message.clone());
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
@@ -194,7 +203,11 @@ pub(crate) async fn consume_provider_streaming_response(
                     )
                     .with_terminal_cause(anyhow::Error::new(err));
                     return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                        partial_text: if refused {
+                            String::new()
+                        } else {
+                            forwarded_text
+                        },
                         message,
                         usage,
                         cause,
@@ -1670,10 +1683,7 @@ mod tests {
         let interrupted = err
             .downcast_ref::<StreamInterruptedAfterOutput>()
             .expect("must produce StreamInterruptedAfterOutput");
-        assert_eq!(
-            interrupted.partial_text,
-            "Visible partial text before refusal"
-        );
+        assert!(interrupted.partial_text.is_empty());
         let usage = interrupted
             .usage
             .as_ref()

@@ -3,12 +3,16 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::rpc::auth::ConnectionAuth;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use tokio_util::sync::CancellationToken;
+use zeroclaw_api::jsonrpc::RpcOutbound;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,6 +30,15 @@ pub struct TuiEntry {
     /// Used to pass the user's real env (PATH, SSH_AUTH_SOCK, etc.) through
     /// to subprocesses spawned by the daemon on their behalf.
     pub env: HashMap<String, String>,
+    /// The connection's outbound writer, when this registration came from a
+    /// live RPC connection. Turn streaming looks it up so notifications for
+    /// a session reach the pane that owns the session even when a different
+    /// connection triggered the turn. `None` for registrations that have no
+    /// writer to offer.
+    pub outbound: Option<Arc<RpcOutbound>>,
+    /// The connection authority captured when this registration was created.
+    /// `None` is reserved for tests and non-RPC registrations.
+    pub auth: Option<ConnectionAuth>,
 }
 
 // ── Registry ─────────────────────────────────────────────────────
@@ -41,6 +54,12 @@ pub struct TuiEntry {
 /// registered under, so it can only ever remove its own registration.
 pub type TuiEpoch = u64;
 
+struct TuiRegistration {
+    epoch: TuiEpoch,
+    entry: TuiEntry,
+    cancel: CancellationToken,
+}
+
 /// Daemon-wide registry of connected TUI clients.
 /// **Source of truth** for live TUI connection state. Not persisted —
 /// rebuilt on each daemon start from incoming `initialize` handshakes.
@@ -51,7 +70,7 @@ pub struct TuiRegistry {
     signing_key: Option<Vec<u8>>,
     /// Connected TUIs keyed by `tui_id`, each stamped with the epoch of the
     /// registration that installed it.
-    connected: Mutex<HashMap<String, (TuiEpoch, TuiEntry)>>,
+    connected: Mutex<HashMap<String, TuiRegistration>>,
     /// Hands out the next registration epoch. Monotonic for the life of the
     /// registry, so an epoch identifies one registration and is never reused.
     next_epoch: AtomicU64,
@@ -141,10 +160,17 @@ impl TuiRegistry {
     /// back to [`Self::unregister`] so a late teardown cannot evict a successor.
     pub fn register(&self, entry: TuiEntry) -> TuiEpoch {
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
-        self.connected
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(entry.tui_id.clone(), (epoch, entry));
+        let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = connected.insert(
+            entry.tui_id.clone(),
+            TuiRegistration {
+                epoch,
+                entry,
+                cancel: CancellationToken::new(),
+            },
+        ) {
+            previous.cancel.cancel();
+        }
         epoch
     }
 
@@ -159,9 +185,10 @@ impl TuiRegistry {
         let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
         if connected
             .get(tui_id)
-            .is_some_and(|(live, _)| *live == epoch)
+            .is_some_and(|registration| registration.epoch == epoch)
+            && let Some(registration) = connected.remove(tui_id)
         {
-            connected.remove(tui_id);
+            registration.cancel.cancel();
         }
     }
 
@@ -171,7 +198,7 @@ impl TuiRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|(_, entry)| entry.clone())
+            .map(|registration| registration.entry.clone())
             .collect()
     }
 
@@ -195,8 +222,52 @@ impl TuiRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(tui_id)
-            .filter(|(live, _)| *live == epoch)
-            .map(|(_, entry)| entry.env.clone())
+            .filter(|registration| registration.epoch == epoch)
+            .map(|registration| registration.entry.env.clone())
+    }
+
+    /// The outbound writer of the live registration for `tui_id`, when that
+    /// registration carries one. Like the entry itself, the writer is only
+    /// resolvable while the registration is live: `unregister` removes it
+    /// with the entry, under the same epoch check.
+    pub fn outbound_for(&self, tui_id: &str) -> Option<Arc<RpcOutbound>> {
+        self.connected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tui_id)
+            .and_then(|registration| registration.entry.outbound.clone())
+    }
+
+    /// Run a synchronous callback against one exact live registration. The
+    /// callback receives a cancellation token that fires when this registration
+    /// is replaced or unregistered.
+    pub fn with_registration<R>(
+        &self,
+        tui_id: &str,
+        epoch: TuiEpoch,
+        f: impl FnOnce(&TuiEntry, CancellationToken) -> R,
+    ) -> Option<R> {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let registration = connected
+            .get(tui_id)
+            .filter(|registration| registration.epoch == epoch)?;
+        Some(f(&registration.entry, registration.cancel.clone()))
+    }
+
+    /// Run a synchronous callback against the current registration and return
+    /// its epoch for later exact-registration checks.
+    pub fn with_live_registration<R>(
+        &self,
+        tui_id: &str,
+        f: impl FnOnce(TuiEpoch, &TuiEntry, CancellationToken) -> R,
+    ) -> Option<R> {
+        let connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        let registration = connected.get(tui_id)?;
+        Some(f(
+            registration.epoch,
+            &registration.entry,
+            registration.cancel.clone(),
+        ))
     }
 }
 
@@ -285,6 +356,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            outbound: None,
+            auth: None,
         });
         assert_eq!(registry.list().len(), 1);
         assert_eq!(registry.list()[0].tui_id, "tui_aabb0011");
@@ -300,6 +373,8 @@ mod tests {
             peer_label: peer_label.to_string(),
             transport: "wss".to_string(),
             env: HashMap::new(),
+            outbound: None,
+            auth: None,
         }
     }
 
@@ -391,6 +466,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            outbound: None,
+            auth: None,
         });
         // generate_unique should return something different
         let id = registry.generate_unique_tui_id();
@@ -412,6 +489,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
+            auth: None,
         });
 
         let entries = registry.list();
@@ -437,6 +516,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            outbound: None,
+            auth: None,
         });
 
         let entries = registry.list();
@@ -455,6 +536,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
+            auth: None,
         });
         assert_eq!(registry.list().len(), 1);
 
@@ -477,6 +560,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
+            auth: None,
         };
         let cloned = entry.clone();
         assert_eq!(
@@ -498,6 +583,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
+            auth: None,
         });
 
         let got = registry
@@ -530,6 +617,8 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
+            auth: None,
         });
         assert!(
             registry
@@ -554,6 +643,8 @@ mod tests {
             peer_label: "first".to_string(),
             transport: "unix".to_string(),
             env: HashMap::from([("SENTINEL_SOCK".to_string(), "/tmp/first.sock".to_string())]),
+            outbound: None,
+            auth: None,
         });
         let epoch_second = registry.register(TuiEntry {
             tui_id: id.to_string(),
@@ -561,6 +652,8 @@ mod tests {
             peer_label: "second".to_string(),
             transport: "unix".to_string(),
             env: HashMap::from([("OTHER_SOCK".to_string(), "/tmp/second.sock".to_string())]),
+            outbound: None,
+            auth: None,
         });
 
         assert!(
@@ -575,5 +668,28 @@ mod tests {
             Some("/tmp/second.sock")
         );
         assert!(!live.contains_key("SENTINEL_SOCK"));
+    }
+
+    #[test]
+    fn superseding_registration_cancels_old_forwarders() {
+        let registry = TuiRegistry::new_unsigned();
+        let id = "tui_cancel001";
+        let first_epoch = registry.register(entry(id, "first"));
+        let first_cancel = registry
+            .with_registration(id, first_epoch, |_entry, cancel| cancel)
+            .expect("first registration should be live");
+
+        let second_epoch = registry.register(entry(id, "second"));
+        assert!(first_cancel.is_cancelled());
+        assert!(
+            registry
+                .with_registration(id, first_epoch, |_entry, _| ())
+                .is_none()
+        );
+        assert!(
+            registry
+                .with_registration(id, second_epoch, |_entry, _| ())
+                .is_some()
+        );
     }
 }

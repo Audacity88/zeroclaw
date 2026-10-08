@@ -20,13 +20,13 @@ fn distinct_effective_chords(chords: Vec<Chord>) -> Vec<Chord> {
 macro_rules! keyactions {
     (
         $vis:vis enum $name:ident ( $tag:literal ) {
-            $( $variant:ident [ $($chord:expr),* $(,)? ] => $label:expr ),* $(,)?
+            $( $(#[$attr:meta])* $variant:ident [ $($chord:expr),* $(,)? ] => $label:expr ),* $(,)?
         }
     ) => {
         #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         $vis enum $name {
-            $( $variant ),*
+            $( $(#[$attr])* $variant ),*
         }
 
         impl $name {
@@ -165,6 +165,14 @@ keyactions! {
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::primary('r'), Chord::ctrl('r')]            => "reload daemon",
         ToggleSidebar [Chord::ctrl('b')]                                => "toggle sidebar",
+        FocusSession1 [Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL)] => "focus session 1",
+        FocusSession2 [Chord::with_primary(KeyCode::Char('2'), KeyModifiers::CONTROL)] => "focus session 2",
+        FocusSession3 [Chord::with_primary(KeyCode::Char('3'), KeyModifiers::CONTROL)] => "focus session 3",
+        FocusSession4 [Chord::with_primary(KeyCode::Char('4'), KeyModifiers::CONTROL)] => "focus session 4",
+        FocusSession5 [Chord::with_primary(KeyCode::Char('5'), KeyModifiers::CONTROL)] => "focus session 5",
+        FocusSession6 [Chord::with_primary(KeyCode::Char('6'), KeyModifiers::CONTROL)] => "focus session 6",
+        FocusSession7 [Chord::with_primary(KeyCode::Char('7'), KeyModifiers::CONTROL)] => "focus session 7",
+        FocusSession8 [Chord::with_primary(KeyCode::Char('8'), KeyModifiers::CONTROL)] => "focus session 8",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -203,6 +211,7 @@ keyactions! {
         TodoToggle              [Chord::primary('p'), Chord::ctrl('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
+        RefreshSession          [Chord::key(KeyCode::F(5))] => "refresh focused session",
         DeleteSession           [] => "delete session",
         CancelTurn              [Chord::primary('d'), Chord::ctrl('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",
@@ -286,6 +295,8 @@ keyactions! {
 
 keyactions! {
     pub enum ConfigTabAction ("config_tab") {
+        DescriptionUp   [Chord::key(KeyCode::PageUp)] => "scroll description up",
+        DescriptionDown [Chord::key(KeyCode::PageDown)] => "scroll description down",
         Up            [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down          [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter         [Chord::key(KeyCode::Enter)] => "open",
@@ -295,8 +306,12 @@ keyactions! {
         SectionNext   [Chord::key(KeyCode::Tab)] => "next section",
         SectionPrev   [Chord::key(KeyCode::BackTab)] => "prev section",
         BeginSearch   [Chord::char('/')] => "search",
-        ToggleSecret  [Chord::char('x')] => "toggle secret",
-        DeleteRow     [Chord::char('d')] => "delete row",
+        // Keep persisted override keys stable while naming the actual actions.
+        #[serde(rename = "toggle_secret", alias = "delete")]
+        Delete        [Chord::char('x')] => "delete",
+        #[serde(rename = "delete_row", alias = "reset")]
+        Reset         [Chord::char('d')] => "reset",
+        RenameAlias   [Chord::char('e')] => "rename provider alias",
         ApplyTemplate [Chord::char('t')] => "apply template",
     }
 }
@@ -419,6 +434,20 @@ keyactions! {
 }
 
 keyactions! {
+    pub enum ModelPickerAction ("model_picker") {
+        Confirm   [Chord::key(KeyCode::Enter)] => "confirm",
+        Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
+        Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        Up        [Chord::key(KeyCode::Up)] => "prev",
+        Down      [Chord::key(KeyCode::Down)] => "next",
+        PageUp    [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown  [Chord::key(KeyCode::PageDown)] => "page down",
+        First     [Chord::key(KeyCode::Home)] => "first result",
+        Last      [Chord::key(KeyCode::End)] => "last result",
+    }
+}
+
+keyactions! {
     pub enum FileExplorerAction ("file_explorer") {
         Up           [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down         [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
@@ -480,6 +509,46 @@ keyactions! {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn config_destructive_actions_keep_legacy_override_keys_with_accurate_labels() {
+        use super::ConfigTabAction;
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for (action, legacy, label, chord) in [
+            (
+                ConfigTabAction::Delete,
+                "toggle_secret",
+                "delete",
+                Chord::char('z'),
+            ),
+            (
+                ConfigTabAction::Reset,
+                "delete_row",
+                "reset",
+                Chord::char('r'),
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ConfigTabAction>(serde_json::json!(legacy)).unwrap(),
+                action
+            );
+            assert_eq!(action.action_key(), format!("config_tab.{legacy}"));
+            assert_eq!(action.label(), label);
+            crate::keymap::overrides::set_row("config_tab", legacy, vec![chord]);
+        }
+        assert_eq!(
+            ConfigTabAction::from_chord(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            Some(ConfigTabAction::Delete)
+        );
+        assert_eq!(
+            ConfigTabAction::from_chord(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some(ConfigTabAction::Reset)
+        );
+        crate::keymap::overrides::reset();
+    }
 
     fn assert_distinct_defaults<A: crate::keymap::RebindableActions>() {
         for action in A::all() {
@@ -575,6 +644,40 @@ mod tests {
                 KeyModifiers::NONE,
                 InputBarAction::from_chord,
                 expected,
+            );
+        }
+    }
+
+    #[test]
+    fn session_shortcut_primary_digits_resolve_to_ordinals() {
+        let actions = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ];
+        for (index, action) in actions.into_iter().enumerate() {
+            let digit = char::from_digit((index + 1) as u32, 10).unwrap();
+            let modifiers = if cfg!(target_os = "macos") {
+                KeyModifiers::CONTROL.union(KeyModifiers::SUPER)
+            } else {
+                KeyModifiers::CONTROL
+            };
+            assert_eq!(
+                GlobalAction::from_chord(&KeyEvent::new(KeyCode::Char(digit), modifiers)),
+                Some(action)
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                GlobalAction::from_chord(
+                    &KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SUPER,)
+                ),
+                None,
+                "bare Command+{digit} remains available to the terminal host"
             );
         }
     }
