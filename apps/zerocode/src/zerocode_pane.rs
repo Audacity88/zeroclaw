@@ -1988,7 +1988,7 @@ impl ZerocodePane {
                     !self.binding_query_claims_key(&event)
                         && !self.connection_editor_claims_key(&event)
                         && !(self.wants_text_input()
-                            && matches!(event.code, KeyCode::Char(_))
+                            && matches!(event.code, KeyCode::Char(_)) // keyguard: classify literal editor text, not a remappable command
                             && !event.modifiers.intersects(
                                 KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
                             ))
