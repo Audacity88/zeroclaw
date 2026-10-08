@@ -143,7 +143,7 @@ def summarize():
     records = {}
     controls = None
     for name in PROFILES:
-        path = HERE / "results" / f"footprint-{name}"
+        path = HERE / "results" / name
         report = json.loads((path / "binary.json").read_text())
         reporter.validate_report(report, name, policy, policy_hash)
         require([m["id"] for m in report["measurements"]] == [name], "wrong arm artifact")

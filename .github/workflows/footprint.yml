@@ -24,11 +24,6 @@ jobs:
     if: github.repository == 'Audacity88/zeroclaw' && github.actor == 'Audacity88'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    strategy:
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        profile: [full-dist, no-saas-coding, no-native-adapters]
     steps:
       - name: Check out experiment
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -54,46 +49,20 @@ jobs:
         with:
           toolchain: 1.98.0
           targets: x86_64-unknown-linux-gnu
-      - name: Capture closure and measure one release binary
-        env:
-          PROFILE: ${{ matrix.profile }}
+      - name: Capture closures and measure three release binaries
         run: |
           chmod +x harness/experiment.py
-          python3 harness/experiment.py measure "$PROFILE"
+          for profile in full-dist no-saas-coding no-native-adapters; do
+            python3 harness/experiment.py measure "$profile"
+          done
+      - name: Validate controls and summarize capability costs
+        run: python3 harness/experiment.py summarize
       - name: Retain evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: footprint-${{ matrix.profile }}
-          path: harness/results/${{ matrix.profile }}/
+          name: footprint-all
+          path: harness/results/
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
-
-  summarize:
-    needs: measure
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          path: harness
-          persist-credentials: false
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          repository: zeroclaw-labs/zeroclaw
-          ref: 40cb7be43e7db9b40cd5f720ee34d2ae964de415
-          path: reporter
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          pattern: footprint-*
-          path: harness/results
-      - name: Validate controls and summarize capability costs
-        run: python3 harness/experiment.py summarize
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: footprint-summary
-          path: harness/results/summary.json
-          if-no-files-found: error
-          retention-days: 7
