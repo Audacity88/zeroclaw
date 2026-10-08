@@ -6414,7 +6414,15 @@ impl RpcDispatcher {
     /// issuer and owner are the same connection (or the owner is not
     /// connected), this is just the issuer's own outbound — exactly one copy
     /// of each notification, as before.
-    async fn turn_notification_outbound(&self, session_id: &str) -> Arc<RpcOutbound> {
+    ///
+    /// The second value is the owner's outbound alone, present only when the
+    /// owner is a different connection: frames meant for the owner and not
+    /// the issuer (the announcement of a prompt the owner did not type) go
+    /// there directly.
+    async fn turn_notification_outbound(
+        &self,
+        session_id: &str,
+    ) -> (Arc<RpcOutbound>, Option<Arc<RpcOutbound>>) {
         let owner_outbound = super::turn_notifications::owner_turn_outbound(
             Arc::clone(&self.ctx),
             session_id,
@@ -6438,10 +6446,11 @@ impl RpcDispatcher {
             message
         );
         match owner_outbound {
-            Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => {
-                fanout_outbound(vec![Arc::clone(&self.rpc), owner])
-            }
-            _ => Arc::clone(&self.rpc),
+            Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => (
+                fanout_outbound(vec![Arc::clone(&self.rpc), Arc::clone(&owner)]),
+                Some(owner),
+            ),
+            _ => (Arc::clone(&self.rpc), None),
         }
     }
 
@@ -6500,7 +6509,7 @@ impl RpcDispatcher {
         // and, when a different live connection owns the session, to that
         // owner as well — a pane must see a turn triggered on its session by
         // any caller, not only by itself.
-        let turn_rpc = self.turn_notification_outbound(sid).await;
+        let (turn_rpc, foreign_owner_rpc) = self.turn_notification_outbound(sid).await;
 
         let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
         if let Some(expected) = expected_generation
@@ -7077,10 +7086,50 @@ impl RpcDispatcher {
                 .with_attrs(::serde_json::json!({ "session_id": sid })),
             "turn dispatch: registered cancel token, starting turn"
         );
-        // An agent-injected prompt was not typed by the pane that owns this
-        // session: tell that pane the message exists before the turn starts,
-        // so the stream it is about to receive reads as a reply to a visible
-        // prompt instead of appearing from nowhere.
+        // A prompt from any connection other than the owner's was not typed
+        // in the owner pane: tell that pane the message exists before the
+        // turn starts, so it knows the session is busy and the stream it is
+        // about to receive reads as a reply to a visible prompt. Without this
+        // a pane fed a foreign turn's frames stays idle and dispatches into a
+        // session the daemon holds (SESSION_BUSY after the admission wait).
+        // Agent-injected prompts carry the injecting alias; any other
+        // foreign caller (a script on the socket, another client) is labelled
+        // `external`, and the announcement goes to the owner only so a
+        // client that typed the prompt never receives its own words back.
+        if req.injected_by.is_none()
+            && let Some(owner_rpc) = foreign_owner_rpc.as_ref()
+        {
+            let update = SessionUpdateEvent::UserMessage {
+                session_id: sid.to_string(),
+                text: prompt.clone(),
+                source: Some(EXTERNAL_PROMPT_SOURCE.to_string()),
+            };
+            if let Ok(params) = serde_json::to_value(update)
+                && let Ok(frame) = serde_json::to_string(&JsonRpcNotification::new(
+                    notification::SESSION_UPDATE,
+                    params,
+                ))
+            {
+                let queued = owner_rpc.send_raw(frame).await;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(if queued {
+                            ::zeroclaw_log::EventOutcome::Success
+                        } else {
+                            ::zeroclaw_log::EventOutcome::Failure
+                        })
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "issuer": self.peer_label,
+                            "prompt_chars": prompt.chars().count(),
+                        })),
+                    "turn dispatch: external prompt user_message update queued to session owner"
+                );
+            }
+        }
+        drop(foreign_owner_rpc);
         if let Some(source) = req.injected_by.as_deref() {
             let update = SessionUpdateEvent::UserMessage {
                 session_id: sid.to_string(),
@@ -14393,6 +14442,10 @@ fn replace_rpc_chat_conversation_state(
 /// untouched: one `send_raw` reaches every target. The forwarder lives only
 /// as long as some handle to the fanout does — a turn drops it when its
 /// last notification is sent, so nothing long-lived is leaked per turn.
+/// `UserMessage.source` for a prompt the owner pane did not type and no agent
+/// injected: a script on the daemon socket or another client.
+pub(crate) const EXTERNAL_PROMPT_SOURCE: &str = "external";
+
 fn fanout_outbound(targets: Vec<Arc<RpcOutbound>>) -> Arc<RpcOutbound> {
     let (tx, mut rx) = mpsc::channel::<String>(64);
     zeroclaw_spawn::spawn!(async move {
@@ -41087,10 +41140,25 @@ mod tests {
              another connection — before the fanout it saw nothing until a \
              durable resync"
         );
+        // The owner did not type this prompt, so it is announced to the
+        // owner (and only the owner) before the turn streams: that frame is
+        // what tells the pane the session is busy.
+        let announce = &owner_frames[0];
+        assert_eq!(announce["params"]["type"], "user_message");
+        assert_eq!(announce["params"]["text"], "hello from another connection");
+        assert_eq!(announce["params"]["source"], EXTERNAL_PROMPT_SOURCE);
+        assert!(
+            issuer_frames
+                .iter()
+                .all(|f| f["params"]["type"] != "user_message"),
+            "the issuer typed the prompt and must not receive it back"
+        );
         assert_eq!(
-            owner_frames, issuer_frames,
-            "owner and issuer must receive the same notification sequence, \
-             including turn_complete, with no divergence or reordering"
+            owner_frames[1..],
+            issuer_frames[..],
+            "after the announcement, owner and issuer must receive the same \
+             notification sequence, including turn_complete, with no \
+             divergence or reordering"
         );
         assert_eq!(
             owner_frames.last().expect("sequence must be non-empty")["params"]["type"],
@@ -41133,6 +41201,12 @@ mod tests {
         assert_eq!(
             chunk_count, 1,
             "the owner must receive exactly one copy of each streamed event"
+        );
+        assert!(
+            owner_frames
+                .iter()
+                .all(|f| f["params"]["type"] != "user_message"),
+            "the owner typed its own prompt; announcing it would duplicate the row"
         );
         assert!(
             matches!(
