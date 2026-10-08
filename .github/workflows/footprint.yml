@@ -1,4 +1,4 @@
-name: Culling adapter footprint experiment
+name: Culling parallel footprint experiment
 
 on:
   push:
@@ -16,14 +16,27 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.98.0
-  SOURCE_SHA: cb58607b8ea29c725d31bd44d629d80ec0bce41e
-  REPORTER_SHA: 40cb7be43e7db9b40cd5f720ee34d2ae964de415
 
 jobs:
   measure:
     if: github.repository == 'Audacity88/zeroclaw' && github.actor == 'Audacity88'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - lane: tuning
+            minutes: 90
+          - lane: plugin
+            minutes: 90
+          - lane: channels
+            minutes: 120
+          - lane: gateway
+            minutes: 90
+          - lane: tls
+            minutes: 90
     steps:
       - name: Check out experiment
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -49,20 +62,51 @@ jobs:
         with:
           toolchain: 1.98.0
           targets: x86_64-unknown-linux-gnu
-      - name: Capture closures and measure three release binaries
+      - name: Capture closures and measure paired binaries
         run: |
-          chmod +x harness/experiment.py
-          for profile in full-dist no-saas-coding no-native-adapters; do
-            python3 harness/experiment.py measure "$profile"
-          done
-      - name: Validate controls and summarize capability costs
-        run: python3 harness/experiment.py summarize
-      - name: Retain evidence
+          chmod +x harness/parallel_experiment.py
+          python3 harness/parallel_experiment.py lane '${{ matrix.lane }}'
+      - name: Retain lane evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: footprint-all
-          path: harness/results/
+          name: footprint-${{ matrix.lane }}
+          path: harness/results/${{ matrix.lane }}/
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+  summary:
+    needs: measure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out experiment
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Check out immutable reporter
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: 40cb7be43e7db9b40cd5f720ee34d2ae964de415
+          path: reporter
+          persist-credentials: false
+      - name: Download lane evidence
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          pattern: footprint-*
+          path: downloads
+      - name: Validate each pair and aggregate
+        run: |
+          mkdir -p harness/results
+          for lane in tuning plugin channels gateway tls; do
+            mv "downloads/footprint-$lane" "harness/results/$lane"
+          done
+          python3 harness/parallel_experiment.py aggregate harness/results
+      - name: Retain summary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: footprint-summary
+          path: harness/results/summary.json
+          retention-days: 7

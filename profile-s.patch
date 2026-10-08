@@ -1,0 +1,12 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -465,7 +465,7 @@
+ opt-level = 0
+ 
+ [profile.release]
+-opt-level = "z"      # Optimize for size
++opt-level = "s"      # Optimize for size
+ lto = "fat"          # Maximum cross-crate optimization for smaller binaries
+ codegen-units = 1    # Serialized codegen for low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM)
+                      # Higher values (e.g., 8) compile faster but require more RAM during compilation

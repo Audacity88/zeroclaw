@@ -1,0 +1,11 @@
+diff --git a/crates/zeroclaw-channels/Cargo.toml b/crates/zeroclaw-channels/Cargo.toml
+--- a/crates/zeroclaw-channels/Cargo.toml
++++ b/crates/zeroclaw-channels/Cargo.toml
+@@ -71,7 +71,6 @@ matrix-sdk = { version = "0.19", optional = true, default-features = false, features
+   # 0.19 moved the TLS provider out of `reqwest/rustls` into its own feature
+   # and made it a default; with default-features = false we have to name it or
+   # every Client build panics with "No rustls crypto provider is configured".
+-  "rustls-aws-lc-rs",
+   "e2e-encryption",
+   "markdown",
+   "sqlite",
