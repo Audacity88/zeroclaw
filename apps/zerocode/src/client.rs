@@ -376,6 +376,21 @@ impl SessionUpdate {
             | SessionUpdate::UserMessage { session_id, .. } => session_id,
         }
     }
+
+    /// Frames only a running turn produces. A pane that is idle and receives
+    /// one is watching a turn another connection started. Metadata frames
+    /// (usage, plan, history trim, file diffs) and the terminal frame itself
+    /// are excluded: they can trail a turn the pane already settled.
+    pub fn is_turn_activity(&self) -> bool {
+        matches!(
+            self,
+            SessionUpdate::AgentMessageChunk { .. }
+                | SessionUpdate::AgentThoughtChunk { .. }
+                | SessionUpdate::ToolCall { .. }
+                | SessionUpdate::ToolResult { .. }
+                | SessionUpdate::ApprovalRequest { .. }
+        )
+    }
 }
 
 /// Wire mirror of the daemon's `TurnCompletionOutcome`. Decoded straight from

@@ -11405,6 +11405,15 @@ pub struct ChatState {
     /// the same local generation extend this entry instead of creating a
     /// second `Agent:` block.
     prompt_settled_stream_entry: Option<(u64, usize)>,
+    /// The pane's own turn was settled from its `session/prompt` response
+    /// and that turn's terminal frame has not arrived yet. Frames still
+    /// streaming in belong to that turn, not to a turn someone else started.
+    prompt_settled_awaiting_terminal: bool,
+    /// The turn in flight was started by another connection (announced by a
+    /// `user_message` frame, or inferred from turn frames arriving while the
+    /// pane was idle). Its terminal frame carries the issuer's generation,
+    /// not this pane's, so it settles the turn whatever generation it names.
+    observing_foreign_turn: bool,
     /// Set when any `ToolCall` event arrived during the current turn.
     /// Used by `commit_turn` to distinguish "empty completion with tool
     /// calls" (normal — tool output is the visible record) from "empty
@@ -11579,6 +11588,8 @@ impl ChatState {
             dispatched_prompt: None,
             turn_had_streaming_text: false,
             prompt_settled_stream_entry: None,
+            prompt_settled_awaiting_terminal: false,
+            observing_foreign_turn: false,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -13279,6 +13290,19 @@ impl ChatState {
         }
         self.last_activity = Some(chrono::Utc::now().to_rfc3339());
 
+        // Turn activity while the pane believes it is idle, and not the tail
+        // of its own prompt-settled turn, means another connection started a
+        // turn on this session without an announcement (an older daemon, or a
+        // frame that raced ahead of it). Treat the session as busy until that
+        // turn's terminal frame: otherwise the queue dispatches into a session
+        // the daemon holds and the prompt is refused as SESSION_BUSY.
+        if !self.turn_in_flight
+            && !self.prompt_settled_awaiting_terminal
+            && update.is_turn_activity()
+        {
+            self.begin_observed_turn();
+        }
+
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
                 if !text.is_empty() {
@@ -13520,11 +13544,15 @@ impl ChatState {
                 content,
                 ..
             } => {
-                if client_turn_generation
-                    .is_some_and(|generation| generation != self.turn_generation)
+                // A foreign turn's terminal carries the issuer's generation
+                // (or none); it settles the observed turn regardless.
+                if !self.observing_foreign_turn
+                    && client_turn_generation
+                        .is_some_and(|generation| generation != self.turn_generation)
                 {
                     return;
                 }
+                self.prompt_settled_awaiting_terminal = false;
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
                 }
@@ -13568,14 +13596,21 @@ impl ChatState {
                 });
                 self.mark_dirty_append();
                 self.message_count = self.message_count.saturating_add(1);
-                self.turn_in_flight = true;
-                self.turn_generation = self.turn_generation.wrapping_add(1);
-                self.turn_had_streaming_text = false;
-                self.turn_had_tool_calls = false;
-                self.turn_status = TurnStatus::Working;
-                self.turn_started_at = Instant::now();
+                self.begin_observed_turn();
             }
         }
+    }
+
+    /// Enter the busy state for a turn this pane did not start.
+    fn begin_observed_turn(&mut self) {
+        self.prompt_settled_awaiting_terminal = false;
+        self.observing_foreign_turn = true;
+        self.turn_in_flight = true;
+        self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
+        self.turn_status = TurnStatus::Working;
+        self.turn_started_at = Instant::now();
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
@@ -13616,6 +13651,7 @@ impl ChatState {
     }
 
     fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
+        self.prompt_settled_awaiting_terminal = true;
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
@@ -13640,6 +13676,7 @@ impl ChatState {
 
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
+        self.observing_foreign_turn = false;
         self.optimistic_user_message = None;
         self.dispatched_prompt = None;
         self.turn_status = TurnStatus::Idle;
@@ -13706,6 +13743,8 @@ impl ChatState {
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
         self.freeze_prompt_settled_stream();
+        self.prompt_settled_awaiting_terminal = false;
+        self.observing_foreign_turn = false;
         self.last_activity = Some(chrono::Utc::now().to_rfc3339());
         // A new prompt supersedes the previous failure: the red dot clears
         // until the daemon reports otherwise.
@@ -14328,6 +14367,8 @@ impl ChatState {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.dispatched_prompt = None;
+        self.prompt_settled_awaiting_terminal = false;
+        self.observing_foreign_turn = false;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
@@ -28882,6 +28923,117 @@ mod tests {
                 .filter(|e| matches!(e, ChatEntry::UserMessage { .. }))
                 .count(),
             1
+        );
+    }
+
+    fn foreign_frame(params: serde_json::Value) -> RpcNotification {
+        RpcNotification {
+            method: "session/update".to_string(),
+            params,
+        }
+    }
+
+    // A turn another connection started streams into this idle pane with no
+    // announcement (an older daemon). The pane must read the session as busy
+    // and hold its queue until that turn's terminal frame, whose generation is
+    // the issuer's, not the pane's.
+    #[tokio::test]
+    async fn unannounced_foreign_turn_holds_queue_until_its_terminal() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let (notif_tx, notif_rx) = broadcast::channel(16);
+        chat.notif_rx = notif_rx;
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        notif_tx
+            .send(foreign_frame(serde_json::json!({
+                "type": "tool_call",
+                "session_id": "sess-1",
+                "tool_call_id": "t1",
+                "name": "shell",
+                "raw_input": {"command": "go test ./..."}
+            })))
+            .unwrap();
+        chat.drain_notifications();
+        assert!(
+            active_state(&mut chat).turn_in_flight,
+            "turn frames while idle mean someone else's turn is running"
+        );
+        assert_eq!(
+            active_state(&mut chat).sidebar_status(),
+            SidebarStatus::Running
+        );
+
+        active_state(&mut chat)
+            .enqueue_message("typed during the foreign turn".to_string(), Vec::new())
+            .unwrap();
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the queue must not dispatch into a session another turn holds"
+        );
+
+        notif_tx
+            .send(foreign_frame(serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "completed",
+                "content": "done",
+                "client_turn_generation": 4242
+            })))
+            .unwrap();
+        chat.drain_notifications();
+        // The foreign terminal settles the observed turn despite naming the
+        // issuer's generation; the drain then pumps the queue, so the held
+        // message is what dispatches next.
+        let request = next_rpc_request(
+            &mut writer_rx,
+            "the foreign terminal must settle the observed turn and release the queue",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_PROMPT);
+        assert_eq!(request["params"]["prompt"], "typed during the foreign turn");
+    }
+
+    // The announced path: a `user_message` frame from the daemon starts the
+    // observed turn; the terminal frame carries the issuer's generation.
+    #[test]
+    fn announced_foreign_turn_settles_on_foreign_generation_terminal() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::UserMessage {
+            session_id: "sess-1".to_string(),
+            text: "[wake] new activity".to_string(),
+            source: Some("external".to_string()),
+        });
+        assert!(s.turn_in_flight);
+        s.apply_update(SessionUpdate::TurnComplete {
+            session_id: "sess-1".to_string(),
+            outcome: TurnEndOutcome::Completed,
+            content: "ok".to_string(),
+            client_turn_generation: Some(4242),
+            message_count: None,
+        });
+        assert!(
+            !s.turn_in_flight,
+            "a foreign turn's terminal must not be dropped as a stale generation"
+        );
+    }
+
+    // The pane's own turn settled from its prompt response; its terminal and
+    // trailing chunks may still arrive. Those must not read as a new foreign
+    // turn, or the queue would stall behind a turn that already ended.
+    #[test]
+    fn own_turn_tail_after_prompt_settle_is_not_a_foreign_turn() {
+        let mut s = state();
+        s.push_user_message(Some("mine".to_string()), Vec::new());
+        s.settle_turn_from_prompt_response(QueuePauseReason::MissingCompletion);
+        assert!(!s.turn_in_flight);
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "late tail".to_string(),
+        });
+        assert!(
+            !s.turn_in_flight,
+            "a late chunk of the pane's own settled turn must not mark it busy"
         );
     }
 
