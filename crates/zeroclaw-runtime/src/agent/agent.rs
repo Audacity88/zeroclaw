@@ -4813,7 +4813,29 @@ impl Agent {
                                 steered_continuation = Some(admitted);
                                 continue;
                             }
+                            // About to finish. Close first, then drain once
+                            // more: a sender whose message landed after the
+                            // drain above got `Ok` from `try_send`, and
+                            // without this the turn would end and drop it.
+                            // Anything that slipped in before the close still
+                            // gets its round; a later sender sees `Closed` and
+                            // can fall back to an ordinary prompt.
+                            if let Some(rx) = steering_rx.as_deref_mut() {
+                                rx.close();
+                            }
+                            let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                            let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                            if !admitted.is_empty() {
+                                steered_continuation = Some(admitted);
+                                continue;
+                            }
                         }
+                    }
+                    // Finishing on every path (budget spent, cancelled, or
+                    // nothing admitted): stop accepting steering so no sender
+                    // is told its message was taken by a turn that has ended.
+                    if let Some(rx) = steering_rx.as_deref_mut() {
+                        rx.close();
                     }
 
                     // Cache put only when the turn was a single tool-free
@@ -13760,10 +13782,14 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let (steering_tx, mut steering_rx) =
             tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        // The receiver comes back out of the task alive, as it does for the
+        // gateway (which lends `&mut`): only an explicit close, not a drop,
+        // can make the late send below fail.
         let handle = zeroclaw_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -13779,11 +13805,18 @@ mod tests {
             }
         }
 
-        let outcome = handle
-            .await
-            .expect("turn task should finish")
-            .expect("steered turn should succeed");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let outcome = outcome.expect("steered turn should succeed");
         assert_eq!(outcome.response, "draftfinal");
+        // The turn has ended: a late steer must be refused visibly rather
+        // than accepted into a receiver nobody will drain again.
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a finished turn must close its steering channel"
+        );
 
         let new_chat_messages: Vec<_> = outcome
             .new_messages
