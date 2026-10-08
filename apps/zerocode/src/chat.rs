@@ -886,6 +886,9 @@ struct PromptCompletion {
     session_id: String,
     turn_generation: u64,
     error: Option<String>,
+    /// JSON-RPC code of `error`, so a refusal the daemon issued before the
+    /// turn started (`SESSION_BUSY`) can be told apart from a turn failure.
+    error_code: Option<i32>,
     transport_closed: bool,
     cancelled: bool,
 }
@@ -3009,6 +3012,11 @@ impl Chat {
             if completion.error.is_some() {
                 state.remove_optimistic_user_message(completion.turn_generation);
             }
+            // A busy refusal never started the turn: return the message to
+            // the queue before settling, so settling neither cleans up its
+            // attachments nor loses its text.
+            let requeued = completion.error_code == Some(crate::jsonrpc::error_codes::SESSION_BUSY)
+                && state.requeue_refused_dispatch(completion.turn_generation);
             // Keep a known pause or cancellation reason. Other successful
             // responses still cannot prove clean completion without a terminal
             // notification, so queued work stays paused conservatively.
@@ -3024,10 +3032,12 @@ impl Chat {
             state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-queue-dispatch-failed",
-                    &[("error", &error)],
-                ));
+                let key = if requeued {
+                    "zc-queue-dispatch-requeued"
+                } else {
+                    "zc-queue-dispatch-failed"
+                };
+                state.set_info_notice(crate::i18n::t_args(key, &[("error", &error)]));
             }
             // The response is the one terminal signal guaranteed on this
             // connection: the daemon answers every `session/prompt` it ran,
@@ -3939,6 +3949,7 @@ impl Chat {
         state.own_active_turn_attachments(attachments);
         state.push_user_message(prompt, att_names);
         let turn_generation = state.turn_generation;
+        state.dispatched_prompt = Some((turn_generation, text.clone()));
         Self::spawn_prompt_on(
             rpc_out,
             rpc,
@@ -3980,12 +3991,14 @@ impl Chat {
             let cancelled = result
                 .as_ref()
                 .is_ok_and(|value| value["stop_reason"].as_str() == Some("cancelled"));
+            let error_code = result.as_ref().err().map(|e| e.code);
             let error = result.err().map(|e| format!("{} ({})", e.message, e.code));
             let _ = completion_tx
                 .send(PromptCompletion {
                     session_id: sid,
                     turn_generation,
                     error,
+                    error_code,
                     transport_closed,
                     cancelled,
                 })
@@ -11379,6 +11392,10 @@ pub struct ChatState {
     /// closure and terminal notifications leave it intact.
     /// `(generation, entry index, prior durable count)` for the optimistic row.
     optimistic_user_message: Option<(u64, usize, usize)>,
+    /// Text of the queued message the current turn dispatched, keyed by turn
+    /// generation. A `SESSION_BUSY` refusal means the daemon never ran it, so
+    /// it goes back to the front of the queue instead of being dropped.
+    dispatched_prompt: Option<(u64, String)>,
     /// Set when any streaming text was flushed during the current turn.
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
@@ -11559,6 +11576,7 @@ impl ChatState {
             turn_in_flight: false,
             turn_generation: 0,
             optimistic_user_message: None,
+            dispatched_prompt: None,
             turn_had_streaming_text: false,
             prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
@@ -13623,6 +13641,7 @@ impl ChatState {
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
+        self.dispatched_prompt = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         let mut cleanup_report = self.cleanup_active_turn_attachments();
@@ -13728,6 +13747,33 @@ impl ChatState {
 
     fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
         cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
+    }
+
+    /// Put the message a refused prompt dispatched back at the front of the
+    /// queue, with its attachments, and pause the queue. Only for refusals
+    /// issued before the turn started (`SESSION_BUSY`): the daemon never ran
+    /// the message, so dropping it would lose what the user typed. The queue
+    /// pauses so a session that stays busy is not retried in a loop; the item
+    /// is re-queued as `Pending` (not `Injected`) for the same reason, since
+    /// injected items bypass the pause.
+    fn requeue_refused_dispatch(&mut self, generation: u64) -> bool {
+        let Some((marked_generation, text)) = self.dispatched_prompt.take() else {
+            return false;
+        };
+        if marked_generation != generation {
+            return false;
+        }
+        let attachments = std::mem::take(&mut self.active_turn_attachments);
+        let id = self.alloc_queue_id();
+        self.message_queue.push_front(QueuedMessage {
+            id,
+            text,
+            attachments,
+            status: QueueItemStatus::Pending,
+        });
+        self.queue_paused = Some(QueuePauseReason::Generic);
+        self.resume_override = false;
+        true
     }
 
     fn remove_optimistic_user_message(&mut self, generation: u64) {
@@ -14281,6 +14327,7 @@ impl ChatState {
         self.clear_transcript_selection();
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
+        self.dispatched_prompt = None;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
@@ -35246,6 +35293,91 @@ mod tests {
         assert!(
             active.info_message.is_some(),
             "the dispatch error must be surfaced"
+        );
+        let queued: Vec<_> = active
+            .message_queue
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["busy prompt".to_string()],
+            "a busy refusal never ran the message, so it returns to the queue"
+        );
+        assert!(
+            active.queue_paused(),
+            "the requeued message waits for an explicit resume, not a retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_session_busy_requeues_ahead_of_pending_with_attachments() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let clip = dir.path().join("shot.png");
+        std::fs::write(&clip, b"png").expect("write clipboard attachment");
+        let mut active = state();
+        active
+            .enqueue_message("first".to_string(), vec![clipboard_att(&clip, "shot.png")])
+            .unwrap();
+        active
+            .enqueue_message("second".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "first prompt should be sent").await;
+        assert_eq!(request["params"]["prompt"], "first");
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_BUSY,
+            "Session busy: Timed out waiting for session sess-1",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        let queued: Vec<_> = active
+            .message_queue
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(queued, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(active.message_queue[0].attachments.len(), 1);
+        assert!(
+            clip.exists(),
+            "settling a refused turn must not delete the requeued clipboard temp"
+        );
+        assert!(active.queue_paused());
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a paused queue must not redispatch into the busy session"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_non_busy_error_does_not_requeue() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("bad prompt".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt should be sent").await;
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::INVALID_PARAMS,
+            "bad params",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        assert_eq!(
+            active_state(&mut chat).queue_len(),
+            0,
+            "only a refusal issued before the turn started requeues"
         );
     }
 
