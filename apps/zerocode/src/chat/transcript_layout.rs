@@ -27,6 +27,8 @@ pub(super) enum LinesDirty {
 pub(super) struct EntryLayoutInput<'a> {
     pub index: usize,
     pub entry: &'a ChatEntry,
+    /// Preformatted header time (`HH:MM`, or dated when not today).
+    pub time_label: Option<String>,
     pub highlighted: bool,
     pub disclosure: ToolDisclosure,
 }
@@ -258,6 +260,7 @@ impl TranscriptLayoutCache {
         let before = self.layout.cached_lines.len();
         let footer_line = render_entry_into(
             input.entry,
+            input.time_label.as_deref(),
             input.highlighted,
             show_thoughts,
             input.disclosure,
