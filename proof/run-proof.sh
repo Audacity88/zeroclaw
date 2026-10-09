@@ -270,6 +270,10 @@ def retain_runtime_diagnostics(rc):
                 ('signal: 6, SIGABRT', 'sigabrt'), ('panicked at', 'panic'),
                 ('test result: FAILED', 'failed-tests'), ('test result: ok', 'passed-tests'),
                 ('has overflowed its stack', 'stack-overflow'), ('fatal runtime error', 'fatal-runtime'),
+                ('execution on async fiber has overflowed its stack', 'wasmtime-fiber-stack'),
+                ("thread 'tokio-runtime-worker' has overflowed its stack", 'tokio-worker-stack'),
+                ("thread 'matrix_plugin_smoke' has overflowed its stack", 'test-root-stack'),
+                ('Wasmtime caught a segfault for a wasm program', 'wasmtime-native-fault'),
                 ('double free', 'allocator-double-free'), ('corrupted size', 'allocator-corruption'),
                 ('memory allocation of', 'allocation-failure'), ('assertion failed', 'assertion'),
             ):

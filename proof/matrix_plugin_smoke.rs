@@ -1475,7 +1475,11 @@ async fn matrix_plugin_smoke() -> Result<()> {
         .await
         .context("proof-stage-relay-start")?;
     PHASE.store(1, std::sync::atomic::Ordering::Relaxed);
-    let result = primary(&relay, &fixture).await;
+    let phase = Box::pin(primary(&relay, &fixture));
+    diagnostic(json!({"stage":"phase-frame", "phase":"primary",
+        "future_bytes":std::mem::size_of_val(phase.as_ref().get_ref()),
+        "config_bytes":std::mem::size_of::<Config>()}));
+    let result = phase.await;
     let stopped = relay.stop().await;
     failure_checkpoint("primary-failure", &result);
     failure_checkpoint("relay-stop-failure", &stopped);
@@ -1485,7 +1489,11 @@ async fn matrix_plugin_smoke() -> Result<()> {
         .await
         .context("proof-stage-scripted-start")?;
     PHASE.store(2, std::sync::atomic::Ordering::Relaxed);
-    let result = scripted(&server).await;
+    let phase = Box::pin(scripted(&server));
+    diagnostic(json!({"stage":"phase-frame", "phase":"scripted",
+        "future_bytes":std::mem::size_of_val(phase.as_ref().get_ref()),
+        "config_bytes":std::mem::size_of::<Config>()}));
+    let result = phase.await;
     let stopped = server.stop().await;
     failure_checkpoint("scripted-failure", &result);
     failure_checkpoint("scripted-stop-failure", &stopped);
