@@ -210,7 +210,6 @@ root:
     room = request(base, "createRoom", {
         "visibility": "private", "preset": "private_chat",
         "invite": [users["sender"]["id"], users["deny"]["id"]],
-        "power_level_content_override": {"users": {users["bot"]["id"]: 100}},
     }, users["bot"]["token"])["room_id"]
     from urllib.parse import quote
     setup_stage("room-join")
