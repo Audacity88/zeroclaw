@@ -9,7 +9,7 @@ type Requests = Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>;
 struct RecordingProvider {
     scripted: ScriptedProvider,
     requests: Requests,
-    steering: Option<mpsc::Sender<String>>,
+    steering: Option<mpsc::Sender<crate::agent::SteeringInput>>,
 }
 
 impl zeroclaw_api::attribution::Attributable for RecordingProvider {
@@ -116,7 +116,7 @@ fn agent_for_with_steering(
     responses: Vec<ChatResponse>,
     tool: OutcomeTool,
     pacing: Option<zeroclaw_config::schema::PacingConfig>,
-    steering: Option<mpsc::Sender<String>>,
+    steering: Option<mpsc::Sender<crate::agent::SteeringInput>>,
 ) -> (TestAgent, Requests) {
     let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut agent = build_agent(
@@ -434,16 +434,20 @@ async fn disabled_and_standalone_pacing_preserve_chains_and_live_policy_refreshe
                 failing(&calls),
                 (!standalone).then_some(disabled.clone()),
             );
-            let live = Arc::new(parking_lot::RwLock::new(Config::default()));
-            live.write().pacing = disabled;
+            let live = zeroclaw_config::live::LiveConfig::new(Config {
+                pacing: disabled,
+                ..Config::default()
+            });
             if !standalone {
-                agent.provider_switch_config.as_mut().unwrap().live_config =
-                    Some(Arc::clone(&live));
+                agent.provider_switch_config.as_mut().unwrap().live_config = Some(live.handle());
             }
             assert_eq!(run(&mut agent, streamed).await.0, "done");
             assert_eq!(calls.load(Ordering::SeqCst), 5);
             if !standalone {
-                live.write().pacing.loop_detection_enabled = true;
+                let mut updated = live.snapshot();
+                updated.pacing.loop_detection_enabled = true;
+                live.publish(live.next_revision().unwrap(), updated)
+                    .unwrap();
                 let response = run(&mut agent, streamed).await.0;
                 assert!(response.contains(&crate::i18n::get_required_cli_string(
                     "turn-repeated-failure-exhausted"
@@ -540,7 +544,7 @@ async fn streaming_exhaustion_is_terminal_despite_queued_steering() {
         4,
         "queued steering cannot restart an exhausted turn"
     );
-    assert_eq!(steer_rx.try_recv().unwrap(), "continue working");
+    assert_eq!(steer_rx.try_recv().unwrap().text(), "continue working");
 }
 
 #[tokio::test]
