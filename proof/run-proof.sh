@@ -269,6 +269,9 @@ def retain_runtime_diagnostics(rc):
                 ('signal: 9, SIGKILL', 'sigkill'), ('signal: 11, SIGSEGV', 'sigsegv'),
                 ('signal: 6, SIGABRT', 'sigabrt'), ('panicked at', 'panic'),
                 ('test result: FAILED', 'failed-tests'), ('test result: ok', 'passed-tests'),
+                ('has overflowed its stack', 'stack-overflow'), ('fatal runtime error', 'fatal-runtime'),
+                ('double free', 'allocator-double-free'), ('corrupted size', 'allocator-corruption'),
+                ('memory allocation of', 'allocation-failure'), ('assertion failed', 'assertion'),
             ):
                 if needle in text: termination.add(label)
             for value in re.findall(r'exit status: ([0-9]{1,3})(?![0-9])', text):
@@ -427,7 +430,7 @@ classification=synapse-setup
 python3 "$proof/prepare_synapse.py" prepare "$MATRIX_PROOF_PRIVATE" >"$MATRIX_PROOF_PRIVATE/setup.log" 2>&1
 classification=host-cases
 cd "$root/host"
-PROOF_RUNTIME_DIAGNOSTICS=1 owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke -- --test-threads=1 --show-output
+PROOF_RUNTIME_DIAGNOSTICS=1 owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke -- --test-threads=1 --nocapture
 python3 - <<'PY'
 import hashlib, json, os
 from pathlib import Path
