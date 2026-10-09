@@ -63,7 +63,10 @@ pub(crate) fn build_iteration_tool_specs(
                 poisoned.into_inner()
             }
         };
-        hidden_builtin_names = activated_tools.hidden_builtin_names();
+        // Turn exclusions can remove search without mutating the scoped registry.
+        if tool_specs.iter().any(|spec| spec.name == "tool_search") {
+            hidden_builtin_names = activated_tools.hidden_builtin_names();
+        }
         for spec in activated_tools.tool_specs() {
             if !excluded_tools.iter().any(|ex| ex == &spec.name) {
                 tool_specs.push(spec);
@@ -273,6 +276,33 @@ mod tests {
         );
         assert!(specs.known_tool_names.contains("calendar"));
         assert!(!specs.known_tool_names.contains("blocked"));
+
+        let eager = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &registry,
+            &["blocked".into(), "tool_search".into()],
+            Some(&activated),
+        )
+        .unwrap();
+        assert_eq!(
+            eager
+                .request_tool_specs()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["calendar"]
+        );
+        assert!(eager.known_tool_names.contains("calendar"));
+        assert!(!eager.known_tool_names.contains("blocked"));
+        assert!(!eager.known_tool_names.contains("tool_search"));
+        assert!(
+            activated
+                .lock()
+                .unwrap()
+                .hidden_builtin_names()
+                .contains("calendar")
+        );
     }
 
     #[test]

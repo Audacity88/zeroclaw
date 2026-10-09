@@ -803,7 +803,13 @@ pub(crate) fn build_system_prompt_for_turn(
         activated_tools,
     )?;
     let excluded_tool_names: HashSet<&str> = excluded_tools.iter().map(String::as_str).collect();
-    let hidden_builtin_names = activated_tools.map_or_else(HashSet::new, |state| {
+    let builtin_discovery = activated_tools.filter(|_| {
+        !excluded_tool_names.contains("tool_search")
+            && tools_registry
+                .iter()
+                .any(|tool| tool.name() == "tool_search")
+    });
+    let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
         state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -818,7 +824,7 @@ pub(crate) fn build_system_prompt_for_turn(
     let mut turn_tool_descs = tool_descs.to_vec();
     turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
     let mut turn_deferred_section = deferred_section.to_string();
-    if let Some(state) = activated_tools {
+    if let Some(state) = builtin_discovery {
         let section = state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3808,14 +3814,22 @@ async fn process_message_inner(
             .map(|tool| tool.name())
             .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
             .collect();
-        let hidden_builtin_names = tools_registry.hidden_builtin_names();
+        let builtin_discovery = activated_handle_pm
+            .as_ref()
+            .filter(|_| effective_tool_names.contains("tool_search"));
+        let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hidden_builtin_names()
+        });
         let prompt_tool_names: HashSet<&str> = effective_tool_names
             .iter()
             .copied()
             .filter(|name| !hidden_builtin_names.contains(*name))
             .collect();
         tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
-        if let Some(state) = &activated_handle_pm {
+        if let Some(state) = builtin_discovery {
             deferred_section.push_str(
                 &state
                     .lock()
@@ -15684,7 +15698,7 @@ Let me check the result."#;
             .lock()
             .unwrap()
             .set_deferred_builtin_specs(vec![tools[1].spec()]);
-        let build = || {
+        let build = |excluded: &[String]| {
             super::build_system_prompt_for_turn(
                 workspace.path(),
                 "test-model",
@@ -15696,7 +15710,7 @@ Let me check the result."#;
                 &RiskProfileConfig::default(),
                 &provider,
                 &tools,
-                &[],
+                excluded,
                 Some(&activated),
                 false,
                 SkillsPromptInjectionMode::Full,
@@ -15709,16 +15723,22 @@ Let me check the result."#;
             )
             .unwrap()
         };
-        let initial = build();
+        let initial = build(&[]);
         assert!(initial.contains("catalog_probe - "));
         assert!(!initial.contains("**catalog_probe**"));
+        let eager = build(&["tool_search".into()]);
+        assert!(eager.contains("**catalog_probe**"));
+        assert!(!eager.contains("catalog_probe - "));
+        assert!(!eager.contains("tool_search"));
+        let excluded = build(&["tool_search".into(), "catalog_probe".into()]);
+        assert!(!excluded.contains("catalog_probe"));
         let search = crate::tools::ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
         let result = search
             .execute(serde_json::json!({"query": "select:catalog_probe"}))
             .await
             .unwrap();
         assert!(result.output.contains("\"name\": \"catalog_probe\""));
-        let selected = build();
+        let selected = build(&[]);
         assert!(selected.contains(&format!(
             "**catalog_probe**: {}\nParameters: `{}`\n",
             tools[1].description(),
