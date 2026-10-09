@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Proposed hosted execution only. Do not run this preparation on the local host.
+# Later publication supplies proof/matrix-port.patch and frozen-inputs.json.
+# Lock schema: harness_sha256 maps the three code filenames to SHA-256;
+# base_archive_sha256 maps host/plugins to git archive --format=tar HEAD hashes;
+# source_patch_sha256 is the reviewed seven-file patch hash below. This lock's
+# SHA-256 remains an unlaunchable placeholder in proof.yml until review/freeze.
+set -euo pipefail
+umask 077
+[[ "${GITHUB_REPOSITORY:-}" == Audacity88/zeroclaw && "${GITHUB_ACTOR:-}" == Audacity88 &&
+   "${GITHUB_EVENT_NAME:-}" == push &&
+   "${GITHUB_REF:-}" == refs/heads/codex/culling-matrix-host-proof-20261009 ]] || exit 64
+[[ "${FROZEN_INPUTS_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || exit 64
+root=$(realpath "${1:?workspace required}")
+[[ "$root" == "${GITHUB_WORKSPACE:-}" && "$(uname -m)" == x86_64 && "$(uname -s)" == Linux ]] || exit 64
+proof="$root/harness/proof"
+echo "$FROZEN_INPUTS_SHA256  $proof/frozen-inputs.json" | sha256sum --check --status
+export CARGO_BUILD_JOBS=2 CARGO_TERM_COLOR=never CARGO_INCREMENTAL=0 RUSTUP_TOOLCHAIN=1.98.0
+export CARGO_NET_RETRY=0 PYTHONOPTIMIZE=0
+export PROOF_ROOT="$root"
+export PROOF_DEADLINE=$(python3 -c 'import time; print(time.monotonic() + 70 * 60)')
+export MATRIX_PROOF_PRIVATE="$root/proof-private" MATRIX_PROOF_PUBLIC="$root/proof-public"
+mkdir "$MATRIX_PROOF_PRIVATE" "$MATRIX_PROOF_PUBLIC"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export HOME="$MATRIX_PROOF_PRIVATE/home" CARGO_HOME="$MATRIX_PROOF_PRIVATE/cargo-home"
+export CARGO_TARGET_DIR="$MATRIX_PROOF_PRIVATE/target"
+export MATRIX_PROOF_PACKAGE="$MATRIX_PROOF_PRIVATE/packages"
+export MATRIX_PROOF_CONFIG="$MATRIX_PROOF_PRIVATE/fixture.json"
+export ZEROCLAW_CONFIG_DIR="$MATRIX_PROOF_PRIVATE/config" ZEROCLAW_DATA_DIR="$MATRIX_PROOF_PRIVATE/data"
+# RUSTUP_HOME must remain the action-installed compiler store; isolate only the
+# Cargo registry/targets and user configuration. No save/restore cache action.
+mkdir -p "$HOME" "$CARGO_HOME" "$MATRIX_PROOF_PACKAGE/matrix"
+classification=admission
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  set +e
+  python3 "$proof/prepare_synapse.py" cleanup "$MATRIX_PROOF_PRIVATE" >"$MATRIX_PROOF_PRIVATE/cleanup.log" 2>&1
+  cleanup_status=$?
+  if (( cleanup_status != 0 )); then
+    status=1; classification=cleanup
+  elif [[ -f "$MATRIX_PROOF_PRIVATE/cargo-failure-class" ]]; then
+    classification=$(<"$MATRIX_PROOF_PRIVATE/cargo-failure-class")
+  fi
+  PROOF_STATUS="$status" PROOF_CLASS="$classification" python3 - <<'PY'
+import json, os
+from pathlib import Path
+p = Path(os.environ['MATRIX_PROOF_PUBLIC']) / 'result.json'
+p.write_text(json.dumps({'exit_code': int(os.environ['PROOF_STATUS']),
+                        'failure_class': os.environ['PROOF_CLASS'], 'automatic_retry': False}))
+PY
+  if (( $? != 0 )); then status=1; fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'classification=cancelled; exit 130' INT TERM
+python3 - <<'PY'
+import hashlib, json, os, shutil, subprocess
+from pathlib import Path
+root = Path(os.environ['PROOF_ROOT'])
+proof = root / 'harness/proof'
+lock = json.loads((proof / 'frozen-inputs.json').read_text())
+expected = {'plugins/matrix/' + p for p in ('Cargo.toml', 'Cargo.lock', 'manifest.toml',
+            'README.md', 'src/lib.rs', 'src/matrix.rs', 'tests/matrix.rs')}
+def digest(data): return hashlib.sha256(data).hexdigest()
+def check(data, wanted):
+    assert isinstance(wanted, str) and len(wanted) == 64 and all(c in '0123456789abcdef' for c in wanted)
+    assert digest(data) == wanted
+assert shutil.disk_usage(root).free >= 20 * 1024**3, 'initial disk floor'
+assert subprocess.check_output(['lsb_release', '-rs'], text=True).strip() == '24.04'
+identity = {'synapse_amd64': '43fd704aedef503a6fba2e5696439ef7bac24479a3472e364561973f550e4aad',
+            'platform': 'ubuntu-24.04/amd64', 'input_sha256': os.environ['FROZEN_INPUTS_SHA256']}
+experiment_head = os.environ['GITHUB_SHA']
+assert len(experiment_head) == 40 and all(c in '0123456789abcdef' for c in experiment_head)
+assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root/'harness', text=True).strip() == experiment_head
+identity['experiment_head'] = experiment_head
+for name in ('run-proof.sh', 'prepare_synapse.py', 'matrix_plugin_smoke.rs'):
+    check((proof / name).read_bytes(), lock['harness_sha256'][name])
+identity['harness_sha256'] = lock['harness_sha256']
+identity['workflow_sha256'] = digest((root / 'harness/.github/workflows/proof.yml').read_bytes())
+for directory, sha in (('host', '35dad4a6f398de83ffa7b6632d2ad2637c971cde'),
+                       ('plugins', '5efe782cec284b30d9cfda143e11fa9b53dbfd17')):
+    cwd = root / directory
+    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=cwd, text=True).strip() == sha
+    assert not subprocess.check_output(['git', 'status', '--porcelain'], cwd=cwd)
+    archive = subprocess.check_output(['git', 'archive', '--format=tar', sha], cwd=cwd)
+    check(archive, lock['base_archive_sha256'][directory])
+    (Path(os.environ['MATRIX_PROOF_PRIVATE']) / (directory + '-base.tar')).write_bytes(archive)
+    identity[directory + '_head'] = sha
+    identity[directory + '_archive_sha256'] = digest(archive)
+patch = proof / 'matrix-port.patch'
+patch_hash = '20b5708d225a93df4936775d94365131b6aa0a755d097661fb94adcf02ade058'
+assert lock['source_patch_sha256'] == patch_hash
+check(patch.read_bytes(), patch_hash)
+cwd = root/'plugins'
+stats = subprocess.check_output(['git', 'apply', '--numstat', '-z', str(patch)], cwd=cwd)
+rows = [row.split(b'\t', 2) for row in stats.split(b'\0') if row]
+assert len(rows) == 7 and all(len(row) == 3 and row[0].isdigit() and row[1].isdigit() for row in rows)
+assert {row[2].decode() for row in rows} == expected
+for path in expected:
+    dest = cwd/path
+    assert not dest.is_symlink() and dest.resolve().is_relative_to(cwd.resolve())
+subprocess.run(['git', 'apply', '--check', str(patch)], cwd=cwd, check=True, capture_output=True)
+subprocess.run(['git', 'apply', str(patch)], cwd=cwd, check=True, capture_output=True)
+changed = subprocess.check_output(['git', 'diff', '--name-only'], cwd=cwd, text=True).splitlines()
+new = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=cwd, text=True).splitlines()
+assert set(changed + new) == expected
+identity['source_patch_sha256'] = patch_hash
+identity['overlay_files_sha256'] = {path: digest((cwd/path).read_bytes()) for path in sorted(expected)}
+check((cwd/'plugins/matrix/manifest.toml').read_bytes(), 'a5c33c862043d3451ff9c14457660b85d7c86b1cc52cd63661ecdb1527d53511')
+check((cwd/'plugins/matrix/Cargo.lock').read_bytes(), 'e96c902848ef5101c644fbbab922a8a438676618b3903b9384299b9f42801966')
+identity['local_reference'] = {'platform': 'Darwin', 'rust': '1.97.0', 'bytes': 289316,
+    'component_sha256': '8fdbf2980aaabb23819750c560b5b1578a98e6db49327b1d1a553187c09fe66a',
+    'provenance': 'source-owner-report', 'linux_byte_equality_required': False}
+def tree(path):
+    assert not any(p.is_symlink() for p in path.rglob('*'))
+    return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob('*') if p.is_file()}
+assert tree(root/'plugins/wit/next') == tree(root/'host/wit/v0'), 'WIT byte mismatch'
+identity['wit_byte_equal'] = True
+identity['host_lock_sha256'] = digest((root/'host/Cargo.lock').read_bytes())
+identity['plugin_lock_sha256'] = digest((root/'plugins/plugins/matrix/Cargo.lock').read_bytes())
+test = root/'host/tests/matrix_plugin_smoke.rs'
+assert not test.exists()
+shutil.copyfile(proof/'matrix_plugin_smoke.rs', test)
+(Path(os.environ['MATRIX_PROOF_PUBLIC'])/'identity.json').write_text(json.dumps(identity, sort_keys=True))
+PY
+# Supervisor owns only its new Cargo session/process group. Disk pressure never
+# invokes pkill, deletes caches, or sends signals to other jobs/process groups.
+owned_cargo() {
+  python3 - "$@" <<'PY'
+import os, shutil, signal, subprocess, sys, time
+from pathlib import Path
+private = Path(os.environ['MATRIX_PROOF_PRIVATE'])
+log = private / ('cargo-' + str(time.monotonic_ns()) + '.log')
+def terminate(p):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try: os.killpg(p.pid, signal.SIGTERM)
+    except ProcessLookupError: pass
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        p.poll()
+        try: os.killpg(p.pid, 0)
+        except ProcessLookupError: break
+        time.sleep(0.1)
+    try: os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    p.wait()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try: os.killpg(p.pid, 0)
+        except ProcessLookupError: return
+        time.sleep(0.1)
+with log.open('wb') as out:
+    if shutil.disk_usage(private).free < 4 * 1024**3:
+        (private/'cargo-failure-class').write_text('disk-reserve')
+        raise SystemExit(75)
+    p = subprocess.Popen(sys.argv[1:], stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    def cancel(sig, frame):
+        terminate(p)
+        raise SystemExit(130)
+    signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGINT, cancel)
+    deadline = float(os.environ['PROOF_DEADLINE'])
+    while p.poll() is None:
+        if shutil.disk_usage(private).free < 4 * 1024**3:
+            (private/'cargo-failure-class').write_text('disk-reserve')
+            terminate(p)
+            raise SystemExit(75)
+        if time.monotonic() > deadline:
+            (private/'cargo-failure-class').write_text('owned-command-deadline')
+            terminate(p)
+            raise SystemExit(124)
+        time.sleep(0.5)
+    rc = p.wait()
+    # A successful root must not leave a compiler or owned test child running.
+    try: os.killpg(p.pid, 0)
+    except ProcessLookupError: pass
+    else:
+        terminate(p)
+        rc = 1
+    raise SystemExit(rc)
+PY
+}
+classification=image-acquisition
+docker pull --platform linux/amd64 ghcr.io/element-hq/synapse@sha256:43fd704aedef503a6fba2e5696439ef7bac24479a3472e364561973f550e4aad >"$MATRIX_PROOF_PRIVATE/image.log" 2>&1
+classification=plugin-build
+cd "$root/plugins/plugins/matrix"
+owned_cargo cargo build --locked --release --target wasm32-wasip2
+cp "$CARGO_TARGET_DIR/wasm32-wasip2/release/matrix.wasm" "$MATRIX_PROOF_PACKAGE/matrix/matrix.wasm"
+cp manifest.toml "$MATRIX_PROOF_PACKAGE/matrix/manifest.toml"
+python3 - <<'PY'
+import hashlib, json, os, subprocess
+from pathlib import Path
+p = Path(os.environ['MATRIX_PROOF_PUBLIC'])/'identity.json'
+identity = json.loads(p.read_text())
+for name, expected in identity['overlay_files_sha256'].items():
+    source = Path(os.environ['PROOF_ROOT'])/'plugins'/name
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == expected, 'source drift during build'
+for name in ('matrix.wasm', 'manifest.toml'):
+    identity[name + '_sha256'] = hashlib.sha256((Path(os.environ['MATRIX_PROOF_PACKAGE'])/'matrix'/name).read_bytes()).hexdigest()
+assert identity['manifest.toml_sha256'] == 'a5c33c862043d3451ff9c14457660b85d7c86b1cc52cd63661ecdb1527d53511'
+identity['component_bytes'] = (Path(os.environ['MATRIX_PROOF_PACKAGE'])/'matrix/matrix.wasm').stat().st_size
+identity['wasm_target'] = 'wasm32-wasip2'
+identity['rustc'] = subprocess.check_output(['rustc', '-Vv'], text=True)
+identity['cargo'] = subprocess.check_output(['cargo', '-V'], text=True).strip()
+assert identity['rustc'].startswith('rustc 1.98.0 ')
+p.write_text(json.dumps(identity, sort_keys=True))
+PY
+classification=synapse-setup
+python3 "$proof/prepare_synapse.py" prepare "$MATRIX_PROOF_PRIVATE" >"$MATRIX_PROOF_PRIVATE/setup.log" 2>&1
+classification=host-build-or-cases
+cd "$root/host"
+owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke -- --test-threads=1
+python3 - <<'PY'
+import hashlib, json, os
+from pathlib import Path
+root = Path(os.environ['PROOF_ROOT'])
+identity = json.loads((Path(os.environ['MATRIX_PROOF_PUBLIC'])/'identity.json').read_text())
+assert hashlib.sha256((root/'host/Cargo.lock').read_bytes()).hexdigest() == identity['host_lock_sha256']
+assert hashlib.sha256((root/'plugins/plugins/matrix/Cargo.lock').read_bytes()).hexdigest() == identity['plugin_lock_sha256']
+PY
+classification=passed

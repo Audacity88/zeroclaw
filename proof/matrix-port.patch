@@ -1,0 +1,2708 @@
+diff --git a/plugins/matrix/Cargo.lock b/plugins/matrix/Cargo.lock
+index 3f104c7..56e4dbf 100644
+--- a/plugins/matrix/Cargo.lock
++++ b/plugins/matrix/Cargo.lock
+@@ -2,18 +2,6 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
+-[[package]]
+-name = "ahash"
+-version = "0.8.12"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+-dependencies = [
+- "cfg-if",
+- "once_cell",
+- "version_check",
+- "zerocopy",
+-]
+-
+ [[package]]
+ name = "anyhow"
+ version = "1.0.103"
+@@ -26,18 +14,6 @@ version = "2.13.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+ 
+-[[package]]
+-name = "bytes"
+-version = "1.12.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+-
+-[[package]]
+-name = "cfg-if"
+-version = "1.0.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+-
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+@@ -50,15 +26,6 @@ version = "0.1.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+ 
+-[[package]]
+-name = "form_urlencoded"
+-version = "1.2.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+-dependencies = [
+- "percent-encoding",
+-]
+-
+ [[package]]
+ name = "futures"
+ version = "0.3.32"
+@@ -147,15 +114,6 @@ dependencies = [
+  "slab",
+ ]
+ 
+-[[package]]
+-name = "hashbrown"
+-version = "0.14.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+-dependencies = [
+- "ahash",
+-]
+-
+ [[package]]
+ name = "hashbrown"
+ version = "0.15.5"
+@@ -177,16 +135,6 @@ version = "0.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+ 
+-[[package]]
+-name = "http"
+-version = "1.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
+-dependencies = [
+- "bytes",
+- "itoa",
+-]
+-
+ [[package]]
+ name = "id-arena"
+ version = "2.3.0"
+@@ -211,12 +159,6 @@ version = "1.0.18"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+ 
+-[[package]]
+-name = "leb128"
+-version = "0.2.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c83bff1d572d6b9aeef67ddfc8448e4a3737909cb28e81f97c791b9018703e52"
+-
+ [[package]]
+ name = "leb128fmt"
+ version = "0.1.0"
+@@ -231,12 +173,12 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+ 
+ [[package]]
+ name = "matrix"
+-version = "0.2.0"
++version = "0.3.0"
+ dependencies = [
+  "percent-encoding",
+  "serde",
+  "serde_json",
+- "waki",
++ "wasip2",
+  "wit-bindgen 0.46.0",
+ ]
+ 
+@@ -347,21 +289,6 @@ version = "0.4.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+ 
+-[[package]]
+-name = "smallvec"
+-version = "1.15.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+-
+-[[package]]
+-name = "spdx"
+-version = "0.10.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c3e17e880bafaeb362a7b751ec46bdc5b61445a188f80e0606e68167cd540fa3"
+-dependencies = [
+- "smallvec",
+-]
+-
+ [[package]]
+ name = "syn"
+ version = "2.0.118"
+@@ -386,45 +313,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+ 
+ [[package]]
+-name = "version_check"
+-version = "0.9.5"
++name = "wasip2"
++version = "1.0.4+wasi-0.2.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+-
+-[[package]]
+-name = "waki"
+-version = "0.5.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6e2db2daf1dfbadf228fd8b3c22b96a359135fd673b3d2c203274ee6a0df9c77"
+-dependencies = [
+- "anyhow",
+- "form_urlencoded",
+- "http",
+- "serde",
+- "serde_json",
+- "waki-macros",
+- "wit-bindgen 0.34.0",
+-]
+-
+-[[package]]
+-name = "waki-macros"
+-version = "0.5.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a061143f321cc5eeb523f60bdbcd45cfc3ee8851f8cf24f7a4b963bddc5642eb"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn",
+-]
+-
+-[[package]]
+-name = "wasm-encoder"
+-version = "0.219.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8aa79bcd666a043b58f5fa62b221b0b914dd901e6f620e8ab7371057a797f3e1"
++checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
+ dependencies = [
+- "leb128",
+- "wasmparser 0.219.2",
++ "wit-bindgen 0.57.1",
+ ]
+ 
+ [[package]]
+@@ -434,23 +328,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5be00faa2b4950c76fe618c409d2c3ea5a3c9422013e079482d78544bb2d184c"
+ dependencies = [
+  "leb128fmt",
+- "wasmparser 0.239.0",
+-]
+-
+-[[package]]
+-name = "wasm-metadata"
+-version = "0.219.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b1ef51bd442042a2a7b562dddb6016ead52c4abab254c376dcffc83add2c9c34"
+-dependencies = [
+- "anyhow",
+- "indexmap",
+- "serde",
+- "serde_derive",
+- "serde_json",
+- "spdx",
+- "wasm-encoder 0.219.2",
+- "wasmparser 0.219.2",
++ "wasmparser",
+ ]
+ 
+ [[package]]
+@@ -461,21 +339,8 @@ checksum = "20b3ec880a9ac69ccd92fbdbcf46ee833071cf09f82bb005b2327c7ae6025ae2"
+ dependencies = [
+  "anyhow",
+  "indexmap",
+- "wasm-encoder 0.239.0",
+- "wasmparser 0.239.0",
+-]
+-
+-[[package]]
+-name = "wasmparser"
+-version = "0.219.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5220ee4c6ffcc0cb9d7c47398052203bc902c8ef3985b0c8134118440c0b2921"
+-dependencies = [
+- "ahash",
+- "bitflags",
+- "hashbrown 0.14.5",
+- "indexmap",
+- "semver",
++ "wasm-encoder",
++ "wasmparser",
+ ]
+ 
+ [[package]]
+@@ -490,16 +355,6 @@ dependencies = [
+  "semver",
+ ]
+ 
+-[[package]]
+-name = "wit-bindgen"
+-version = "0.34.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7e11ad55616555605a60a8b2d1d89e006c2076f46c465c892cc2c153b20d4b30"
+-dependencies = [
+- "wit-bindgen-rt",
+- "wit-bindgen-rust-macro 0.34.0",
+-]
+-
+ [[package]]
+ name = "wit-bindgen"
+ version = "0.46.0"
+@@ -509,18 +364,16 @@ dependencies = [
+  "bitflags",
+  "futures",
+  "once_cell",
+- "wit-bindgen-rust-macro 0.46.0",
++ "wit-bindgen-rust-macro",
+ ]
+ 
+ [[package]]
+-name = "wit-bindgen-core"
+-version = "0.34.0"
++name = "wit-bindgen"
++version = "0.57.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "163cee59d3d5ceec0b256735f3ab0dccac434afb0ec38c406276de9c5a11e906"
++checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+ dependencies = [
+- "anyhow",
+- "heck",
+- "wit-parser 0.219.2",
++ "bitflags",
+ ]
+ 
+ [[package]]
+@@ -531,32 +384,7 @@ checksum = "cabd629f94da277abc739c71353397046401518efb2c707669f805205f0b9890"
+ dependencies = [
+  "anyhow",
+  "heck",
+- "wit-parser 0.239.0",
+-]
+-
+-[[package]]
+-name = "wit-bindgen-rt"
+-version = "0.34.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "744845cde309b8fa32408d6fb67456449278c66ea4dcd96de29797b302721f02"
+-dependencies = [
+- "bitflags",
+-]
+-
+-[[package]]
+-name = "wit-bindgen-rust"
+-version = "0.34.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f6919521fc7807f927a739181db93100ca7ed03c29509b84d5f96b27b2e49a9a"
+-dependencies = [
+- "anyhow",
+- "heck",
+- "indexmap",
+- "prettyplease",
+- "syn",
+- "wasm-metadata 0.219.2",
+- "wit-bindgen-core 0.34.0",
+- "wit-component 0.219.2",
++ "wit-parser",
+ ]
+ 
+ [[package]]
+@@ -570,24 +398,9 @@ dependencies = [
+  "indexmap",
+  "prettyplease",
+  "syn",
+- "wasm-metadata 0.239.0",
+- "wit-bindgen-core 0.46.0",
+- "wit-component 0.239.0",
+-]
+-
+-[[package]]
+-name = "wit-bindgen-rust-macro"
+-version = "0.34.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c967731fc5d50244d7241ecfc9302a8929db508eea3c601fbc5371b196ba38a5"
+-dependencies = [
+- "anyhow",
+- "prettyplease",
+- "proc-macro2",
+- "quote",
+- "syn",
+- "wit-bindgen-core 0.34.0",
+- "wit-bindgen-rust 0.34.0",
++ "wasm-metadata",
++ "wit-bindgen-core",
++ "wit-component",
+ ]
+ 
+ [[package]]
+@@ -601,27 +414,8 @@ dependencies = [
+  "proc-macro2",
+  "quote",
+  "syn",
+- "wit-bindgen-core 0.46.0",
+- "wit-bindgen-rust 0.46.0",
+-]
+-
+-[[package]]
+-name = "wit-component"
+-version = "0.219.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4b8479a29d81c063264c3ab89d496787ef78f8345317a2dcf6dece0f129e5fcd"
+-dependencies = [
+- "anyhow",
+- "bitflags",
+- "indexmap",
+- "log",
+- "serde",
+- "serde_derive",
+- "serde_json",
+- "wasm-encoder 0.219.2",
+- "wasm-metadata 0.219.2",
+- "wasmparser 0.219.2",
+- "wit-parser 0.219.2",
++ "wit-bindgen-core",
++ "wit-bindgen-rust",
+ ]
+ 
+ [[package]]
+@@ -637,28 +431,10 @@ dependencies = [
+  "serde",
+  "serde_derive",
+  "serde_json",
+- "wasm-encoder 0.239.0",
+- "wasm-metadata 0.239.0",
+- "wasmparser 0.239.0",
+- "wit-parser 0.239.0",
+-]
+-
+-[[package]]
+-name = "wit-parser"
+-version = "0.219.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ca004bb251010fe956f4a5b9d4bf86b4e415064160dd6669569939e8cbf2504f"
+-dependencies = [
+- "anyhow",
+- "id-arena",
+- "indexmap",
+- "log",
+- "semver",
+- "serde",
+- "serde_derive",
+- "serde_json",
+- "unicode-xid",
+- "wasmparser 0.219.2",
++ "wasm-encoder",
++ "wasm-metadata",
++ "wasmparser",
++ "wit-parser",
+ ]
+ 
+ [[package]]
+@@ -676,27 +452,7 @@ dependencies = [
+  "serde_derive",
+  "serde_json",
+  "unicode-xid",
+- "wasmparser 0.239.0",
+-]
+-
+-[[package]]
+-name = "zerocopy"
+-version = "0.8.54"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
+-dependencies = [
+- "zerocopy-derive",
+-]
+-
+-[[package]]
+-name = "zerocopy-derive"
+-version = "0.8.54"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn",
++ "wasmparser",
+ ]
+ 
+ [[package]]
+diff --git a/plugins/matrix/Cargo.toml b/plugins/matrix/Cargo.toml
+index 9042469..a99b71d 100644
+--- a/plugins/matrix/Cargo.toml
++++ b/plugins/matrix/Cargo.toml
+@@ -1,9 +1,9 @@
+ # Standalone crate (own [workspace]): built for wasm32-wasip2 as a channel
+ # plugin component; the pure matrix core (rlib) is host-tested with plain
+-# cargo test. `waki` provides blocking wasi:http only in the WASM component.
++# cargo test. `wasip2` supplies bounded wasi:http in the WASM component.
+ [package]
+ name = "matrix"
+-version = "0.2.0"
++version = "0.3.0"
+ edition = "2021"
+ license = "MIT OR Apache-2.0"
+ description = "Matrix channel plugin for ZeroClaw: Client-Server sync + text send over wasi:http."
+@@ -19,7 +19,7 @@ serde_json = "1"
+ percent-encoding = "2"
+ 
+ [target.'cfg(target_family = "wasm")'.dependencies]
+-waki = { version = "0.5.1", features = ["json"] }
++wasip2 = "1"
+ 
+ [profile.release]
+ opt-level = "s"
+diff --git a/plugins/matrix/README.md b/plugins/matrix/README.md
+index 93cc35b..5b3759f 100644
+--- a/plugins/matrix/README.md
++++ b/plugins/matrix/README.md
+@@ -1,47 +1,42 @@
+-# Matrix channel plugin
++# Matrix text-only channel plugin
+ 
+-This plugin mirrors the built-in `matrix` channel through `provides = "matrix"`
+-and reads the existing `[channels.matrix.<alias>]` configuration. It talks to
+-the Matrix Client-Server API through the host's `wasi:http` implementation.
++Matrix 0.3.0 is an opt-in current-host compatibility candidate. It binds the experimental `wit/next` contract with `plugins-wit-v0` and is excluded from registry publication by `registry = false`. Build it with the host revision pinned in `wit/NEXT_REF`; this unfrozen interface does not promise compatibility with released hosts. Published Matrix 0.1.0 and 0.2.0 packages remain unchanged.
+ 
+-## Supported
++Use an explicit `channels.plugin.<alias>` instance with this package and the host's supported plugin configuration surface. `provides = "matrix"` describes the channel; it does not activate a native mirror or read `channels.matrix.*`. Retain native Matrix for encrypted rooms, recovery, password login, media and durable sessions.
+ 
+-- access-token authentication and `/account/whoami` health checks
+-- startup backlog suppression followed by incremental `/sync` polling
+-- unencrypted `m.text` messages in joined rooms
+-- exact `allowed_rooms` filtering and `mention_only` handling
+-- room-ID or room-alias recipients
+-- top-level and threaded text replies
++## Configuration
+ 
+-## Current limits
++The closed schema requires `homeserver` and `access_token`. Set the token through the host's secret-aware configuration surface. Its `x-secret` designation removes it from `config.get`; the component obtains it only through scoped `secrets.get("access_token")`. Public configuration rejects credentials and unknown keys.
+ 
+-- encrypted rooms and recovery keys are not supported
+-- password login is not supported; configure `access_token`
+-- media, edits, reactions, typing indicators, and progressive drafts are not supported
++| Public property | Meaning |
++| --- | --- |
++| `homeserver` | Trusted HTTP or HTTPS base URL, optionally with a base path; no userinfo, query or fragment. Grant only this destination through host egress policy. |
++| `user_id` | Optional assertion against authenticated `/account/whoami`; never an authentication fallback. |
++| `allowed_rooms` | Exact room IDs for inbound filtering; empty or absent accepts joined rooms. Host sender authorization remains authoritative. |
++| `mention_only` | Default false; in group rooms require a body or structured mention of the authenticated account. Direct-room metadata exempts direct rooms. |
++| `reply_in_thread` | Default true; use top-level events as outbound thread anchors. Existing thread roots retain their identity even when this setting is false. |
+ 
+-Unsupported events are ignored rather than delivered with incomplete content.
++Operational calls resolve current public config and secrets, then authenticate before delivery or sending. Same-account token rotation takes effect on the next call. Only an authenticated public self identity, its homeserver provenance, transaction sequence, retry state, sync cursor, bounded server-owned room metadata and pending event metadata survive calls. No credential or live policy snapshot is retained. Unreadable config or secrets blocks delivery. Changing homeserver or authenticated account discards the cursor, pending messages and room metadata and requires fresh configuration, even if the previous binding is restored.
+ 
+-## Configuration
++## Text and lifecycle
++
++- Startup establishes a volatile `/sync` cursor and learns bounded room metadata without replaying backlog. A limited startup timeline is allowed because its backlog is deliberately suppressed. Subsequent polls deliver new unencrypted `m.text` events in joined rooms. Restarting loses the cursor and suppresses the new startup backlog; this is not durable replay.
++- Server-owned `m.direct` membership and summary member counts survive sync responses that omit them. Each `m.direct` event replaces the previous direct-room set, including an empty replacement. Summary count fields update when present; an omitted field leaves the prior count unchanged. A leave clears that room's metadata and pending messages. These are account/homeserver-bound protocol facts, not cached configuration policy.
++- Current room policy excludes disallowed rooms before queue counting. Pending events retain room, direct-room and mention provenance. Current room, mention and reply policy also applies when they leave the queue. Self echoes, encrypted events, media and edits are ignored.
++- Thread replies preserve their genuine root as `interruption_scope_id`. A top-level event used as a new outbound reply anchor has no interruption scope.
++- Authentication failure never falls back to a configured identity. Poll failures emit scrubbed structured logs and make health unhealthy until a successful sync. A successful whoami health probe alone does not clear a poll failure. Initial health is unhealthy until the first successful sync.
++- Polling retries at most once per call, with exponential delay from one to thirty seconds. Batch admission commits the cursor, queue and room metadata together. Queue or metadata overflow, malformed timeline structure, and a limited incremental timeline in a currently allowed room reject the batch without advancing any of those states or clearing sync failure. If a timeline is present, it must be an object with an events array and any `limited` field must be boolean. Sustained overflow or a timeline gap requires operator attention; the plugin does not fetch history or silently skip missing events.
++
++## Deliberately unencrypted rooms only
++
++Every send resolves a room alias first, if present, then performs a fresh authenticated GET of that resolved room's `m.room.encryption` state immediately before the text PUT. Any existing encryption event is refused, including empty content or an unknown algorithm. Only `404` with valid JSON `errcode = "M_NOT_FOUND"` from that exact endpoint establishes absence. Generic 404, malformed responses, authentication or access denial, redirect, network refusal and deadline failure stop before any send PUT. Unencrypted-room permission is never cached.
++
++This preflight is **not atomic**. Encryption may be enabled between the state GET and the send PUT. Use the plugin only in intentionally unencrypted rooms whose operators accept that race. Use native Matrix for encrypted messaging. A send transport failure can leave delivery uncertain; the plugin does not automatically retry sends.
++
++## Bounds and validation
++
++Send and poll share an aggregate HTTP deadline of 25 seconds per call across authentication, alias resolution, state lookup, send and response handling. Configure and health use seven seconds, within the host doctor's ten-second limit. WASI requests also carry two-second connect, three-second first-byte and one-second between-byte limits. Timer pollables bound nonblocking request writes and response reads. Total transferred body bytes are capped at 1 MiB per call; sync responses at 512 KiB; identity, alias, state and send responses at 16 KiB each. The queue holds at most 64 events and each text/send body is at most 64 KiB. Retained room metadata covers at most 256 distinct room IDs across direct membership and member counts; overflow fails closed. Errors contain only local classes or numeric HTTP status, never bodies, content, credentials or URLs.
++
++Typing, reactions, approvals, media, progressive drafts, password login, E2EE and durable cursors are not implemented. Their capability flags remain unset and their required exports use the WIT defaults.
+ 
+-```toml
+-[channels.matrix.default]
+-enabled = true
+-homeserver = "https://matrix.example.org"
+-access_token = "<encrypted secret>"
+-user_id = "@zeroclaw:example.org"
+-allowed_rooms = ["!room:example.org"]
+-mention_only = false
+-reply_in_thread = true
+-```
+-
+-`user_id` is optional because the plugin resolves it with `/account/whoami`.
+-
+-## Validation
+-
+-```bash
+-cargo fmt --check
+-cargo test --lib
+-cargo clippy --all-targets -- -D warnings
+-cargo build --target wasm32-wasip2 --release
+-cargo clippy --target wasm32-wasip2 -- -D warnings
+-```
++Focused host tests cover parsing, current-policy admission and delivery, retained protocol metadata, atomic batch refusal, lifecycle invalidation, thread isolation, backlog suppression and encryption refusal decisions. WASM-target lint and a release build check the component bindings and transport code. Real-host admission, deadline behavior, token rotation, zero-PUT refusal and disposable Synapse delivery require separate integration proof. Local pure tests and compilation cannot establish those integration boundaries. Repository CI commands and immutable-component rules are defined in `docs/ci.md`; do not install a new Rust target implicitly.
+diff --git a/plugins/matrix/manifest.toml b/plugins/matrix/manifest.toml
+index e8b271d..317987e 100644
+--- a/plugins/matrix/manifest.toml
++++ b/plugins/matrix/manifest.toml
+@@ -1,14 +1,50 @@
+ name = "matrix"
+-version = "0.2.0"
++version = "0.3.0"
+ description = "Matrix channel plugin for ZeroClaw: Client-Server sync + text send over wasi:http."
+ author = "JordanTheJet"
+ wasm_path = "matrix.wasm"
+ capabilities = ["channel"]
+-sender_match = "case_insensitive"
++registry = false
++sender_match = "exact"
+ # http_client: Matrix Client-Server API sync, whoami, room alias resolution,
+ # and text sends. TLS is performed host-side.
+-# config_read: read [channels.matrix.*] when loaded as a mirror plugin.
++# config_read: current typed public config and scoped access_token secret.
+ permissions = ["http_client", "config_read"]
+-# provides: mirror the built-in `matrix` channel — read the existing
+-# channel config as the single source of truth and honor native-wins.
++# Explicit plugin instances only; native Matrix is not replaced.
+ provides = "matrix"
++
++[config_schema]
++"$schema" = "https://json-schema.org/draft/2020-12/schema"
++type = "object"
++additionalProperties = false
++required = ["homeserver", "access_token"]
++
++[config_schema.properties.homeserver]
++type = "string"
++minLength = 1
++maxLength = 2048
++pattern = '^https?://[^\s?#@]+$'
++
++[config_schema.properties.access_token]
++type = "string"
++minLength = 1
++maxLength = 8192
++x-secret = true
++
++# Optional assertion checked against authenticated whoami, never a fallback.
++[config_schema.properties.user_id]
++type = "string"
++minLength = 1
++maxLength = 255
++pattern = '^@[^\s:]+:[^\s]+$'
++
++[config_schema.properties.allowed_rooms]
++type = "array"
++maxItems = 256
++items = { type = "string", minLength = 1, maxLength = 255, pattern = '^![^\s:]+:[^\s]+$' }
++
++[config_schema.properties.mention_only]
++type = "boolean"
++
++[config_schema.properties.reply_in_thread]
++type = "boolean"
+diff --git a/plugins/matrix/src/lib.rs b/plugins/matrix/src/lib.rs
+index ed4fca0..339b2ac 100644
+--- a/plugins/matrix/src/lib.rs
++++ b/plugins/matrix/src/lib.rs
+@@ -1,257 +1,486 @@
+-//! A ZeroClaw WIT channel plugin for Matrix.
+-//!
+-//! It uses the Matrix Client-Server API through host-provided `wasi:http`: an
+-//! initial `/sync` establishes a cursor without replaying backlog, subsequent
+-//! polls emit new unencrypted text events, and replies use `m.room.message`.
+-
++//! Matrix text-only component. Policy and credentials are resolved per call.
+ pub mod matrix;
+ 
+ #[cfg(target_family = "wasm")]
+ mod component {
+     wit_bindgen::generate!({
+-        path: "../../wit/unstable",
++        path: "../../wit/next",
+         world: "channel-plugin",
+         features: ["plugins-wit-v0"],
+     });
+ 
+-    use std::cell::{Cell, RefCell};
+-    use std::collections::VecDeque;
+-    use std::time::{SystemTime, UNIX_EPOCH};
+-
+-    use serde_json::Value;
+-
+-    use crate::matrix::{
+-        build_send_body, parse_room_id, parse_sync, parse_whoami, room_alias_url, send_url,
+-        sync_url, whoami_url, Inbound, MatrixConfig, CHANNEL,
+-    };
++    use crate::matrix::{self, Inbound, MatrixConfig, Session, CHANNEL, MAX_BODY, MAX_TEXT};
+     use exports::zeroclaw::plugin::channel::{
+         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
+-        SendMessage, WebhookRejection,
++        SendMessage, WebhookRejection, WebhookRequest, WebhookResponse,
+     };
+     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
++    use serde_json::Value;
++    use std::cell::RefCell;
++    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++    use zeroclaw::plugin::logging::{self, LogLevel, PluginAction, PluginEvent, PluginOutcome};
++    use zeroclaw::plugin::{config, secrets};
+ 
+-    const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+-
+-    fn initial_transaction_id() -> u64 {
+-        SystemTime::now()
+-            .duration_since(UNIX_EPOCH)
+-            .map(|duration| duration.as_nanos() as u64)
+-            .unwrap_or(1)
++    struct Runtime {
++        session: Session,
++        transaction: u64,
++        retry_at: Option<Instant>,
++        retry_secs: u64,
+     }
+-
+     thread_local! {
+-        static CONFIG: RefCell<MatrixConfig> = RefCell::new(MatrixConfig::default());
+-        static SINCE: RefCell<Option<String>> = const { RefCell::new(None) };
+-        static BUFFER: RefCell<VecDeque<Inbound>> = const { RefCell::new(VecDeque::new()) };
+-        static SELF_USER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+-        static TRANSACTION_ID: Cell<u64> = const { Cell::new(1) };
++        static INSTANCE: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+     }
+-
+-    fn error_detail(resp: waki::Response) -> String {
+-        resp.body()
+-            .ok()
+-            .and_then(|body| String::from_utf8(body).ok())
+-            .unwrap_or_default()
++    fn with_state<T>(f: impl FnOnce(&mut Runtime) -> T) -> Result<T, String> {
++        INSTANCE
++            .with(|cell| cell.borrow_mut().as_mut().map(f))
++            .ok_or_else(|| "matrix: fresh configure required".into())
+     }
+ 
+-    fn get_json(url: &str, token: &str) -> Result<Value, String> {
+-        let resp = waki::Client::new()
+-            .get(url)
+-            .header("Authorization", format!("Bearer {token}"))
+-            .header("Accept", "application/json")
+-            .send()
+-            .map_err(|error| format!("matrix GET failed: {error}"))?;
+-        let status = resp.status_code();
+-        if !(200..300).contains(&status) {
+-            return Err(format!(
+-                "matrix GET {url} failed ({status}): {}",
+-                error_detail(resp)
+-            ));
+-        }
+-        resp.json::<Value>()
+-            .map_err(|error| format!("matrix response JSON failed: {error}"))
+-    }
++    // Adapted locally from Discord's wasi:http shim. Nonblocking streams and
++    // timer pollables enforce one aggregate deadline, including body writes.
++    mod http {
++        use crate::matrix::split_http_url;
++        use std::time::{Duration, Instant};
++        use wasip2::clocks::monotonic_clock;
++        use wasip2::http::{
++            outgoing_handler,
++            types::{
++                Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
++            },
++        };
++        use wasip2::io::{
++            poll::{self, Pollable},
++            streams::StreamError,
++        };
+ 
+-    fn put_json(url: &str, token: &str, body: &Value) -> Result<Value, String> {
+-        let resp = waki::Client::new()
+-            .put(url)
+-            .header("Authorization", format!("Bearer {token}"))
+-            .header("Accept", "application/json")
+-            .json(body)
+-            .send()
+-            .map_err(|error| format!("matrix PUT failed: {error}"))?;
+-        let status = resp.status_code();
+-        if !(200..300).contains(&status) {
+-            return Err(format!(
+-                "matrix PUT {url} failed ({status}): {}",
+-                error_detail(resp)
+-            ));
+-        }
+-        resp.json::<Value>()
+-            .map_err(|error| format!("matrix response JSON failed: {error}"))
+-    }
++        pub struct Budget {
++            deadline: Instant,
++            bytes_left: usize,
++        }
++        impl Budget {
++            pub fn new(seconds: u64) -> Self {
++                Self {
++                    deadline: Instant::now() + Duration::from_secs(seconds),
++                    bytes_left: 1024 * 1024,
++                }
++            }
++            fn remaining(&self) -> Result<Duration, String> {
++                self.deadline
++                    .checked_duration_since(Instant::now())
++                    .filter(|d| !d.is_zero())
++                    .ok_or_else(|| "matrix: HTTP deadline exceeded".into())
++            }
++            fn charge(&mut self, bytes: usize) -> Result<(), String> {
++                self.bytes_left = self
++                    .bytes_left
++                    .checked_sub(bytes)
++                    .ok_or("matrix: HTTP byte budget exceeded")?;
++                Ok(())
++            }
++            fn wait(&self, ready: &Pollable) -> Result<(), String> {
++                let nanos = u64::try_from(self.remaining()?.as_nanos()).unwrap_or(u64::MAX);
++                let timer = monotonic_clock::subscribe_duration(nanos);
++                let _ = poll::poll(&[ready, &timer]);
++                self.remaining().map(|_| ())
++            }
++        }
+ 
+-    fn fetch_self(cfg: &MatrixConfig) -> Option<String> {
+-        if !cfg.is_configured() {
+-            return cfg.user_id().map(str::to_string);
+-        }
+-        get_json(&whoami_url(cfg.homeserver()), cfg.access_token())
+-            .ok()
+-            .and_then(|value| parse_whoami(&value))
+-            .or_else(|| cfg.user_id().map(str::to_string))
++        pub fn request(
++            method: Method,
++            url: &str,
++            token: &str,
++            body: Option<&[u8]>,
++            max_body: usize,
++            budget: &mut Budget,
++        ) -> Result<(u16, Vec<u8>), String> {
++            budget.remaining()?;
++            let target = split_http_url(url).ok_or("matrix: invalid HTTP target")?;
++            let headers = Fields::from_list(&[
++                (
++                    "authorization".into(),
++                    format!("Bearer {token}").into_bytes(),
++                ),
++                ("accept".into(), b"application/json".to_vec()),
++                ("content-type".into(), b"application/json".to_vec()),
++            ])
++            .map_err(|_| "matrix: invalid HTTP headers")?;
++            let request = OutgoingRequest::new(headers);
++            let scheme = if target.https {
++                Scheme::Https
++            } else {
++                Scheme::Http
++            };
++            request
++                .set_method(&method)
++                .and_then(|()| request.set_scheme(Some(&scheme)))
++                .and_then(|()| request.set_authority(Some(target.authority)))
++                .and_then(|()| request.set_path_with_query(Some(target.path_with_query)))
++                .map_err(|()| "matrix: HTTP target refused")?;
++            let options = RequestOptions::new();
++            let timeout = |secs| {
++                u64::try_from(
++                    budget
++                        .remaining()
++                        .unwrap_or_default()
++                        .min(Duration::from_secs(secs))
++                        .as_nanos(),
++                )
++                .unwrap_or(u64::MAX)
++            };
++            options
++                .set_connect_timeout(Some(timeout(2)))
++                .map_err(|_| "matrix: HTTP timeout refused")?;
++            options
++                .set_first_byte_timeout(Some(timeout(3)))
++                .map_err(|_| "matrix: HTTP timeout refused")?;
++            options
++                .set_between_bytes_timeout(Some(timeout(1)))
++                .map_err(|_| "matrix: HTTP timeout refused")?;
++            let outgoing = request
++                .body()
++                .map_err(|()| "matrix: HTTP body unavailable")?;
++            let future = outgoing_handler::handle(request, Some(options))
++                .map_err(|_| "matrix: HTTP transport refused")?;
++            if let Some(bytes) = body {
++                budget.charge(bytes.len())?;
++                let stream = outgoing
++                    .write()
++                    .map_err(|()| "matrix: HTTP output unavailable")?;
++                let mut offset = 0;
++                while offset < bytes.len() {
++                    budget.remaining()?;
++                    let quota = stream
++                        .check_write()
++                        .map_err(|_| "matrix: HTTP write failed")?;
++                    let size = (bytes.len() - offset).min(4096).min(quota as usize);
++                    if size == 0 {
++                        budget.wait(&stream.subscribe())?;
++                        continue;
++                    }
++                    stream
++                        .write(&bytes[offset..offset + size])
++                        .map_err(|_| "matrix: HTTP write failed")?;
++                    offset += size;
++                }
++                stream.flush().map_err(|_| "matrix: HTTP flush failed")?;
++                loop {
++                    budget.remaining()?;
++                    if stream
++                        .check_write()
++                        .map_err(|_| "matrix: HTTP flush failed")?
++                        > 0
++                    {
++                        break;
++                    }
++                    budget.wait(&stream.subscribe())?;
++                }
++            }
++            OutgoingBody::finish(outgoing, None).map_err(|_| "matrix: HTTP finish failed")?;
++            let response = loop {
++                budget.remaining()?;
++                if let Some(result) = future.get() {
++                    break result;
++                }
++                budget.wait(&future.subscribe())?;
++            }
++            .map_err(|()| "matrix: HTTP response already taken")?
++            .map_err(|_| "matrix: HTTP transport failed")?;
++            let status = response.status();
++            let incoming = response
++                .consume()
++                .map_err(|()| "matrix: HTTP response unavailable")?;
++            let stream = incoming
++                .stream()
++                .map_err(|()| "matrix: HTTP input unavailable")?;
++            let mut bytes = Vec::new();
++            loop {
++                budget.remaining()?;
++                match stream.read((max_body + 1 - bytes.len()).min(8192) as u64) {
++                    Ok(chunk) if chunk.is_empty() => budget.wait(&stream.subscribe())?,
++                    Ok(chunk) => {
++                        budget.charge(chunk.len())?;
++                        bytes.extend_from_slice(&chunk);
++                        if bytes.len() > max_body {
++                            return Err("matrix: HTTP response too large".into());
++                        }
++                    }
++                    Err(StreamError::Closed) => break,
++                    Err(_) => return Err("matrix: HTTP response incomplete".into()),
++                }
++            }
++            // Child stream must be dropped before its parent body.
++            drop(stream);
++            let completion = IncomingBody::finish(incoming);
++            loop {
++                budget.remaining()?;
++                if let Some(result) = completion.get() {
++                    let trailers = result
++                        .map_err(|()| "matrix: HTTP completion already taken")?
++                        .map_err(|_| "matrix: HTTP response incomplete")?;
++                    drop(trailers);
++                    break;
++                }
++                budget.wait(&completion.subscribe())?;
++            }
++            Ok((status, bytes))
++        }
+     }
++    use http::Budget;
++    use wasip2::http::types::Method;
+ 
+-    fn resolve_recipient(cfg: &MatrixConfig, recipient: &str) -> Result<String, String> {
+-        let target = recipient.trim();
+-        if target.starts_with('!') {
+-            return Ok(target.to_string());
+-        }
+-        if !target.starts_with('#') {
+-            return Err(format!(
+-                "matrix: invalid recipient `{target}` (expected !room:id or #alias:id)"
+-            ));
+-        }
+-        let value = get_json(
+-            &room_alias_url(cfg.homeserver(), target),
+-            cfg.access_token(),
++    fn public_config() -> Result<MatrixConfig, String> {
++        MatrixConfig::from_public_json(&config::get().map_err(|_| "matrix: config unavailable")?)
++    }
++    fn token() -> Result<String, String> {
++        let token = secrets::get("access_token").map_err(|_| "matrix: access_token unavailable")?;
++        if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_control) {
++            return Err("matrix: invalid access_token".into());
++        }
++        Ok(token)
++    }
++    fn json_get(
++        url: &str,
++        token: &str,
++        max_body: usize,
++        budget: &mut Budget,
++    ) -> Result<Value, String> {
++        let (status, bytes) = http::request(Method::Get, url, token, None, max_body, budget)?;
++        if status != 200 {
++            return Err(format!("matrix: HTTP GET status {status}"));
++        }
++        serde_json::from_slice(&bytes).map_err(|_| "matrix: invalid response JSON".into())
++    }
++    fn identity(cfg: &MatrixConfig, token: &str, budget: &mut Budget) -> Result<String, String> {
++        let value = json_get(
++            &matrix::whoami_url(cfg.homeserver()),
++            token,
++            16 * 1024,
++            budget,
+         )?;
+-        parse_room_id(&value).ok_or_else(|| format!("matrix: alias `{target}` did not resolve"))
++        matrix::parse_whoami(&value).ok_or_else(|| "matrix: invalid authenticated identity".into())
++    }
++    fn current() -> Result<(MatrixConfig, String), String> {
++        let cfg = public_config()?;
++        with_state(|state| {
++            let id = state.session.self_id.clone();
++            state.session.check_binding(&cfg, &id)
++        })??;
++        Ok((cfg, token()?))
++    }
++    fn authenticate(cfg: &MatrixConfig, token: &str, budget: &mut Budget) -> Result<(), String> {
++        let id = identity(cfg, token, budget)?;
++        with_state(|state| state.session.check_binding(cfg, &id))?
++    }
++    fn report_failure(function: &str, error: &str) {
++        // All callers supply closed local classes or numeric HTTP statuses.
++        logging::log_record(
++            LogLevel::Warn,
++            &PluginEvent {
++                function_name: format!("matrix::{function}"),
++                action: PluginAction::Fail,
++                outcome: Some(PluginOutcome::Failure),
++                duration_ms: None,
++                attrs: None,
++                message: error.to_string(),
++            },
++        );
+     }
+-
+     fn to_wit(message: Inbound) -> InboundMessage {
+         InboundMessage {
+             id: message.id,
+             sender: message.sender,
+             reply_target: message.reply_target,
+             content: message.content,
+-            channel: CHANNEL.to_string(),
++            channel: CHANNEL.into(),
+             channel_alias: None,
+             timestamp: message.timestamp,
+             thread_ts: message.thread_ts,
+-            interruption_scope_id: None,
++            interruption_scope_id: message.interruption_scope_id,
+             attachments: Vec::new(),
+             subject: None,
+         }
+     }
++    fn poll() -> Result<Option<InboundMessage>, String> {
++        let mut budget = Budget::new(25);
++        let (cfg, token) = current()?;
++        if with_state(|state| state.retry_at.is_some_and(|at| Instant::now() < at))? {
++            return Ok(None);
++        }
++        authenticate(&cfg, &token, &mut budget)?;
++        if let Some(message) = with_state(|state| state.session.next(&cfg))? {
++            return Ok(Some(to_wit(message)));
++        }
++        let since = with_state(|state| state.session.since.clone())?;
++        let value = json_get(
++            &matrix::sync_url(cfg.homeserver(), since.as_deref()),
++            &token,
++            MAX_BODY,
++            &mut budget,
++        )?;
++        with_state(|state| {
++            state.session.ingest(&value, &cfg)?;
++            state.retry_at = None;
++            state.retry_secs = 1;
++            Ok(state.session.next(&cfg).map(to_wit))
++        })?
++    }
+ 
+     struct MatrixChannel;
+-
+     impl PluginInfo for MatrixChannel {
+         fn plugin_name() -> String {
+-            CHANNEL.to_string()
++            CHANNEL.into()
+         }
+-
+         fn plugin_version() -> String {
+-            PLUGIN_VERSION.to_string()
++            env!("CARGO_PKG_VERSION").into()
+         }
+     }
+-
+     impl Channel for MatrixChannel {
+         fn name() -> String {
+-            CHANNEL.to_string()
+-        }
+-
+-        fn configure(config: String) -> Result<(), String> {
+-            let cfg = MatrixConfig::from_json(&config);
+-            let self_user_id = fetch_self(&cfg);
+-            CONFIG.with(|state| *state.borrow_mut() = cfg);
+-            SELF_USER_ID.with(|state| *state.borrow_mut() = self_user_id);
+-            SINCE.with(|state| *state.borrow_mut() = None);
+-            BUFFER.with(|state| state.borrow_mut().clear());
+-            TRANSACTION_ID.with(|state| state.set(initial_transaction_id()));
++            CHANNEL.into()
++        }
++        fn configure() -> Result<(), String> {
++            INSTANCE.with(|cell| *cell.borrow_mut() = None);
++            let mut budget = Budget::new(7);
++            let cfg = public_config()?;
++            let id = identity(&cfg, &token()?, &mut budget)?;
++            let mut session = Session::new(&cfg, id.clone());
++            session.check_binding(&cfg, &id)?;
++            let transaction = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map(|d| d.as_nanos() as u64)
++                .unwrap_or(1);
++            INSTANCE.with(|cell| {
++                *cell.borrow_mut() = Some(Runtime {
++                    session,
++                    transaction,
++                    retry_at: None,
++                    retry_secs: 1,
++                })
++            });
+             Ok(())
+         }
+-
+         fn send(message: SendMessage) -> Result<(), String> {
++            let mut budget = Budget::new(25);
+             if !message.attachments.is_empty() {
+-                return Err(
+-                    "matrix: media attachments are not supported by this plugin yet".into(),
+-                );
++                return Err("matrix: attachments unsupported".into());
+             }
+-            let cfg = CONFIG.with(|state| state.borrow().clone());
+-            if !cfg.is_configured() {
+-                return Err("matrix: homeserver and access_token are required".into());
++            if message.content.len() > MAX_TEXT {
++                return Err("matrix: message too large".into());
+             }
+-            let room_id = resolve_recipient(&cfg, &message.recipient)?;
+-            let transaction_id = TRANSACTION_ID.with(|state| {
+-                let current = state.get();
+-                state.set(current.wrapping_add(1));
+-                current
+-            });
+-            let body = build_send_body(
++            let (cfg, token) = current()?;
++            authenticate(&cfg, &token, &mut budget)?;
++            let room = if matrix::matrix_id(&message.recipient, '!') {
++                message.recipient
++            } else if matrix::matrix_id(&message.recipient, '#') {
++                let value = json_get(
++                    &matrix::room_alias_url(cfg.homeserver(), &message.recipient),
++                    &token,
++                    16 * 1024,
++                    &mut budget,
++                )?;
++                matrix::parse_room_id(&value).ok_or("matrix: invalid alias resolution")?
++            } else {
++                return Err("matrix: invalid recipient".into());
++            };
++            let body = matrix::build_send_body(
+                 &message.content,
+                 message.thread_ts.as_deref(),
+                 cfg.reply_in_thread,
+-            );
+-            put_json(
+-                &send_url(cfg.homeserver(), &room_id, transaction_id),
+-                cfg.access_token(),
+-                &body,
++            )
++            .to_string();
++            if body.len() > MAX_TEXT {
++                return Err("matrix: send body too large".into());
++            }
++            let transaction = with_state(|state| {
++                let id = state.transaction;
++                state.transaction = id.wrapping_add(1);
++                id
++            })?;
++            // No cached room permission. The GET and PUT are necessarily non-atomic.
++            let (status, bytes) = http::request(
++                Method::Get,
++                &matrix::encryption_url(cfg.homeserver(), &room),
++                &token,
++                None,
++                16 * 1024,
++                &mut budget,
+             )?;
++            matrix::require_unencrypted(status, &bytes)?;
++            let (status, _) = http::request(
++                Method::Put,
++                &matrix::send_url(cfg.homeserver(), &room, transaction),
++                &token,
++                Some(body.as_bytes()),
++                16 * 1024,
++                &mut budget,
++            )?;
++            if status != 200 {
++                return Err(format!("matrix: HTTP PUT status {status}"));
++            }
+             Ok(())
+         }
+-
+         fn poll_message() -> Option<InboundMessage> {
+-            if let Some(message) = BUFFER.with(|state| state.borrow_mut().pop_front()) {
+-                return Some(to_wit(message));
+-            }
+-            let cfg = CONFIG.with(|state| state.borrow().clone());
+-            if !cfg.is_configured() {
+-                return None;
++            match poll() {
++                Ok(message) => message,
++                Err(error) => {
++                    let report = with_state(|state| {
++                        state.session.sync_failed = true;
++                        if state.retry_at.is_some_and(|at| Instant::now() < at) {
++                            return false;
++                        }
++                        state.retry_at =
++                            Some(Instant::now() + Duration::from_secs(state.retry_secs));
++                        state.retry_secs = (state.retry_secs * 2).min(30);
++                        true
++                    })
++                    .unwrap_or(true);
++                    if report {
++                        report_failure("poll", &error);
++                    }
++                    None
++                }
+             }
+-            let prior_since = SINCE.with(|state| state.borrow().clone());
+-            let value = get_json(
+-                &sync_url(cfg.homeserver(), prior_since.as_deref()),
+-                cfg.access_token(),
+-            )
+-            .ok()?;
+-            let self_user_id = SELF_USER_ID
+-                .with(|state| state.borrow().clone())
+-                .unwrap_or_default();
+-            let batch = parse_sync(&value, &cfg, &self_user_id);
+-            if batch.next_batch.is_empty() {
+-                return None;
+-            }
+-            SINCE.with(|state| *state.borrow_mut() = Some(batch.next_batch));
+-            prior_since.as_ref()?;
+-            BUFFER.with(|state| state.borrow_mut().extend(batch.messages));
+-            BUFFER
+-                .with(|state| state.borrow_mut().pop_front())
+-                .map(to_wit)
+         }
+-
+         fn get_channel_capabilities() -> ChannelCapabilities {
+             ChannelCapabilities::HEALTH_CHECK
+                 | ChannelCapabilities::SELF_HANDLE
+                 | ChannelCapabilities::SELF_ADDRESSED_MENTION
+         }
+-
+         fn health_check() -> bool {
+-            let cfg = CONFIG.with(|state| state.borrow().clone());
+-            cfg.is_configured() && fetch_self(&cfg).is_some()
++            let result = (|| {
++                let mut budget = Budget::new(7);
++                let (cfg, token) = current()?;
++                authenticate(&cfg, &token, &mut budget)?;
++                with_state(|state| state.session.healthy())
++            })();
++            match result {
++                Ok(healthy) => healthy,
++                Err(error) => {
++                    report_failure("health", &error);
++                    false
++                }
++            }
+         }
+-
++        // Static host metadata is read outside config/secrets service frames.
+         fn self_handle() -> Option<String> {
+-            SELF_USER_ID.with(|state| state.borrow().clone())
++            with_state(|s| s.session.self_id.clone()).ok()
+         }
+-
+         fn self_addressed_mention() -> Option<String> {
+-            SELF_USER_ID.with(|state| state.borrow().clone())
++            Self::self_handle()
+         }
+-
+-        fn drop_self_message(_msg: InboundMessage) -> bool {
++        fn drop_self_message(_message: InboundMessage) -> bool {
+             false
+         }
+-        fn start_typing(_recipient: String) -> Result<(), String> {
++        fn start_typing(_r: String) -> Result<(), String> {
+             Ok(())
+         }
+-        fn stop_typing(_recipient: String) -> Result<(), String> {
++        fn stop_typing(_r: String) -> Result<(), String> {
+             Ok(())
+         }
+         fn supports_draft_updates() -> bool {
+             false
+         }
+-        fn send_draft(_message: SendMessage) -> Result<Option<String>, String> {
++        fn send_draft(_m: SendMessage) -> Result<Option<String>, String> {
+             Ok(None)
+         }
+         fn update_draft(_r: String, _m: String, _t: String) -> Result<(), String> {
+@@ -284,20 +513,16 @@ mod component {
+         fn unpin_message(_c: String, _m: String) -> Result<(), String> {
+             Ok(())
+         }
+-        fn redact_message(_c: String, _m: String, _reason: Option<String>) -> Result<(), String> {
++        fn redact_message(_c: String, _m: String, _r: Option<String>) -> Result<(), String> {
+             Ok(())
+         }
+         fn request_approval(
+-            _recipient: String,
+-            _request: ApprovalRequest,
++            _r: String,
++            _a: ApprovalRequest,
+         ) -> Result<Option<ApprovalResponse>, String> {
+             Ok(None)
+         }
+-        fn request_choice(
+-            _question: String,
+-            _choices: Vec<String>,
+-            _timeout_secs: u64,
+-        ) -> Result<Option<String>, String> {
++        fn request_choice(_q: String, _c: Vec<String>, _t: u64) -> Result<Option<String>, String> {
+             Ok(None)
+         }
+         fn supports_free_form_ask() -> bool {
+@@ -306,15 +531,11 @@ mod component {
+         fn webhook_path() -> Option<String> {
+             None
+         }
+-        fn parse_webhook(
+-            _headers: Vec<(String, String)>,
+-            _body: Vec<u8>,
+-        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
++        fn parse_webhook(_request: WebhookRequest) -> Result<WebhookResponse, WebhookRejection> {
+             Err(WebhookRejection::BadRequest(
+-                "matrix does not serve webhooks".to_string(),
++                "matrix does not serve webhooks".into(),
+             ))
+         }
+     }
+-
+     export!(MatrixChannel);
+ }
+diff --git a/plugins/matrix/src/matrix.rs b/plugins/matrix/src/matrix.rs
+index 72b6005..e27e3a9 100644
+--- a/plugins/matrix/src/matrix.rs
++++ b/plugins/matrix/src/matrix.rs
+@@ -1,27 +1,26 @@
+-//! Pure Matrix Client-Server API logic: configuration, URLs, payloads, and
+-//! `/sync` event mapping. Network I/O stays in the WASM component shim.
++//! Pure Matrix protocol parsing and volatile session decisions. No credentials.
+ 
+ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+ use serde::Deserialize;
+ use serde_json::{json, Value};
+-use std::collections::HashSet;
++use std::collections::{HashMap, VecDeque};
+ 
+ pub const CHANNEL: &str = "matrix";
+-const CLIENT_V3: &str = "_matrix/client/v3";
++pub const MAX_BODY: usize = 512 * 1024;
++pub const MAX_PENDING: usize = 64;
++pub const MAX_ROOM_METADATA: usize = 256;
++pub const MAX_TEXT: usize = 64 * 1024;
++const MAX_ID: usize = 255;
+ 
+ fn default_reply_in_thread() -> bool {
+     true
+ }
+ 
+-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
++#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
+ pub struct MatrixConfig {
+-    #[serde(default)]
+-    pub enabled: bool,
+-    #[serde(default)]
+     pub homeserver: String,
+     #[serde(default)]
+-    pub access_token: Option<String>,
+-    #[serde(default)]
+     pub user_id: Option<String>,
+     #[serde(default)]
+     pub allowed_rooms: Vec<String>,
+@@ -32,402 +31,460 @@ pub struct MatrixConfig {
+ }
+ 
+ impl MatrixConfig {
+-    pub fn from_json(input: &str) -> Self {
+-        serde_json::from_str(input).unwrap_or_default()
++    pub fn from_public_json(input: &str) -> Result<Self, String> {
++        if input.len() > MAX_TEXT {
++            return Err("matrix: public config too large".into());
++        }
++        let cfg: Self = serde_json::from_str(input).map_err(|_| "matrix: invalid public config")?;
++        if cfg.homeserver.len() > 2048
++            || split_http_url(&cfg.homeserver).is_none()
++            || cfg.homeserver.contains(['?', '#'])
++            || cfg.user_id.as_deref().is_some_and(|id| !matrix_id(id, '@'))
++            || cfg.allowed_rooms.len() > 256
++            || cfg.allowed_rooms.iter().any(|id| !matrix_id(id, '!'))
++        {
++            return Err("matrix: invalid public config".into());
++        }
++        Ok(cfg)
+     }
+-
+     pub fn homeserver(&self) -> &str {
+         self.homeserver.trim_end_matches('/')
+     }
+-
+-    pub fn access_token(&self) -> &str {
+-        self.access_token.as_deref().unwrap_or("").trim()
+-    }
+-
+-    pub fn user_id(&self) -> Option<&str> {
+-        self.user_id
+-            .as_deref()
+-            .map(str::trim)
+-            .filter(|value| !value.is_empty())
++    fn room_allowed(&self, room: &str) -> bool {
++        self.allowed_rooms.is_empty() || self.allowed_rooms.iter().any(|id| id == room)
+     }
++}
+ 
+-    pub fn is_configured(&self) -> bool {
+-        !self.homeserver().is_empty() && !self.access_token().is_empty()
+-    }
++pub struct HttpTarget<'a> {
++    pub https: bool,
++    pub authority: &'a str,
++    pub path_with_query: &'a str,
++}
+ 
+-    fn room_allowed(&self, room_id: &str) -> bool {
+-        self.allowed_rooms.is_empty()
+-            || self
+-                .allowed_rooms
+-                .iter()
+-                .any(|allowed| allowed.trim() == room_id)
++pub fn split_http_url(url: &str) -> Option<HttpTarget<'_>> {
++    let (https, rest) = if let Some(rest) = url.strip_prefix("https://") {
++        (true, rest)
++    } else {
++        (false, url.strip_prefix("http://")?)
++    };
++    let boundary = rest.find('/').unwrap_or(rest.len());
++    let authority = &rest[..boundary];
++    if authority.is_empty()
++        || authority.contains(['@', '?', '#', '\\'])
++        || url.chars().any(|c| c.is_whitespace() || c.is_control())
++        || url.contains(['#', '\\'])
++    {
++        return None;
+     }
++    Some(HttpTarget {
++        https,
++        authority,
++        path_with_query: if boundary == rest.len() {
++            "/"
++        } else {
++            &rest[boundary..]
++        },
++    })
+ }
+ 
+-#[derive(Clone, Debug, PartialEq, Eq)]
+-pub struct Inbound {
+-    pub id: String,
+-    pub sender: String,
+-    pub reply_target: String,
+-    pub content: String,
+-    pub timestamp: u64,
+-    pub thread_ts: Option<String>,
++pub fn matrix_id(id: &str, prefix: char) -> bool {
++    id.len() <= MAX_ID
++        && id.starts_with(prefix)
++        && id[1..]
++            .split_once(':')
++            .is_some_and(|(local, server)| !local.is_empty() && !server.is_empty())
++        && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+ }
+-
+-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+-pub struct SyncBatch {
+-    pub next_batch: String,
+-    pub messages: Vec<Inbound>,
++fn event_id(id: &str) -> bool {
++    id.starts_with('$')
++        && id.len() > 1
++        && id.len() <= MAX_ID
++        && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+ }
+-
+ fn encode(value: &str) -> String {
+     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+ }
+-
+ fn api_url(homeserver: &str, path: &str) -> String {
+     format!(
+-        "{}/{}/{}",
+-        homeserver.trim_end_matches('/'),
+-        CLIENT_V3,
+-        path.trim_start_matches('/')
++        "{}/_matrix/client/v3/{path}",
++        homeserver.trim_end_matches('/')
+     )
+ }
+-
+ pub fn whoami_url(homeserver: &str) -> String {
+     api_url(homeserver, "account/whoami")
+ }
+-
+ pub fn sync_url(homeserver: &str, since: Option<&str>) -> String {
+     let base = api_url(homeserver, "sync?timeout=0");
+-    match since.filter(|value| !value.is_empty()) {
++    match since {
+         Some(cursor) => format!("{base}&since={}", encode(cursor)),
+         None => base,
+     }
+ }
+-
+ pub fn room_alias_url(homeserver: &str, alias: &str) -> String {
+     api_url(homeserver, &format!("directory/room/{}", encode(alias)))
+ }
+-
+-pub fn send_url(homeserver: &str, room_id: &str, transaction_id: u64) -> String {
++pub fn encryption_url(homeserver: &str, room: &str) -> String {
+     api_url(
+         homeserver,
+-        &format!(
+-            "rooms/{}/send/m.room.message/{transaction_id}",
+-            encode(room_id)
+-        ),
++        &format!("rooms/{}/state/m.room.encryption/", encode(room)),
++    )
++}
++pub fn send_url(homeserver: &str, room: &str, transaction: u64) -> String {
++    api_url(
++        homeserver,
++        &format!("rooms/{}/send/m.room.message/{transaction}", encode(room)),
+     )
+ }
+-
+ pub fn parse_whoami(value: &Value) -> Option<String> {
+     value
+-        .get("user_id")
+-        .and_then(Value::as_str)
+-        .filter(|id| !id.is_empty())
++        .get("user_id")?
++        .as_str()
++        .filter(|id| matrix_id(id, '@'))
+         .map(str::to_string)
+ }
+-
+ pub fn parse_room_id(value: &Value) -> Option<String> {
+     value
+-        .get("room_id")
+-        .and_then(Value::as_str)
+-        .filter(|id| id.starts_with('!'))
++        .get("room_id")?
++        .as_str()
++        .filter(|id| matrix_id(id, '!'))
+         .map(str::to_string)
+ }
+ 
++/// Only an authenticated response from the exact encryption-state endpoint qualifies.
++pub fn require_unencrypted(status: u16, body: &[u8]) -> Result<(), String> {
++    if status == 404
++        && serde_json::from_slice::<Value>(body)
++            .ok()
++            .is_some_and(|value| {
++                value.get("errcode").and_then(Value::as_str) == Some("M_NOT_FOUND")
++            })
++    {
++        Ok(())
++    } else {
++        Err("matrix: encryption state present or uncertain; send refused".into())
++    }
++}
++
+ pub fn build_send_body(content: &str, thread_ts: Option<&str>, reply_in_thread: bool) -> Value {
+-    let mut body = json!({
+-        "msgtype": "m.text",
+-        "body": content,
+-    });
+-    if reply_in_thread {
+-        if let Some(anchor) = thread_ts.filter(|value| !value.is_empty()) {
+-            body["m.relates_to"] = json!({
+-                "rel_type": "m.thread",
+-                "event_id": anchor,
+-                "is_falling_back": true,
+-                "m.in_reply_to": { "event_id": anchor },
+-            });
+-        }
++    let mut body = json!({"msgtype": "m.text", "body": content});
++    if let Some(anchor) = thread_ts.filter(|id| reply_in_thread && event_id(id)) {
++        body["m.relates_to"] = json!({"rel_type": "m.thread", "event_id": anchor,
++            "is_falling_back": true, "m.in_reply_to": {"event_id": anchor}});
+     }
+     body
+ }
+ 
+-fn room_is_direct(room: &Value) -> bool {
+-    room.pointer("/summary/m.joined_member_count")
+-        .and_then(Value::as_u64)
+-        .is_some_and(|count| count <= 2)
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Inbound {
++    pub id: String,
++    pub sender: String,
++    pub reply_target: String,
++    pub content: String,
++    pub timestamp: u64,
++    pub thread_ts: Option<String>,
++    pub interruption_scope_id: Option<String>,
+ }
+ 
+-fn direct_room_ids(value: &Value) -> HashSet<String> {
+-    let mut rooms = HashSet::new();
+-    let Some(events) = value
+-        .pointer("/account_data/events")
+-        .and_then(Value::as_array)
+-    else {
+-        return rooms;
+-    };
+-    for event in events {
+-        if event.get("type").and_then(Value::as_str) != Some("m.direct") {
+-            continue;
+-        }
+-        let Some(content) = event.get("content").and_then(Value::as_object) else {
+-            continue;
+-        };
+-        for room_ids in content.values().filter_map(Value::as_array) {
+-            rooms.extend(
+-                room_ids
+-                    .iter()
+-                    .filter_map(Value::as_str)
+-                    .map(str::to_string),
+-            );
++#[derive(Clone, Debug)]
++pub struct Pending {
++    message: Inbound,
++    direct: bool,
++    mentioned: bool,
++}
++impl Pending {
++    pub fn deliver(mut self, cfg: &MatrixConfig, self_id: &str) -> Option<Inbound> {
++        if self.message.sender == self_id
++            || !cfg.room_allowed(&self.message.reply_target)
++            || (cfg.mention_only && !self.direct && !self.mentioned)
++        {
++            return None;
+         }
++        self.message.thread_ts = self
++            .message
++            .interruption_scope_id
++            .clone()
++            .or_else(|| cfg.reply_in_thread.then(|| self.message.id.clone()));
++        Some(self.message)
+     }
+-    rooms
+ }
+ 
+-fn mentions_user(content: &Value, body: &str, user_id: &str) -> bool {
+-    body.contains(user_id)
+-        || content
+-            .pointer("/m.mentions/user_ids")
+-            .and_then(Value::as_array)
+-            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(user_id)))
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct RoomMetadata {
++    direct: bool,
++    joined_members: Option<u64>,
+ }
+ 
+-fn thread_anchor(content: &Value) -> Option<String> {
+-    let relation = content.get("m.relates_to")?;
+-    if relation.get("rel_type").and_then(Value::as_str) == Some("m.replace") {
+-        return None;
++struct SyncBatch {
++    cursor: String,
++    rooms: HashMap<String, RoomMetadata>,
++    pending: VecDeque<Pending>,
++}
++
++fn room_metadata<'a>(
++    rooms: &'a mut HashMap<String, RoomMetadata>,
++    id: &str,
++) -> Result<&'a mut RoomMetadata, String> {
++    if !rooms.contains_key(id) && rooms.len() >= MAX_ROOM_METADATA {
++        return Err("matrix: room metadata limit exceeded".into());
+     }
+-    (relation.get("rel_type").and_then(Value::as_str) == Some("m.thread"))
+-        .then(|| relation.get("event_id").and_then(Value::as_str))
+-        .flatten()
+-        .filter(|id| !id.is_empty())
+-        .map(str::to_string)
++    Ok(rooms.entry(id.to_string()).or_default())
+ }
+ 
+-fn parse_event(
+-    room_id: &str,
+-    event: &Value,
++fn parse_sync(
++    value: &Value,
+     cfg: &MatrixConfig,
+-    self_user_id: &str,
+-    is_direct: bool,
+-) -> Option<Inbound> {
+-    if event.get("type").and_then(Value::as_str) != Some("m.room.message") {
+-        return None;
+-    }
+-    let sender = event.get("sender").and_then(Value::as_str)?;
+-    if !self_user_id.is_empty() && sender == self_user_id {
+-        return None;
+-    }
+-    let content = event.get("content")?;
+-    if content.get("msgtype").and_then(Value::as_str) != Some("m.text") {
+-        return None;
+-    }
+-    if content
+-        .get("m.relates_to")
+-        .and_then(|relation| relation.get("rel_type"))
+-        .and_then(Value::as_str)
+-        == Some("m.replace")
++    self_id: &str,
++    mut metadata: HashMap<String, RoomMetadata>,
++    mut pending: VecDeque<Pending>,
++    startup: bool,
++) -> Result<SyncBatch, String> {
++    let cursor = parse_cursor(value)?;
++    if value.get("rooms").is_some_and(|v| !v.is_object())
++        || value.pointer("/rooms/join").is_some_and(|v| !v.is_object())
++        || value
++            .pointer("/rooms/leave")
++            .is_some_and(|v| !v.is_object())
++        || value.get("account_data").is_some_and(|v| !v.is_object())
++        || value
++            .pointer("/account_data/events")
++            .is_some_and(|v| !v.is_array())
+     {
+-        return None;
++        return Err("matrix: invalid sync structure".into());
+     }
+-    let body = content.get("body").and_then(Value::as_str)?.trim();
+-    if body.is_empty() {
+-        return None;
++    let departed = value.pointer("/rooms/leave").and_then(Value::as_object);
++    if let Some(rooms) = departed {
++        for (id, room) in rooms {
++            if !matrix_id(id, '!') || !room.is_object() {
++                return Err("matrix: invalid sync departure".into());
++            }
++            metadata.remove(id);
++        }
+     }
+-    if cfg.mention_only
+-        && !is_direct
+-        && (self_user_id.is_empty() || !mentions_user(content, body, self_user_id))
++    pending.retain(|event| {
++        cfg.room_allowed(&event.message.reply_target)
++            && !departed.is_some_and(|rooms| rooms.contains_key(&event.message.reply_target))
++    });
++    if let Some(events) = value
++        .pointer("/account_data/events")
++        .and_then(Value::as_array)
+     {
+-        return None;
++        for event in events.iter().filter(|event| event["type"] == "m.direct") {
++            let content = event["content"]
++                .as_object()
++                .ok_or("matrix: invalid direct-room metadata")?;
++            // m.direct is a replacement, not a delta; member counts are separate.
++            for room in metadata.values_mut() {
++                room.direct = false;
++            }
++            metadata.retain(|_, room| room.joined_members.is_some());
++            for rooms in content.values() {
++                for room in rooms
++                    .as_array()
++                    .ok_or("matrix: invalid direct-room metadata")?
++                {
++                    let id = room
++                        .as_str()
++                        .filter(|id| matrix_id(id, '!'))
++                        .ok_or("matrix: invalid direct-room metadata")?;
++                    if !departed.is_some_and(|rooms| rooms.contains_key(id)) {
++                        room_metadata(&mut metadata, id)?.direct = true;
++                    }
++                }
++            }
++        }
+     }
+-    let event_id = event
+-        .get("event_id")
+-        .and_then(Value::as_str)
+-        .filter(|id| !id.is_empty())?;
+-    let thread_ts =
+-        thread_anchor(content).or_else(|| cfg.reply_in_thread.then(|| event_id.to_string()));
+-    Some(Inbound {
+-        id: event_id.to_string(),
+-        sender: sender.to_string(),
+-        reply_target: room_id.to_string(),
+-        content: body.to_string(),
+-        timestamp: event
+-            .get("origin_server_ts")
+-            .and_then(Value::as_u64)
+-            .unwrap_or(0),
+-        thread_ts,
++    if let Some(rooms) = value.pointer("/rooms/join").and_then(Value::as_object) {
++        for (room_id, room) in rooms {
++            if !room.is_object() {
++                return Err("matrix: invalid sync room".into());
++            }
++            if !matrix_id(room_id, '!') {
++                return Err("matrix: invalid sync room id".into());
++            }
++            if departed.is_some_and(|rooms| rooms.contains_key(room_id)) {
++                return Err("matrix: conflicting sync membership".into());
++            }
++            if let Some(summary) = room.get("summary") {
++                let summary = summary.as_object().ok_or("matrix: invalid room summary")?;
++                if let Some(count) = summary.get("m.joined_member_count") {
++                    room_metadata(&mut metadata, room_id)?.joined_members =
++                        Some(count.as_u64().ok_or("matrix: invalid room member count")?);
++                }
++            }
++            if let Some(timeline) = room.get("timeline") {
++                let timeline = timeline
++                    .as_object()
++                    .ok_or("matrix: invalid sync timeline")?;
++                let events = timeline
++                    .get("events")
++                    .and_then(Value::as_array)
++                    .ok_or("matrix: invalid sync timeline")?;
++                let limited = match timeline.get("limited") {
++                    Some(value) => value
++                        .as_bool()
++                        .ok_or("matrix: invalid timeline limited flag")?,
++                    None => false,
++                };
++                if !cfg.room_allowed(room_id) {
++                    continue;
++                }
++                if !startup && limited {
++                    return Err("matrix: incremental timeline gap; sync refused".into());
++                }
++                if startup {
++                    continue;
++                }
++                let direct = metadata.get(room_id).is_some_and(|room| {
++                    room.direct || room.joined_members.is_some_and(|count| count <= 2)
++                });
++                for event in events {
++                    if let Some(message) = parse_event(room_id, event, self_id, direct) {
++                        if pending.len() == MAX_PENDING {
++                            return Err("matrix: sync queue limit exceeded".into());
++                        }
++                        pending.push_back(message);
++                    }
++                }
++            }
++        }
++    }
++    Ok(SyncBatch {
++        cursor,
++        rooms: metadata,
++        pending,
+     })
+ }
+ 
+-pub fn parse_sync(value: &Value, cfg: &MatrixConfig, self_user_id: &str) -> SyncBatch {
+-    let next_batch = value
++pub fn parse_cursor(value: &Value) -> Result<String, String> {
++    value
+         .get("next_batch")
+         .and_then(Value::as_str)
+-        .unwrap_or("")
+-        .to_string();
+-    let mut messages = Vec::new();
+-    let direct_rooms = direct_room_ids(value);
+-    let Some(rooms) = value.pointer("/rooms/join").and_then(Value::as_object) else {
+-        return SyncBatch {
+-            next_batch,
+-            messages,
+-        };
+-    };
+-    for (room_id, room) in rooms {
+-        if !cfg.room_allowed(room_id) {
+-            continue;
+-        }
+-        let Some(events) = room.pointer("/timeline/events").and_then(Value::as_array) else {
+-            continue;
+-        };
+-        messages.extend(events.iter().filter_map(|event| {
+-            parse_event(
+-                room_id,
+-                event,
+-                cfg,
+-                self_user_id,
+-                direct_rooms.contains(room_id) || room_is_direct(room),
+-            )
+-        }));
+-    }
+-    SyncBatch {
+-        next_batch,
+-        messages,
+-    }
++        .filter(|s| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control))
++        .map(str::to_string)
++        .ok_or_else(|| "matrix: invalid sync cursor".into())
+ }
+ 
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    fn cfg() -> MatrixConfig {
+-        MatrixConfig {
+-            enabled: true,
+-            homeserver: "https://matrix.example/base/".to_string(),
+-            access_token: Some(" token ".to_string()),
+-            user_id: Some("@bot:example".to_string()),
+-            allowed_rooms: Vec::new(),
+-            mention_only: false,
+-            reply_in_thread: true,
+-        }
++fn parse_event(room: &str, event: &Value, self_id: &str, direct: bool) -> Option<Pending> {
++    if event["type"] != "m.room.message" {
++        return None;
+     }
+-
+-    #[test]
+-    fn config_and_urls_use_native_keys() {
+-        let parsed = MatrixConfig::from_json(
+-            r#"{"enabled":true,"homeserver":"https://m.example/","access_token":"abc","user_id":"@bot:m","allowed_rooms":["!ok:m"],"mention_only":true}"#,
+-        );
+-        assert!(parsed.is_configured());
+-        assert_eq!(parsed.user_id(), Some("@bot:m"));
+-        assert_eq!(
+-            whoami_url(parsed.homeserver()),
+-            "https://m.example/_matrix/client/v3/account/whoami"
+-        );
+-        assert_eq!(
+-            sync_url("https://m.example", Some("s/1")),
+-            "https://m.example/_matrix/client/v3/sync?timeout=0&since=s%2F1"
+-        );
+-        assert!(send_url("https://m.example", "!room:m", 7).contains("rooms/%21room%3Am/send"));
++    let sender = event["sender"]
++        .as_str()
++        .filter(|id| matrix_id(id, '@') && *id != self_id)?;
++    let content = &event["content"];
++    if content["msgtype"] != "m.text" || content["m.relates_to"]["rel_type"] == "m.replace" {
++        return None;
+     }
+-
+-    #[test]
+-    fn send_body_threads_only_when_enabled() {
+-        let threaded = build_send_body("hello", Some("$root"), true);
+-        assert_eq!(threaded["m.relates_to"]["event_id"], "$root");
+-        assert_eq!(
+-            threaded["m.relates_to"]["m.in_reply_to"]["event_id"],
+-            "$root"
+-        );
+-        let plain = build_send_body("hello", Some("$root"), false);
+-        assert!(plain.get("m.relates_to").is_none());
++    let body = content["body"].as_str()?.trim();
++    if body.is_empty() || body.len() > MAX_TEXT {
++        return None;
+     }
++    let id = event["event_id"].as_str().filter(|id| event_id(id))?;
++    let root = if content["m.relates_to"]["rel_type"] == "m.thread" {
++        Some(
++            content["m.relates_to"]["event_id"]
++                .as_str()
++                .filter(|id| event_id(id))?
++                .to_string(),
++        )
++    } else {
++        None
++    };
++    let mentioned = body.contains(self_id)
++        || content
++            .pointer("/m.mentions/user_ids")
++            .and_then(Value::as_array)
++            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(self_id)));
++    Some(Pending {
++        direct,
++        mentioned,
++        message: Inbound {
++            id: id.to_string(),
++            sender: sender.to_string(),
++            reply_target: room.to_string(),
++            content: body.to_string(),
++            timestamp: event["origin_server_ts"].as_u64().unwrap_or(0),
++            thread_ts: None,
++            interruption_scope_id: root,
++        },
++    })
++}
+ 
+-    #[test]
+-    fn sync_maps_text_and_filters_self_non_text_and_disallowed_rooms() {
+-        let mut config = cfg();
+-        config.allowed_rooms = vec!["!ok:m".to_string()];
+-        let value = json!({
+-            "next_batch": "s2",
+-            "rooms": { "join": {
+-                "!ok:m": { "summary": { "m.joined_member_count": 3 }, "timeline": { "events": [
+-                    {"type":"m.room.message","event_id":"$1","sender":"@alice:m","origin_server_ts":12,"content":{"msgtype":"m.text","body":"hello"}},
+-                    {"type":"m.room.message","event_id":"$2","sender":"@bot:example","content":{"msgtype":"m.text","body":"self"}},
+-                    {"type":"m.room.message","event_id":"$3","sender":"@alice:m","content":{"msgtype":"m.image","body":"pic"}}
+-                ]}},
+-                "!blocked:m": { "timeline": { "events": [
+-                    {"type":"m.room.message","event_id":"$4","sender":"@alice:m","content":{"msgtype":"m.text","body":"blocked"}}
+-                ]}}
+-            }}
+-        });
+-        let batch = parse_sync(&value, &config, "@bot:example");
+-        assert_eq!(batch.next_batch, "s2");
+-        assert_eq!(batch.messages.len(), 1);
+-        assert_eq!(batch.messages[0].id, "$1");
+-        assert_eq!(batch.messages[0].reply_target, "!ok:m");
+-        assert_eq!(batch.messages[0].thread_ts.as_deref(), Some("$1"));
+-        assert_eq!(batch.messages[0].timestamp, 12);
++/// Only protocol provenance and authenticated public metadata survive a call.
++pub struct Session {
++    pub self_id: String,
++    homeserver: String,
++    invalidated: bool,
++    pub since: Option<String>,
++    pub pending: VecDeque<Pending>,
++    pub rooms: HashMap<String, RoomMetadata>,
++    pub sync_failed: bool,
++}
++impl Session {
++    pub fn new(cfg: &MatrixConfig, self_id: String) -> Self {
++        Self {
++            self_id,
++            homeserver: cfg.homeserver().to_string(),
++            invalidated: false,
++            since: None,
++            pending: VecDeque::new(),
++            rooms: HashMap::new(),
++            sync_failed: false,
++        }
+     }
+-
+-    #[test]
+-    fn mention_gate_allows_dm_and_explicit_matrix_mention() {
+-        let mut config = cfg();
+-        config.mention_only = true;
+-        let value = json!({
+-            "next_batch": "s3",
+-            "rooms": { "join": {
+-                "!group:m": { "summary": { "m.joined_member_count": 4 }, "timeline": { "events": [
+-                    {"type":"m.room.message","event_id":"$skip","sender":"@a:m","content":{"msgtype":"m.text","body":"hello"}},
+-                    {"type":"m.room.message","event_id":"$mention","sender":"@a:m","content":{"msgtype":"m.text","body":"hello","m.mentions":{"user_ids":["@bot:example"]}}}
+-                ]}},
+-                "!dm:m": { "summary": { "m.joined_member_count": 2 }, "timeline": { "events": [
+-                    {"type":"m.room.message","event_id":"$dm","sender":"@b:m","content":{"msgtype":"m.text","body":"hello"}}
+-                ]}}
+-            }}
+-        });
+-        let mut ids: Vec<_> = parse_sync(&value, &config, "@bot:example")
+-            .messages
+-            .into_iter()
+-            .map(|message| message.id)
+-            .collect();
+-        ids.sort();
+-        assert_eq!(ids, vec!["$dm", "$mention"]);
++    pub fn check_binding(&mut self, cfg: &MatrixConfig, authenticated: &str) -> Result<(), String> {
++        if self.homeserver != cfg.homeserver()
++            || self.self_id != authenticated
++            || cfg.user_id.as_deref().is_some_and(|id| id != authenticated)
++        {
++            self.invalidated = true;
++            self.since = None;
++            self.pending.clear();
++            self.rooms.clear();
++        }
++        if self.invalidated {
++            Err("matrix: binding changed; fresh configure required".into())
++        } else {
++            Ok(())
++        }
+     }
+-
+-    #[test]
+-    fn mention_gate_uses_m_direct_without_a_room_summary() {
+-        let mut config = cfg();
+-        config.mention_only = true;
+-        let value = json!({
+-            "next_batch": "s3",
+-            "account_data": { "events": [{
+-                "type": "m.direct",
+-                "content": { "@friend:m": ["!dm:m"] }
+-            }]},
+-            "rooms": { "join": { "!dm:m": { "timeline": { "events": [{
+-                "type":"m.room.message",
+-                "event_id":"$dm",
+-                "sender":"@friend:m",
+-                "content":{"msgtype":"m.text","body":"hello"}
+-            }]}}}}
+-        });
+-        let messages = parse_sync(&value, &config, "@bot:example").messages;
+-        assert_eq!(messages.len(), 1);
+-        assert_eq!(messages[0].id, "$dm");
++    pub fn ingest(&mut self, value: &Value, cfg: &MatrixConfig) -> Result<(), String> {
++        let id = self.self_id.clone();
++        self.check_binding(cfg, &id)?;
++        // Admission is atomic: failed parsing keeps the cursor, queue and metadata.
++        match parse_sync(
++            value,
++            cfg,
++            &self.self_id,
++            self.rooms.clone(),
++            self.pending.clone(),
++            self.since.is_none(),
++        ) {
++            Ok(batch) => {
++                self.since = Some(batch.cursor);
++                self.rooms = batch.rooms;
++                self.pending = batch.pending;
++                self.sync_failed = false;
++                Ok(())
++            }
++            Err(error) => {
++                self.sync_failed = true;
++                Err(error)
++            }
++        }
+     }
+-
+-    #[test]
+-    fn edits_are_not_reingested_and_existing_threads_are_preserved() {
+-        let value = json!({
+-            "next_batch": "s4",
+-            "rooms": { "join": { "!r:m": { "timeline": { "events": [
+-                {"type":"m.room.message","event_id":"$edit","sender":"@a:m","content":{"msgtype":"m.text","body":"edited","m.relates_to":{"rel_type":"m.replace","event_id":"$old"}}},
+-                {"type":"m.room.message","event_id":"$reply","sender":"@a:m","content":{"msgtype":"m.text","body":"reply","m.relates_to":{"rel_type":"m.thread","event_id":"$root"}}}
+-            ]}}}}
+-        });
+-        let messages = parse_sync(&value, &cfg(), "@bot:example").messages;
+-        assert_eq!(messages.len(), 1);
+-        assert_eq!(messages[0].thread_ts.as_deref(), Some("$root"));
++    pub fn next(&mut self, cfg: &MatrixConfig) -> Option<Inbound> {
++        if self.invalidated {
++            return None;
++        }
++        while let Some(pending) = self.pending.pop_front() {
++            if let Some(message) = pending.deliver(cfg, &self.self_id) {
++                return Some(message);
++            }
++        }
++        None
++    }
++    pub fn healthy(&self) -> bool {
++        !self.invalidated && !self.sync_failed && self.since.is_some()
+     }
+ }
+diff --git a/plugins/matrix/tests/matrix.rs b/plugins/matrix/tests/matrix.rs
+index e4e3875..62e9c70 100644
+--- a/plugins/matrix/tests/matrix.rs
++++ b/plugins/matrix/tests/matrix.rs
+@@ -1,44 +1,542 @@
+-use matrix::matrix::{build_send_body, parse_sync, send_url, sync_url, whoami_url, MatrixConfig};
+-use serde_json::json;
++use matrix::matrix::{
++    build_send_body, encryption_url, parse_cursor, parse_whoami, require_unencrypted, send_url,
++    sync_url, whoami_url, Inbound, MatrixConfig, Session, MAX_PENDING, MAX_ROOM_METADATA,
++};
++use serde_json::{json, Value};
++
++const SELF: &str = "@bot:example";
++fn cfg() -> MatrixConfig {
++    MatrixConfig::from_public_json(r#"{"homeserver":"https://matrix.example/"}"#).unwrap()
++}
++fn text(id: &str, sender: &str, content: Value) -> Value {
++    json!({"type":"m.room.message", "event_id":id, "sender":sender,
++        "origin_server_ts":1234, "content":content})
++}
++fn sync(events: Vec<Value>) -> Value {
++    json!({"next_batch":"s2", "rooms":{"join":{"!room:example":{
++        "summary":{"m.joined_member_count":4}, "timeline":{"events":events}}}}})
++}
++fn messages(value: &Value, cfg: &MatrixConfig) -> Vec<Inbound> {
++    let mut state = Session::new(cfg, SELF.into());
++    state.ingest(&json!({"next_batch":"start"}), cfg).unwrap();
++    state.ingest(value, cfg).unwrap();
++    let mut messages = Vec::new();
++    while let Some(message) = state.next(cfg) {
++        messages.push(message);
++    }
++    messages
++}
+ 
+ #[test]
+-fn access_token_config_is_runnable() {
+-    let cfg = MatrixConfig::from_json(
+-        r#"{"enabled":true,"homeserver":"https://matrix.example","access_token":"token","user_id":"@bot:example"}"#,
++fn public_config_rejects_credentials_unknown_keys_and_sensitive_urls() {
++    for input in [
++        r#"{"homeserver":"https://matrix.example","access_token":"secret"}"#,
++        r#"{"homeserver":"https://matrix.example","password":"secret"}"#,
++        r#"{"homeserver":"https://user:password@matrix.example"}"#,
++        r#"{"homeserver":"https://matrix.example/?token=secret"}"#,
++        r#"{"homeserver":"https://matrix.example/#fragment"}"#,
++        r#"{"homeserver":"https://matrix.example","allowed_rooms":["not a room"]}"#,
++        "not json",
++    ] {
++        assert!(MatrixConfig::from_public_json(input).is_err());
++    }
++    assert!(cfg().reply_in_thread);
++    assert_eq!(
++        parse_whoami(&json!({"user_id": SELF})).as_deref(),
++        Some(SELF)
+     );
+-    assert!(cfg.is_configured());
+-    assert_eq!(cfg.user_id(), Some("@bot:example"));
++    assert!(parse_whoami(&json!({"user_id": "not-an-id"})).is_none());
++    assert!(parse_whoami(&json!({"errcode": "M_UNKNOWN_TOKEN"})).is_none());
++}
++
++#[test]
++fn urls_encode_room_alias_and_cursor_segments() {
+     assert_eq!(
+-        whoami_url(cfg.homeserver()),
++        whoami_url(cfg().homeserver()),
+         "https://matrix.example/_matrix/client/v3/account/whoami"
+     );
+     assert_eq!(
+-        sync_url(cfg.homeserver(), Some("next/1")),
++        sync_url(cfg().homeserver(), Some("next/1")),
+         "https://matrix.example/_matrix/client/v3/sync?timeout=0&since=next%2F1"
+     );
+-    assert!(send_url(cfg.homeserver(), "!room:example", 1).contains("%21room%3Aexample"));
++    assert!(send_url(cfg().homeserver(), "!room:example", 1).contains("%21room%3Aexample"));
++    assert!(encryption_url(cfg().homeserver(), "!r:example")
++        .ends_with("rooms/%21r%3Aexample/state/m.room.encryption/"));
+ }
+ 
+ #[test]
+-fn sync_to_threaded_reply_round_trip() {
+-    let cfg = MatrixConfig::from_json(
+-        r#"{"homeserver":"https://matrix.example","access_token":"token","reply_in_thread":true}"#,
+-    );
+-    let sync = json!({
+-        "next_batch": "s2",
+-        "rooms": { "join": { "!room:example": { "timeline": { "events": [{
+-            "type": "m.room.message",
+-            "event_id": "$event",
+-            "sender": "@user:example",
+-            "origin_server_ts": 1234,
+-            "content": { "msgtype": "m.text", "body": "hello" }
+-        }] } } } }
+-    });
+-    let batch = parse_sync(&sync, &cfg, "@bot:example");
+-    assert_eq!(batch.next_batch, "s2");
+-    assert_eq!(batch.messages.len(), 1);
+-    let inbound = &batch.messages[0];
+-    assert_eq!(inbound.reply_target, "!room:example");
+-    let reply = build_send_body("world", inbound.thread_ts.as_deref(), cfg.reply_in_thread);
+-    assert_eq!(reply["m.relates_to"]["event_id"], "$event");
++fn encryption_preflight_admits_only_endpoint_specific_authenticated_absence() {
++    assert!(require_unencrypted(404, br#"{"errcode":"M_NOT_FOUND"}"#).is_ok());
++    for (status, body) in [
++        (200, br#"{"algorithm":"m.megolm.v1.aes-sha2"}"#.as_slice()),
++        (200, br#"{"algorithm":"unknown"}"#.as_slice()),
++        (200, br#"{}"#.as_slice()),
++        (200, b"".as_slice()),
++        (404, br#"{}"#.as_slice()),
++        (404, b"not json".as_slice()),
++        (404, br#"{"errcode":"M_FORBIDDEN"}"#.as_slice()),
++        (403, br#"{"errcode":"M_NOT_FOUND"}"#.as_slice()),
++        (401, br#"{"errcode":"M_UNKNOWN_TOKEN"}"#.as_slice()),
++        (302, b"".as_slice()),
++        (500, b"".as_slice()),
++    ] {
++        assert!(
++            require_unencrypted(status, body).is_err(),
++            "status {status}"
++        );
++    }
++}
++
++#[test]
++fn text_mapping_filters_echoes_media_edits_and_rooms() {
++    let mut config = cfg();
++    config.allowed_rooms = vec!["!room:example".into()];
++    let mut value = sync(vec![
++        text(
++            "$plain",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"hello"}),
++        ),
++        text("$self", SELF, json!({"msgtype":"m.text","body":"echo"})),
++        text(
++            "$image",
++            "@user:example",
++            json!({"msgtype":"m.image","body":"image"}),
++        ),
++        text(
++            "$edit",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"edit",
++            "m.relates_to":{"rel_type":"m.replace","event_id":"$plain"}}),
++        ),
++        json!({"type":"m.room.encrypted", "event_id":"$cipher", "sender":"@user:example"}),
++    ]);
++    value["rooms"]["join"]["!blocked:example"] = json!({"timeline":{"events":[
++        text("$blocked", "@user:example", json!({"msgtype":"m.text","body":"blocked"}))]}});
++    let inbound = messages(&value, &config);
++    assert_eq!(inbound.len(), 1);
++    assert_eq!(inbound[0].timestamp, 1234);
++    assert_eq!(inbound[0].reply_target, "!room:example");
++    assert_eq!(inbound[0].thread_ts.as_deref(), Some("$plain"));
++    assert_eq!(inbound[0].interruption_scope_id, None);
++    let reply = build_send_body("world", inbound[0].thread_ts.as_deref(), true);
++    assert_eq!(reply["m.relates_to"]["m.in_reply_to"]["event_id"], "$plain");
++    assert!(build_send_body("world", Some("$plain"), false)
++        .get("m.relates_to")
++        .is_none());
++}
++
++#[test]
++fn same_sender_threads_have_distinct_interruption_roots_not_reply_anchors() {
++    let value = sync(vec![
++        text(
++            "$one",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"one",
++            "m.relates_to":{"rel_type":"m.thread","event_id":"$root1"}}),
++        ),
++        text(
++            "$two",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"two",
++            "m.relates_to":{"rel_type":"m.thread","event_id":"$root2"}}),
++        ),
++    ]);
++    let mut config = cfg();
++    config.reply_in_thread = false;
++    let inbound = messages(&value, &config);
++    assert_eq!(inbound[0].interruption_scope_id.as_deref(), Some("$root1"));
++    assert_eq!(inbound[1].interruption_scope_id.as_deref(), Some("$root2"));
++    assert_eq!(inbound[0].thread_ts, inbound[0].interruption_scope_id);
++}
++
++#[test]
++fn queued_delivery_uses_current_room_mention_and_reply_policy() {
++    let value = sync(vec![
++        text(
++            "$plain",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"hello"}),
++        ),
++        text(
++            "$mention",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"hello",
++            "m.mentions":{"user_ids":[SELF]}}),
++        ),
++    ]);
++    let mut config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    state
++        .ingest(&json!({"next_batch":"start"}), &config)
++        .unwrap();
++    state.ingest(&value, &config).unwrap();
++    config.mention_only = true;
++    config.reply_in_thread = false;
++    let delivered = state.next(&config).unwrap();
++    assert_eq!(delivered.id, "$mention");
++    assert!(delivered.thread_ts.is_none());
++    state.ingest(&value, &config).unwrap();
++    config.allowed_rooms = vec!["!else:example".into()];
++    assert!(state.next(&config).is_none());
++}
++
++#[test]
++fn mention_gate_keeps_direct_room_and_explicit_mention_behavior() {
++    let mut config = cfg();
++    config.mention_only = true;
++    let mut value = sync(vec![text(
++        "$dm",
++        "@user:example",
++        json!({"msgtype":"m.text","body":"hello"}),
++    )]);
++    assert!(messages(&value, &config).is_empty());
++    value["rooms"]["join"]["!room:example"]["summary"]["m.joined_member_count"] = json!(2);
++    assert_eq!(messages(&value, &config).len(), 1);
++    value["rooms"]["join"]["!room:example"]
++        .as_object_mut()
++        .unwrap()
++        .remove("summary");
++    value["account_data"] =
++        json!({"events":[{"type":"m.direct","content":{"@user:example":["!room:example"]}}]});
++    assert_eq!(messages(&value, &config).len(), 1);
++}
++
++#[test]
++fn account_or_homeserver_change_discards_state_and_requires_fresh_configure() {
++    for change_server in [false, true] {
++        let config = cfg();
++        let mut state = Session::new(&config, SELF.into());
++        state
++            .ingest(
++                &json!({"next_batch":"start", "account_data":{"events":[
++                    {"type":"m.direct","content":{"@user:example":["!room:example"]}}
++                ]}}),
++                &config,
++            )
++            .unwrap();
++        let value = sync(vec![text(
++            "$queued",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"hello"}),
++        )]);
++        state.ingest(&value, &config).unwrap();
++        assert!(!state.rooms.is_empty());
++        let mut changed = config.clone();
++        let account = if change_server {
++            changed.homeserver = "https://other.example".into();
++            SELF
++        } else {
++            "@other:example"
++        };
++        assert!(state.check_binding(&changed, account).is_err());
++        assert!(state.since.is_none());
++        assert!(state.pending.is_empty());
++        assert!(state.rooms.is_empty());
++        assert!(state.check_binding(&config, SELF).is_err());
++        assert!(!state.healthy());
++        assert!(Session::new(&config, SELF.into())
++            .check_binding(&config, SELF)
++            .is_ok());
++    }
++}
++
++#[test]
++fn startup_suppresses_backlog_and_identity_probe_does_not_clear_sync_failure() {
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    assert!(!state.healthy());
++    let value = sync(vec![text(
++        "$backlog",
++        "@user:example",
++        json!({"msgtype":"m.text","body":"old"}),
++    )]);
++    state.ingest(&value, &config).unwrap();
++    assert!(state.next(&config).is_none());
++    assert!(state.healthy());
++    state.sync_failed = true;
++    assert!(state.check_binding(&config, SELF).is_ok());
++    assert!(!state.healthy());
++    state
++        .ingest(&json!({"next_batch":"recovered"}), &config)
++        .unwrap();
++    assert!(state.healthy());
++}
++
++#[test]
++fn sync_cursor_and_queue_limits_fail_without_advancing_session() {
++    let events = (0..=MAX_PENDING)
++        .map(|i| {
++            text(
++                &format!("$event{i}"),
++                "@user:example",
++                json!({"msgtype":"m.text","body":"hello"}),
++            )
++        })
++        .collect();
++    let value = sync(events);
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    state.ingest(&value, &config).unwrap();
++    assert!(state.pending.is_empty());
++    assert!(state.ingest(&value, &config).is_err());
++    assert_eq!(state.since.as_deref(), Some("s2"));
++    // Startup can suppress a backlog larger than the delivery queue.
++    assert_eq!(parse_cursor(&value).unwrap(), "s2");
++    assert!(parse_cursor(&json!({"next_batch":""})).is_err());
++    assert!(parse_cursor(&json!({"next_batch":"x".repeat(4097)})).is_err());
++    for malformed in [
++        json!({"next_batch":"s3", "rooms": []}),
++        json!({"next_batch":"s3", "rooms": {"join": []}}),
++        json!({"next_batch":"s3", "rooms": {"join": {"!r:example": {"timeline": {}}}}}),
++        json!({"next_batch":"s3", "rooms": {"join": {"!r:example": {"timeline": {"events": {}}}}}}),
++    ] {
++        assert!(state.ingest(&malformed, &config).is_err());
++        assert_eq!(state.since.as_deref(), Some("s2"));
++        assert!(!state.healthy());
++    }
++}
++
++#[test]
++fn excluded_room_events_do_not_consume_the_allowed_queue() {
++    let mut config = cfg();
++    config.allowed_rooms = vec!["!room:example".into()];
++    let excluded: Vec<_> = (0..=MAX_PENDING)
++        .map(|i| {
++            text(
++                &format!("$blocked{i}"),
++                "@user:example",
++                json!({"msgtype":"m.text","body":"blocked"}),
++            )
++        })
++        .collect();
++    let mut value = sync(vec![text(
++        "$allowed",
++        "@user:example",
++        json!({"msgtype":"m.text","body":"allowed"}),
++    )]);
++    value["rooms"]["join"]["!excluded:example"] =
++        json!({"timeline":{"events":excluded,"limited":true}});
++    let delivered = messages(&value, &config);
++    assert_eq!(delivered.len(), 1);
++    assert_eq!(delivered[0].id, "$allowed");
++}
++
++#[test]
++fn startup_room_metadata_survives_omission_but_not_replacement_or_leave() {
++    for via_direct in [true, false] {
++        let mut config = cfg();
++        config.mention_only = true;
++        let mut state = Session::new(&config, SELF.into());
++        let mut initial = sync(Vec::new());
++        if via_direct {
++            initial["account_data"] = json!({"events":[{"type":"m.direct","content":{"@user:example":["!room:example"]}}]});
++        } else {
++            initial["rooms"]["join"]["!room:example"]["summary"]["m.joined_member_count"] =
++                json!(2);
++        }
++        state.ingest(&initial, &config).unwrap();
++        let mut later = sync(vec![text(
++            "$later",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"hello"}),
++        )]);
++        later["rooms"]["join"]["!room:example"]
++            .as_object_mut()
++            .unwrap()
++            .remove("summary");
++        state.ingest(&later, &config).unwrap();
++        assert_eq!(state.next(&config).unwrap().id, "$later");
++
++        // A present empty summary is a delta with no count change.
++        later["rooms"]["join"]["!room:example"]["summary"] = json!({});
++        state.ingest(&later, &config).unwrap();
++        assert!(state.next(&config).is_some());
++
++        let mut replacement = json!({"next_batch":"replacement"});
++        if via_direct {
++            replacement["account_data"] = json!({"events":[{"type":"m.direct","content":{}}]});
++        } else {
++            replacement["rooms"] =
++                json!({"join":{"!room:example":{"summary":{"m.joined_member_count":4}}}});
++        }
++        state.ingest(&replacement, &config).unwrap();
++        state.ingest(&later, &config).unwrap();
++        assert!(state.next(&config).is_none());
++
++        state.ingest(&initial, &config).unwrap();
++        state
++            .ingest(
++                &json!({"next_batch":"leave", "rooms":{"leave":{"!room:example":{}}}}),
++                &config,
++            )
++            .unwrap();
++        assert!(state.rooms.is_empty());
++        state.ingest(&later, &config).unwrap();
++        assert!(state.next(&config).is_none());
++    }
++}
++
++#[test]
++fn leave_removes_pending_messages_and_all_room_provenance() {
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    state
++        .ingest(
++            &json!({"next_batch":"start", "account_data":{"events":[
++                {"type":"m.direct", "content":{"@user:example":["!room:example"]}}
++            ]}}),
++            &config,
++        )
++        .unwrap();
++    state
++        .ingest(
++            &sync(vec![text(
++                "$queued",
++                "@user:example",
++                json!({"msgtype":"m.text","body":"hello"}),
++            )]),
++            &config,
++        )
++        .unwrap();
++    assert_eq!(state.pending.len(), 1);
++    state
++        .ingest(
++            &json!({"next_batch":"left", "rooms":{"leave":{"!room:example":{}}}}),
++            &config,
++        )
++        .unwrap();
++    assert!(state.pending.is_empty());
++    assert!(state.rooms.is_empty());
++}
++
++#[test]
++fn limited_and_malformed_batches_do_not_commit_cursor_queue_or_metadata() {
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    let mut initial = sync(vec![text(
++        "$old",
++        "@user:example",
++        json!({"msgtype":"m.text","body":"old"}),
++    )]);
++    initial["rooms"]["join"]["!room:example"]["timeline"]["limited"] = json!(true);
++    state.ingest(&initial, &config).unwrap();
++    assert!(state.pending.is_empty());
++    assert!(state.healthy());
++    state
++        .ingest(
++            &sync(vec![text(
++                "$queued",
++                "@user:example",
++                json!({"msgtype":"m.text","body":"queued"}),
++            )]),
++            &config,
++        )
++        .unwrap();
++    let prior = state.rooms.clone();
++    for timeline in [
++        json!({"events":[], "limited":true}),
++        json!({}),
++        json!({"events":[], "limited":"true"}),
++        json!({"events":[], "limited":null}),
++        json!({"events":{}, "limited":false}),
++        json!([]),
++    ] {
++        let value = json!({"next_batch":"must-not-commit", "account_data":{"events":[
++            {"type":"m.direct", "content":{"@user:example":["!new:example"]}}
++        ]}, "rooms":{"join":{"!room:example":{"summary":{"m.joined_member_count":2}, "timeline":timeline}}}});
++        if timeline.get("limited") != Some(&json!(true)) {
++            let mut fresh = Session::new(&config, SELF.into());
++            assert!(fresh.ingest(&value, &config).is_err());
++            assert!(fresh.since.is_none());
++            assert!(fresh.rooms.is_empty());
++        }
++        assert!(state.ingest(&value, &config).is_err());
++        assert_eq!(state.since.as_deref(), Some("s2"));
++        assert_eq!(state.pending.len(), 1);
++        assert_eq!(state.rooms, prior);
++        assert!(!state.healthy());
++    }
++    assert_eq!(state.next(&config).unwrap().id, "$queued");
++    assert!(state.check_binding(&config, SELF).is_ok());
++    assert!(!state.healthy());
++}
++
++#[test]
++fn metadata_overflow_does_not_partially_admit_replacement_or_cursor() {
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    state.ingest(&sync(Vec::new()), &config).unwrap();
++    let prior = state.rooms.clone();
++    let rooms: Vec<_> = (0..MAX_ROOM_METADATA)
++        .map(|i| format!("!direct{i}:example"))
++        .collect();
++    let value = json!({"next_batch":"overflow", "account_data":{"events":[
++        {"type":"m.direct", "content":{"@user:example":rooms}}
++    ]}});
++    // The existing member-count record and replacement together exceed 256.
++    assert!(state.ingest(&value, &config).is_err());
++    assert_eq!(state.since.as_deref(), Some("s2"));
++    assert_eq!(state.rooms, prior);
++    assert!(!state.healthy());
++    let fitting: Vec<_> = (0..MAX_ROOM_METADATA - 1)
++        .map(|i| format!("!direct{i}:example"))
++        .collect();
++    state
++        .ingest(
++            &json!({"next_batch":"fits", "account_data":{"events":[
++                {"type":"m.direct", "content":{"@user:example":fitting}}
++            ]}}),
++            &config,
++        )
++        .unwrap();
++    assert_eq!(state.rooms.len(), MAX_ROOM_METADATA);
++    state
++        .ingest(
++            &json!({"next_batch":"cleared", "account_data":{"events":[
++                {"type":"m.direct", "content":{}}
++            ]}}),
++            &config,
++        )
++        .unwrap();
++    assert_eq!(state.rooms, prior);
++    assert!(state.healthy());
++}
++
++#[test]
++fn departures_free_metadata_capacity_before_additions_and_reject_malformed_entries() {
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    let joined: serde_json::Map<String, Value> = (0..MAX_ROOM_METADATA)
++        .map(|i| {
++            (
++                format!("!room{i}:example"),
++                json!({"summary":{"m.joined_member_count":4}}),
++            )
++        })
++        .collect();
++    state
++        .ingest(
++            &json!({"next_batch":"full", "rooms":{"join":joined}}),
++            &config,
++        )
++        .unwrap();
++    assert_eq!(state.rooms.len(), MAX_ROOM_METADATA);
++    state.ingest(&json!({"next_batch":"replacement", "rooms":{"leave":{"!room0:example":{}}},
++        "account_data":{"events":[{"type":"m.direct", "content":{"@user:example":["!new:example", "!room0:example"]}}]}}), &config).unwrap();
++    assert_eq!(state.rooms.len(), MAX_ROOM_METADATA);
++    assert!(!state.rooms.contains_key("!room0:example"));
++    assert!(state.rooms.contains_key("!new:example"));
++    let prior = state.rooms.clone();
++    for leave in [json!({"not-a-room":{}}), json!({"!new:example":null})] {
++        assert!(state
++            .ingest(
++                &json!({"next_batch":"must-not-commit", "rooms":{"leave":leave}}),
++                &config
++            )
++            .is_err());
++        assert_eq!(state.since.as_deref(), Some("replacement"));
++        assert_eq!(state.rooms, prior);
++        assert!(!state.healthy());
++    }
+ }

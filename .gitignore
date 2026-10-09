@@ -1,0 +1,14 @@
+*
+!.gitignore
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/proof.yml
+!proof/
+proof/*
+!proof/run-proof.sh
+!proof/prepare_synapse.py
+!proof/matrix_plugin_smoke.rs
+!proof/matrix-port.patch
+!proof/frozen-inputs.json

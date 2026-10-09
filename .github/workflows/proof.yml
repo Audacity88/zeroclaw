@@ -1,0 +1,78 @@
+name: Matrix real-host proof
+
+on:
+  push:
+    branches: [codex/culling-matrix-host-proof-20261009]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: culling-matrix-host-proof-20261009
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '0'
+  RUSTUP_TOOLCHAIN: 1.98.0
+  # Local prepared snapshot; publication and execution need separate approval.
+  FROZEN_INPUTS_SHA256: 03ffae2d9d71bba3f3d755a842da1a017473b51a2dd19f3ca80340d5336a531d
+
+jobs:
+  proof:
+    if: >-
+      github.repository == 'Audacity88/zeroclaw' &&
+      github.actor == 'Audacity88' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/culling-matrix-host-proof-20261009'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out proposed experiment
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+      - name: Verify frozen inputs before source acquisition
+        shell: bash
+        run: |
+          [[ "$FROZEN_INPUTS_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 64
+          echo "$FROZEN_INPUTS_SHA256  harness/proof/frozen-inputs.json" | sha256sum --check --status
+          python3 -c 'import shutil; assert shutil.disk_usage(".").free >= 20 * 1024**3, "initial disk floor"'
+      - name: Check out immutable host
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: 35dad4a6f398de83ffa7b6632d2ad2637c971cde
+          path: host
+          persist-credentials: false
+      - name: Check out immutable plugin base
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: zeroclaw-labs/zeroclaw-plugins
+          ref: 5efe782cec284b30d9cfda143e11fa9b53dbfd17
+          path: plugins
+          persist-credentials: false
+      - name: Install pinned compiler and component target
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-wasip2
+      - name: Run exactly one proof attempt
+        shell: bash
+        run: bash harness/proof/run-proof.sh "$GITHUB_WORKSPACE"
+      - name: Retain only scrubbed assertions and identities
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: matrix-host-proof-${{ github.sha }}
+          path: |
+            proof-public/identity.json
+            proof-public/cases.jsonl
+            proof-public/result.json
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
