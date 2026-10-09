@@ -18,7 +18,7 @@ env:
   CARGO_NET_RETRY: '0'
   RUSTUP_TOOLCHAIN: 1.98.0
   # Local prepared snapshot; publication and execution need separate approval.
-  FROZEN_INPUTS_SHA256: 61a22280630fdb42109e213a5b5a811340514efb400066efb6b80d261614beff
+  FROZEN_INPUTS_SHA256: 8c556e6427cf07db0e1fa34fbe4c8ffae0baefd1f7fbb8ec808cdbf6d253071c
 
 jobs:
   proof:

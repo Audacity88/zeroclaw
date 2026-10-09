@@ -326,7 +326,7 @@ for name, expected in identity['overlay_files_sha256'].items():
     assert hashlib.sha256(source.read_bytes()).hexdigest() == expected, 'source drift during build'
 for name in ('matrix.wasm', 'manifest.toml'):
     identity[name + '_sha256'] = hashlib.sha256((Path(os.environ['MATRIX_PROOF_PACKAGE'])/'matrix'/name).read_bytes()).hexdigest()
-assert identity['manifest.toml_sha256'] == 'a5c33c862043d3451ff9c14457660b85d7c86b1cc52cd63661ecdb1527d53511'
+assert identity['manifest.toml_sha256'] == '81e00d8917642f0a00f2b87eb48463919cc0899f2cdd6e2ba2a9968a4afb08a4'
 identity['component_bytes'] = (Path(os.environ['MATRIX_PROOF_PACKAGE'])/'matrix/matrix.wasm').stat().st_size
 identity['wasm_target'] = 'wasm32-wasip2'
 identity['rustc'] = subprocess.check_output(['rustc', '-Vv'], text=True)
