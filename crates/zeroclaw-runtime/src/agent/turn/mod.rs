@@ -645,6 +645,58 @@ fn replace_tool_protocol_section(
     }
 }
 
+fn apply_builtin_search_fallback(
+    messages: &mut [ChatMessage],
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    effective_names: &HashSet<String>,
+    use_native_tools: bool,
+    strict_tool_parsing: bool,
+) {
+    let names: HashSet<&str> = effective_names.iter().map(String::as_str).collect();
+    let instructions = if use_native_tools || strict_tool_parsing {
+        String::new()
+    } else {
+        crate::agent::loop_::build_tool_instructions_for_names(tools_registry, &names)
+    };
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role == "system")
+    {
+        // A same-agent step shares history, but its discovery route is narrower.
+        // Reconcile only the request clone, preserving unrelated prompt sections.
+        for heading in [
+            "## Deferred Built-in Tools\n",
+            "## Tools\n",
+            "## Tool Use Protocol\n",
+        ] {
+            if heading != "## Deferred Built-in Tools\n"
+                && (use_native_tools || strict_tool_parsing)
+            {
+                continue;
+            }
+            while let Some(start) = message.content.find(heading) {
+                let body = start + heading.len();
+                let end = if heading == "## Deferred Built-in Tools\n" {
+                    let close = "</available-deferred-builtin-tools>";
+                    let Some(offset) = message.content[body..].find(close) else {
+                        break;
+                    };
+                    body + offset + close.len()
+                } else {
+                    message.content[body..]
+                        .find("\n## ")
+                        .map_or(message.content.len(), |offset| body + offset)
+                };
+                message.content.replace_range(start..end, "");
+            }
+        }
+        if !instructions.is_empty() {
+            message.content.push('\n');
+            message.content.push_str(&instructions);
+        }
+    }
+}
+
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -1923,6 +1975,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let tool_specs = iteration_tool_specs.request_tool_specs();
         let use_native_tools = iteration_tool_specs.use_native_tools;
+        let builtin_search_unavailable = !iteration_tool_specs
+            .known_tool_names
+            .contains("tool_search")
+            && activated_tools.is_some_and(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .has_deferred_builtin_schemas()
+            });
 
         // Tool protocol selection follows the provider-facing selector. Direct
         // Agent turns also refresh their scoped complete prompt after a hook
@@ -1934,6 +1995,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
+        if builtin_search_unavailable {
+            apply_builtin_search_fallback(
+                &mut provider_request_messages,
+                tools_registry,
+                &iteration_tool_specs.known_tool_names,
+                use_native_tools,
+                strict_tool_parsing,
+            );
+        }
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
@@ -2082,6 +2152,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut trimmed_post_hook,
                     use_native_tools,
                 );
+                if builtin_search_unavailable {
+                    apply_builtin_search_fallback(
+                        &mut trimmed_post_hook,
+                        tools_registry,
+                        &iteration_tool_specs.known_tool_names,
+                        use_native_tools,
+                        strict_tool_parsing,
+                    );
+                }
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
@@ -6852,6 +6931,59 @@ mod sop_step_reassembly_tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn builtin_search_fallback_preserves_strict_policy_and_scoped_replay() {
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(NamedTool("allowed_tool")),
+            Box::new(NamedTool("denied_tool")),
+        ];
+        let names = HashSet::from(["allowed_tool".to_string()]);
+        let prompt = "## Tools\nParent tools.\n\n## Tool Use Protocol\nParent protocol.\n\n## Safety\nKeep safety guidance.\n\n## Hardware Access\nKeep hardware guidance.\n\n## Deferred Built-in Tools\n<available-deferred-builtin-tools>\nallowed_tool\ndenied_tool\n</available-deferred-builtin-tools>\n\n## Context\nKeep context.";
+        let mut history = vec![ChatMessage::system(prompt), ChatMessage::user(prompt)];
+        let mut request = history.clone();
+        let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
+        scope_tool_protocol_prompts(prompts, async {
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            apply_builtin_search_fallback(&mut request, &tools, &names, false, false);
+            // Trim rebuilds the projected request, then refreshes the cached section.
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            apply_builtin_search_fallback(&mut request, &tools, &names, false, false);
+        })
+        .await;
+        assert_eq!(
+            request[0].content.matches("## Tool Use Protocol").count(),
+            1
+        );
+        assert_eq!(request[0].content.matches("**allowed_tool**").count(), 1);
+        assert!(!request[0].content.contains("denied_tool"));
+        assert!(
+            !request[0]
+                .content
+                .contains("available-deferred-builtin-tools")
+        );
+        for section in [
+            "Keep safety guidance.",
+            "Keep hardware guidance.",
+            "Keep context.",
+        ] {
+            assert!(request[0].content.contains(section));
+        }
+        assert_eq!(request[1].content, prompt);
+        assert_eq!(history[0].content, prompt);
+
+        let strict_prompt = &prompt[prompt.find("## Safety").unwrap()..];
+        let mut strict = vec![ChatMessage::system(strict_prompt)];
+        apply_builtin_search_fallback(&mut strict, &tools, &names, false, true);
+        assert!(
+            !strict[0]
+                .content
+                .contains("available-deferred-builtin-tools")
+        );
+        assert!(!strict[0].content.contains("## Tool Use Protocol"));
+        assert!(!strict[0].content.contains("**allowed_tool**"));
+        assert!(strict[0].content.contains("Keep hardware guidance."));
     }
 
     struct BudgetToolCallingProvider;

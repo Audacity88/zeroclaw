@@ -4432,6 +4432,7 @@ impl DelegateTool {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_enriched_system_prompt_from_config(
         &self,
         config: Option<&Config>,
