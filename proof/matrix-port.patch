@@ -545,7 +545,7 @@ index 93cc35b..5b3759f 100644
 -```
 +Focused host tests cover parsing, current-policy admission and delivery, retained protocol metadata, atomic batch refusal, lifecycle invalidation, thread isolation, backlog suppression and encryption refusal decisions. WASM-target lint and a release build check the component bindings and transport code. Real-host admission, deadline behavior, token rotation, zero-PUT refusal and disposable Synapse delivery require separate integration proof. Local pure tests and compilation cannot establish those integration boundaries. Repository CI commands and immutable-component rules are defined in `docs/ci.md`; do not install a new Rust target implicitly.
 diff --git a/plugins/matrix/manifest.toml b/plugins/matrix/manifest.toml
-index e8b271d..317987e 100644
+index e8b271d..520e5d2 100644
 --- a/plugins/matrix/manifest.toml
 +++ b/plugins/matrix/manifest.toml
 @@ -1,14 +1,50 @@
@@ -597,7 +597,7 @@ index e8b271d..317987e 100644
 +[config_schema.properties.allowed_rooms]
 +type = "array"
 +maxItems = 256
-+items = { type = "string", minLength = 1, maxLength = 255, pattern = '^![^\s:]+:[^\s]+$' }
++items = { type = "string", minLength = 1, maxLength = 255, pattern = '^![^\s\x00-\x1f\x7f-\x9f]+$' }
 +
 +[config_schema.properties.mention_only]
 +type = "boolean"
@@ -1310,7 +1310,7 @@ index ed4fca0..339b2ac 100644
      export!(MatrixChannel);
  }
 diff --git a/plugins/matrix/src/matrix.rs b/plugins/matrix/src/matrix.rs
-index 72b6005..e27e3a9 100644
+index 72b6005..af9d68d 100644
 --- a/plugins/matrix/src/matrix.rs
 +++ b/plugins/matrix/src/matrix.rs
 @@ -1,27 +1,26 @@
@@ -1350,7 +1350,7 @@ index 72b6005..e27e3a9 100644
      pub user_id: Option<String>,
      #[serde(default)]
      pub allowed_rooms: Vec<String>,
-@@ -32,402 +31,460 @@ pub struct MatrixConfig {
+@@ -32,402 +31,465 @@ pub struct MatrixConfig {
  }
  
  impl MatrixConfig {
@@ -1441,11 +1441,16 @@ index 72b6005..e27e3a9 100644
 -    pub timestamp: u64,
 -    pub thread_ts: Option<String>,
 +pub fn matrix_id(id: &str, prefix: char) -> bool {
++    let Some(rest) = id.strip_prefix(prefix) else {
++        return false;
++    };
++    // Room IDs are opaque; v12 rooms no longer include a server name.
 +    id.len() <= MAX_ID
-+        && id.starts_with(prefix)
-+        && id[1..]
-+            .split_once(':')
-+            .is_some_and(|(local, server)| !local.is_empty() && !server.is_empty())
++        && !rest.is_empty()
++        && (prefix == '!'
++            || rest
++                .split_once(':')
++                .is_some_and(|(local, server)| !local.is_empty() && !server.is_empty()))
 +        && !id.chars().any(|c| c.is_whitespace() || c.is_control())
  }
 -
@@ -2129,15 +2134,16 @@ index 72b6005..e27e3a9 100644
      }
  }
 diff --git a/plugins/matrix/tests/matrix.rs b/plugins/matrix/tests/matrix.rs
-index e4e3875..62e9c70 100644
+index e4e3875..0769fe0 100644
 --- a/plugins/matrix/tests/matrix.rs
 +++ b/plugins/matrix/tests/matrix.rs
-@@ -1,44 +1,542 @@
+@@ -1,44 +1,595 @@
 -use matrix::matrix::{build_send_body, parse_sync, send_url, sync_url, whoami_url, MatrixConfig};
 -use serde_json::json;
 +use matrix::matrix::{
-+    build_send_body, encryption_url, parse_cursor, parse_whoami, require_unencrypted, send_url,
-+    sync_url, whoami_url, Inbound, MatrixConfig, Session, MAX_PENDING, MAX_ROOM_METADATA,
++    build_send_body, encryption_url, matrix_id, parse_cursor, parse_room_id, parse_whoami,
++    require_unencrypted, send_url, sync_url, whoami_url, Inbound, MatrixConfig, Session,
++    MAX_PENDING, MAX_ROOM_METADATA,
 +};
 +use serde_json::{json, Value};
 +
@@ -2189,6 +2195,58 @@ index e4e3875..62e9c70 100644
 -    assert_eq!(cfg.user_id(), Some("@bot:example"));
 +    assert!(parse_whoami(&json!({"user_id": "not-an-id"})).is_none());
 +    assert!(parse_whoami(&json!({"errcode": "M_UNKNOWN_TOKEN"})).is_none());
++}
++
++#[test]
++fn room_ids_are_opaque_without_relaxing_user_alias_or_room_policy() {
++    let hash_room = format!("!{}", "A".repeat(43));
++    for room in ["!legacy:example", hash_room.as_str()] {
++        let input = json!({"homeserver":"https://matrix.example", "allowed_rooms":[room]});
++        let config = MatrixConfig::from_public_json(&input.to_string()).unwrap();
++        assert_eq!(
++            parse_room_id(&json!({"room_id": room})).as_deref(),
++            Some(room)
++        );
++        let value = json!({"next_batch":"s2", "rooms":{"join":{(room):{
++            "summary":{"m.joined_member_count":4},
++            "timeline":{"events":[text("$message", "@user:example", json!({"msgtype":"m.text","body":"hello"}))]}
++        }, "!excluded:example":{
++            "timeline":{"events":[text("$excluded", "@user:example", json!({"msgtype":"m.text","body":"blocked"}))]}
++        }}}});
++        let inbound = messages(&value, &config);
++        assert_eq!(inbound.len(), 1);
++        assert_eq!(inbound[0].reply_target, room);
++        assert_eq!(inbound[0].id, "$message");
++        assert!(send_url(config.homeserver(), room, 1).contains("/rooms/%21"));
++    }
++    for room in [
++        "",
++        "!",
++        "not-a-room",
++        "!has space",
++        "!tab\t",
++        "!nul\0",
++        "!del\u{7f}",
++        "!control\u{80}",
++    ] {
++        assert!(!matrix_id(room, '!'));
++        assert!(parse_room_id(&json!({"room_id": room})).is_none());
++        let input = json!({"homeserver":"https://matrix.example", "allowed_rooms":[room]});
++        assert!(MatrixConfig::from_public_json(&input.to_string()).is_err());
++    }
++    assert!(!matrix_id(&format!("!{}", "A".repeat(255)), '!'));
++    for (id, prefix) in [
++        ("@user", '@'),
++        ("@:example", '@'),
++        ("@user:", '@'),
++        ("#alias", '#'),
++        ("#:example", '#'),
++        ("#alias:", '#'),
++    ] {
++        assert!(!matrix_id(id, prefix));
++    }
++    assert!(matrix_id("@user:example", '@'));
++    assert!(matrix_id("#alias:example", '#'));
 +}
 +
 +#[test]

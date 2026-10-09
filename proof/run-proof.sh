@@ -89,7 +89,7 @@ for directory, sha in (('host', '35dad4a6f398de83ffa7b6632d2ad2637c971cde'),
     identity[directory + '_head'] = sha
     identity[directory + '_archive_sha256'] = digest(archive)
 patch = proof / 'matrix-port.patch'
-patch_hash = '20b5708d225a93df4936775d94365131b6aa0a755d097661fb94adcf02ade058'
+patch_hash = '7ae1eaa81064ec363f3c8ced2ba91d407c1f660044ac015c39849596a3929c86'
 assert lock['source_patch_sha256'] == patch_hash
 check(patch.read_bytes(), patch_hash)
 cwd = root/'plugins'
@@ -107,10 +107,10 @@ new = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standar
 assert set(changed + new) == expected
 identity['source_patch_sha256'] = patch_hash
 identity['overlay_files_sha256'] = {path: digest((cwd/path).read_bytes()) for path in sorted(expected)}
-check((cwd/'plugins/matrix/manifest.toml').read_bytes(), 'a5c33c862043d3451ff9c14457660b85d7c86b1cc52cd63661ecdb1527d53511')
+check((cwd/'plugins/matrix/manifest.toml').read_bytes(), '81e00d8917642f0a00f2b87eb48463919cc0899f2cdd6e2ba2a9968a4afb08a4')
 check((cwd/'plugins/matrix/Cargo.lock').read_bytes(), 'e96c902848ef5101c644fbbab922a8a438676618b3903b9384299b9f42801966')
-identity['local_reference'] = {'platform': 'Darwin', 'rust': '1.97.0', 'bytes': 289316,
-    'component_sha256': '8fdbf2980aaabb23819750c560b5b1578a98e6db49327b1d1a553187c09fe66a',
+identity['local_reference'] = {'platform': 'Darwin', 'rust': '1.97.0', 'bytes': 289524,
+    'component_sha256': 'cb2a7145cbca9ba8ffa05d7c911212de36ceab9cd807d2f96af698571750aa52',
     'provenance': 'source-owner-report', 'linux_byte_equality_required': False}
 def tree(path):
     assert not any(p.is_symlink() for p in path.rglob('*'))

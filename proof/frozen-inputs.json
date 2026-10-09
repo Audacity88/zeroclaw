@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "harness_sha256": {
-    "run-proof.sh": "f7295a6eedad9725b601e3f95605a31ccb91d28286b60bfbfc37857eb99417b5",
+    "run-proof.sh": "d7959f77c6619216e2a9940d97708c55b3bc6daa21c37deaeee986971db9cfe1",
     "prepare_synapse.py": "030d4cb2c05cd3924c5e6594b0e46cc4fb486a7a6997fd7a1eafee821cccf757",
     "matrix_plugin_smoke.rs": "cb1b2123fc6706cfbf1c0e98b266a04f26e1ea2dfbe12b9fbbc3b0e09333d360"
   },
@@ -9,5 +9,5 @@
     "host": "f40966b770286adc3901ebf99494fa3a16e1fccd4d40ca652c24e412f1caed65",
     "plugins": "eef361e639dbb5120a2681d16bdd614c2885a9882acce0a44b7d1ceb61da35da"
   },
-  "source_patch_sha256": "20b5708d225a93df4936775d94365131b6aa0a755d097661fb94adcf02ade058"
+  "source_patch_sha256": "7ae1eaa81064ec363f3c8ced2ba91d407c1f660044ac015c39849596a3929c86"
 }
