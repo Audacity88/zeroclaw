@@ -244,6 +244,8 @@ def retain_runtime_diagnostics(rc):
                'authentication': ('M_UNKNOWN_TOKEN', 'M_FORBIDDEN')}
     found_stages, found_contexts, found_events, found_classes, interfaces = set(), set(), set(), set(), set()
     found_matrix_errors, found_host_contexts, http_statuses = set(), set(), set()
+    termination = set()
+    child_codes = set()
     entered = capture_installed = False
     oversized_lines = max_line_bytes = line_bytes = 0
     overlap = b''
@@ -263,6 +265,14 @@ def retain_runtime_diagnostics(rc):
                 line_bytes = len(parts[-1])
             window = overlap + chunk
             text = window.decode('utf-8', errors='replace')
+            for needle, label in (
+                ('signal: 9, SIGKILL', 'sigkill'), ('signal: 11, SIGSEGV', 'sigsegv'),
+                ('signal: 6, SIGABRT', 'sigabrt'), ('panicked at', 'panic'),
+                ('test result: FAILED', 'failed-tests'), ('test result: ok', 'passed-tests'),
+            ):
+                if needle in text: termination.add(label)
+            for value in re.findall(r'exit status: ([0-9]{1,3})(?![0-9])', text):
+                if int(value) <= 255: child_codes.add(int(value))
             overlap = window[-512:]
             entered |= 'proof-runtime-entered' in text
             capture_installed |= 'proof-runtime-entered capture-installed=true' in text
@@ -285,7 +295,11 @@ def retain_runtime_diagnostics(rc):
               'matched_matrix_errors': sorted(found_matrix_errors),
               'matched_host_contexts': sorted(found_host_contexts),
               'oversized_lines': oversized_lines, 'max_line_bytes': max_line_bytes,
-              'matrix_http_statuses': [{'method': method, 'status': status} for method, status in sorted(http_statuses)]}
+              'matrix_http_statuses': [{'method': method, 'status': status} for method, status in sorted(http_statuses)],
+              'child_termination': sorted(termination), 'child_exit_codes': sorted(child_codes),
+              'process_group_peak_rss_bytes': peak_rss, 'process_group_peak_count': peak_count,
+              'host_total_memory_bytes': total_memory, 'host_min_available_memory_bytes': min_available,
+              'cgroup_oom_delta': oom_delta()}
     (Path(os.environ['MATRIX_PROOF_PUBLIC'])/'host-runtime.json').write_text(json.dumps(report, sort_keys=True))
 def terminate(p):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -306,6 +320,45 @@ def terminate(p):
         try: os.killpg(p.pid, 0)
         except ProcessLookupError: return
         time.sleep(0.1)
+def memory_values():
+    values = {}
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            key, value = line.split(':', 1)
+            if key in ('MemTotal', 'MemAvailable'): values[key] = int(value.split()[0]) * 1024
+    except (OSError, ValueError): pass
+    return values
+def oom_values():
+    values = {}
+    try:
+        for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines():
+            key, value = line.split()
+            if key in ('oom', 'oom_kill', 'oom_group_kill'): values[key] = int(value)
+    except (OSError, ValueError): pass
+    return values
+oom_before = oom_values()
+def oom_delta():
+    after = oom_values()
+    return {key: max(0, after[key] - value) for key, value in oom_before.items() if key in after}
+memory = memory_values()
+total_memory = memory.get('MemTotal')
+min_available = memory.get('MemAvailable')
+peak_rss = peak_count = 0
+def sample_owned_memory(pgid):
+    global peak_rss, peak_count, min_available
+    rss = count = 0
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            fields = stat.read_text().rsplit(')', 1)[1].split()
+            if int(fields[2]) == pgid:
+                count += 1
+                rss += max(0, int(fields[21])) * os.sysconf('SC_PAGE_SIZE')
+        except (OSError, ValueError, IndexError): pass
+    peak_rss = max(peak_rss, rss)
+    peak_count = max(peak_count, count)
+    available = memory_values().get('MemAvailable')
+    if available is not None:
+        min_available = available if min_available is None else min(min_available, available)
 with log.open('wb') as out:
     if shutil.disk_usage(private).free < 4 * 1024**3:
         (private/'cargo-failure-class').write_text('disk-reserve')
@@ -318,6 +371,7 @@ with log.open('wb') as out:
     signal.signal(signal.SIGINT, cancel)
     deadline = float(os.environ['PROOF_DEADLINE'])
     while p.poll() is None:
+        if os.environ.get('PROOF_RUNTIME_DIAGNOSTICS') == '1': sample_owned_memory(p.pid)
         if shutil.disk_usage(private).free < 4 * 1024**3:
             (private/'cargo-failure-class').write_text('disk-reserve')
             terminate(p)
