@@ -205,6 +205,7 @@ zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
 zc-queue-dispatch-failed = Could not send queued message: { $error }
+zc-queue-dispatch-requeued = Session busy; your message is back in the queue (paused): { $error }
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity
@@ -517,6 +518,11 @@ zc-chat-status-awaiting-input = awaiting input
 zc-chat-status-cancelling = cancelling
 zc-chat-session-close-error = Failed to close session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
+zc-chat-elicitation-asked = The agent asked: { $question }
+zc-chat-elicitation-answered = You answered: { $answer }
+zc-chat-elicitation-cancelled = You dismissed the question without answering.
+zc-chat-elicitation-withdrawn = The question closed before you answered (the view reloaded). The agent was told it was cancelled.
+zc-chat-elicitation-expired = The agent stopped waiting for an answer to its question.
 zc-chat-session-restarted = New session started.
 zc-chat-session-cap = Session limit for this pane reached ({ $max }). Close a session from the sidebar first.
 zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached and were retained for retry.
@@ -605,6 +611,11 @@ zc-chat-approval-action-allow = Allow
 zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
+# Cost-limit notice: the daemon paused a turn at the cost limit and asks whether to override it.
+zc-chat-cost-limit-title = COST LIMIT REACHED
+zc-chat-cost-limit-override = Override and continue
+zc-chat-cost-limit-stop = Stop
+zc-chat-cost-limit-wait = If you do not answer within { $minutes } min, this turn stops.
 
 
 zc-chat-clipboard-you = You: { $text }

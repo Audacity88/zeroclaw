@@ -465,6 +465,11 @@ pub(crate) struct ResumeEntry {
     queue: ReconnectQueueState,
     interrupted: bool,
     recovery_required: bool,
+    /// The last turn ended `Failed` (`SessionError::TurnFailed`). The rebuilt
+    /// pane reloads the transcript but not the client-side status, so the
+    /// red sidebar dot is carried here. `SessionLost` is not carried: the
+    /// rebuild re-attaches the session, which is what clears it.
+    turn_failed: bool,
 }
 
 /// The queue owns both its pause and the explanation shown to the user.
@@ -886,6 +891,9 @@ struct PromptCompletion {
     session_id: String,
     turn_generation: u64,
     error: Option<String>,
+    /// JSON-RPC code of `error`, so a refusal the daemon issued before the
+    /// turn started (`SESSION_BUSY`) can be told apart from a turn failure.
+    error_code: Option<i32>,
     transport_closed: bool,
     cancelled: bool,
 }
@@ -1087,6 +1095,7 @@ impl Chat {
                     || self
                         .session_resync_in_flight
                         .contains_key(&state.session_id),
+                turn_failed: state.last_error == Some(SessionError::TurnFailed),
             });
         }
 
@@ -1895,6 +1904,7 @@ impl Chat {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            turn_failed: false,
         });
         self.pick_or_start_session(&agent_alias).await;
     }
@@ -2510,6 +2520,7 @@ impl Chat {
                         entry.queue,
                         entry.interrupted,
                         entry.recovery_required,
+                        entry.turn_failed,
                     );
                 }
                 if !self.session_order.contains(&state.session_id) {
@@ -2728,6 +2739,7 @@ impl Chat {
             entry.queue.clone(),
             entry.interrupted,
             entry.recovery_required,
+            entry.turn_failed,
         );
         Ok(state)
     }
@@ -3009,6 +3021,11 @@ impl Chat {
             if completion.error.is_some() {
                 state.remove_optimistic_user_message(completion.turn_generation);
             }
+            // A busy refusal never started the turn: return the message to
+            // the queue before settling, so settling neither cleans up its
+            // attachments nor loses its text.
+            let requeued = completion.error_code == Some(crate::jsonrpc::error_codes::SESSION_BUSY)
+                && state.requeue_refused_dispatch(completion.turn_generation);
             // Keep a known pause or cancellation reason. Other successful
             // responses still cannot prove clean completion without a terminal
             // notification, so queued work stays paused conservatively.
@@ -3024,10 +3041,12 @@ impl Chat {
             state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-queue-dispatch-failed",
-                    &[("error", &error)],
-                ));
+                let key = if requeued {
+                    "zc-queue-dispatch-requeued"
+                } else {
+                    "zc-queue-dispatch-failed"
+                };
+                state.set_info_notice(crate::i18n::t_args(key, &[("error", &error)]));
             }
             // The response is the one terminal signal guaranteed on this
             // connection: the daemon answers every `session/prompt` it ran,
@@ -3127,6 +3146,7 @@ impl Chat {
                 Self::reject_stale_approval(&rpc, session_id.clone(), approval.request_id);
             }
             if let Some(elicitation) = elicitation {
+                state.record_elicitation_outcome(crate::i18n::t("zc-chat-elicitation-withdrawn"));
                 Self::answer_cancel(&rpc, elicitation.request_id);
             }
         }
@@ -3939,6 +3959,7 @@ impl Chat {
         state.own_active_turn_attachments(attachments);
         state.push_user_message(prompt, att_names);
         let turn_generation = state.turn_generation;
+        state.dispatched_prompt = Some((turn_generation, text.clone()));
         Self::spawn_prompt_on(
             rpc_out,
             rpc,
@@ -3980,12 +4001,14 @@ impl Chat {
             let cancelled = result
                 .as_ref()
                 .is_ok_and(|value| value["stop_reason"].as_str() == Some("cancelled"));
+            let error_code = result.as_ref().err().map(|e| e.code);
             let error = result.err().map(|e| format!("{} ({})", e.message, e.code));
             let _ = completion_tx
                 .send(PromptCompletion {
                     session_id: sid,
                     turn_generation,
                     error,
+                    error_code,
                     transport_closed,
                     cancelled,
                 })
@@ -4100,6 +4123,7 @@ impl Chat {
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
+        self.answer_withdrawn_elicitations();
         self.maybe_refresh_git_branch();
         let connected = matches!(
             self.rpc.connection_state(),
@@ -4125,6 +4149,30 @@ impl Chat {
             || !self.prompt_completion_rx.is_empty()
             || !self.session_resync_rx.is_empty()
             || !self.session_reattach_rx.is_empty()
+    }
+
+    /// Send the `cancel` every withdrawn elicitation still owes the daemon,
+    /// and note each one in its transcript. Runs after the resync drain, so
+    /// a note for a prompt dropped by a reload lands after the reloaded
+    /// history rather than being wiped by it.
+    fn answer_withdrawn_elicitations(&mut self) {
+        let rpc = self.rpc.clone();
+        let answer = |state: &mut ChatState| {
+            for withdrawn in state.take_withdrawn_elicitations() {
+                Self::answer_cancel(&rpc, withdrawn.request_id);
+                if withdrawn.note {
+                    state.record_elicitation_outcome(crate::i18n::t(
+                        "zc-chat-elicitation-withdrawn",
+                    ));
+                }
+            }
+        };
+        if let ChatPhase::Active(state) = &mut self.phase {
+            answer(state);
+        }
+        for state in self.background.iter_mut() {
+            answer(state);
+        }
     }
 
     #[cfg(test)]
@@ -4550,12 +4598,16 @@ impl Chat {
                     // Build the response without holding the modal borrow,
                     // then answer the daemon. For an invalid multi-select
                     // (bounds unmet) keep the modal open.
-                    let payload = state
-                        .pending_elicitation
-                        .as_ref()
-                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
-                    if let Some((id, content)) = payload {
+                    let payload = state.pending_elicitation.as_ref().and_then(|e| {
+                        e.accept_content()
+                            .map(|c| (e.request_id.clone(), c, e.answer_summary()))
+                    });
+                    if let Some((id, content, answer)) = payload {
                         state.pending_elicitation = None;
+                        state.record_elicitation_outcome(crate::i18n::t_args(
+                            "zc-chat-elicitation-answered",
+                            &[("answer", &answer)],
+                        ));
                         state.mark_dirty_full();
                         self.rpc.respond_to_inbound_request(
                             id,
@@ -4570,6 +4622,9 @@ impl Chat {
                 }
                 Some(ModalAction::Cancel) => {
                     if let Some(e) = state.pending_elicitation.take() {
+                        state.record_elicitation_outcome(crate::i18n::t(
+                            "zc-chat-elicitation-cancelled",
+                        ));
                         state.mark_dirty_full();
                         let id = e.request_id;
                         self.rpc.respond_to_inbound_request(
@@ -6038,6 +6093,30 @@ impl Chat {
                 return;
             }
 
+            // The cost-limit notice is the one overlay with buttons: a click on
+            // Override or Stop answers it; any other click is swallowed below.
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && let Some(buttons) = state.cost_limit_buttons
+            {
+                let decision = if mouse::in_rect(mouse.column, mouse.row, buttons.override_rect) {
+                    Some(ApprovalDecision::AllowOnce)
+                } else if mouse::in_rect(mouse.column, mouse.row, buttons.stop_rect) {
+                    Some(ApprovalDecision::Reject)
+                } else {
+                    None
+                };
+                if let Some(decision) = decision
+                    && let Some(pa) = state.take_pending_approval()
+                {
+                    state.cost_limit_buttons = None;
+                    let _ = self
+                        .rpc
+                        .session_approve(&state.session_id, &pa.request_id, decision)
+                        .await;
+                }
+                return;
+            }
+
             // Approval and elicitation overlays are keyboard-driven but still
             // block clicks from reaching controls rendered beneath them.
             if state.pending_approval().is_some() || state.pending_elicitation().is_some() {
@@ -7155,7 +7234,13 @@ fn render_with_plan_placement(
     state.input_bar.render_autocomplete_popup(f);
     state.input_bar.render_attachment_manager(f, area);
 
-    if state.pending_approval().is_some() {
+    state.cost_limit_buttons = None;
+    if state
+        .pending_approval()
+        .is_some_and(PendingApproval::is_cost_limit)
+    {
+        state.cost_limit_buttons = render_cost_limit_overlay(f, state, area);
+    } else if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
     }
 
@@ -8118,6 +8203,46 @@ fn render_tool_entry_with_diff(
                 } else {
                     display_limited |= render_generic_input(lines);
                 }
+            }
+        }
+        "ask_user" | "poll" => {
+            // The card is the durable record of a question (the daemon
+            // persists the tool call), so it leads with the question and
+            // lists the choices, in every disclosure. The generic preview
+            // showed the first bytes of key-sorted JSON, which put `channel`
+            // and `choices` ahead of the question and cut it off.
+            let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+            let question = parsed
+                .as_ref()
+                .and_then(|input| input.get("question"))
+                .and_then(serde_json::Value::as_str);
+            if let (Some(input), Some(question)) = (parsed.as_ref(), question) {
+                let (question, limited) = terminal_safe_tool_text_limited(
+                    question,
+                    TOOL_EXPANDED_MAX_BYTES,
+                    TOOL_EXPANDED_MAX_LINES,
+                );
+                display_limited |= limited;
+                push_text(lines, "question", &question);
+                let choices = input
+                    .get(if name == "poll" { "options" } else { "choices" })
+                    .and_then(serde_json::Value::as_array);
+                for (i, choice) in choices
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .enumerate()
+                {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}. {}", i + 1, preview(choice, 200)),
+                        theme::dim_style().add_modifier(sel_mod),
+                    )));
+                }
+                if matches!(disclosure, ToolDisclosure::Full) {
+                    display_limited |= render_generic_input(lines);
+                }
+            } else {
+                display_limited |= render_generic_input(lines);
             }
         }
         _ => {
@@ -9543,6 +9668,115 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
     );
 }
 
+/// The daemon paused a turn because a cost limit is reached and asks
+/// whether to override it. Drawn centred, in bold red, above everything in
+/// the pane; only Override or Stop (key or click) closes it. Returns the
+/// button rects for the mouse handler.
+fn render_cost_limit_overlay(
+    f: &mut Frame,
+    state: &ChatState,
+    area: Rect,
+) -> Option<CostLimitButtons> {
+    use crate::keymap::{ChatTabAction as C, action_key_labels};
+    let pa = state.pending_approval()?;
+    let red = theme::status_error_style().add_modifier(Modifier::BOLD);
+    let override_label = format!(
+        " {} ({}) ",
+        crate::i18n::t("zc-chat-cost-limit-override"),
+        action_key_labels(C::ApprovalApprove).join("/")
+    );
+    let stop_label = format!(
+        " {} ({}) ",
+        crate::i18n::t("zc-chat-cost-limit-stop"),
+        action_key_labels(C::CancelTurn).join("/")
+    );
+    let minutes = pa.timeout_secs.div_ceil(60).to_string();
+    let wait = crate::i18n::t_args("zc-chat-cost-limit-wait", &[("minutes", &minutes)]);
+
+    let width = area.width.saturating_sub(4).clamp(20, 76);
+    let inner_width = width.saturating_sub(4).max(1) as usize;
+    let body_rows = |text: &str| {
+        crate::display_width::display_width(text)
+            .div_ceil(inner_width)
+            .max(1) as u16
+    };
+    // border + pad + summary + blank + wait + blank + buttons + pad + border
+    let height = (body_rows(&pa.arguments_summary) + body_rows(&wait) + 6)
+        .min(area.height)
+        .max(3);
+    let modal = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height,
+    };
+    f.render_widget(Clear, modal);
+
+    let title = format!(" {} ", crate::i18n::t("zc-chat-cost-limit-title"));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Thick)
+        .border_style(red)
+        .title(Span::styled(title, red))
+        .title_alignment(Alignment::Center)
+        .style(theme::fill_style());
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    let body = Rect {
+        x: inner.x + 1,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(2),
+        height: inner.height.saturating_sub(3),
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(pa.arguments_summary.clone(), red)),
+            Line::default(),
+            Line::from(Span::styled(wait, theme::dim_style())),
+        ])
+        .wrap(Wrap { trim: true }),
+        body,
+    );
+
+    let row = inner.y + inner.height.saturating_sub(2);
+    let override_w = crate::display_width::display_width(&override_label) as u16;
+    let stop_w = crate::display_width::display_width(&stop_label) as u16;
+    let override_rect = Rect {
+        x: inner.x + 1,
+        y: row,
+        width: override_w.min(inner.width.saturating_sub(1)),
+        height: 1,
+    };
+    let stop_rect = Rect {
+        x: (override_rect.x + override_rect.width + 3).min(inner.x + inner.width),
+        y: row,
+        width: stop_w
+            .min((inner.x + inner.width).saturating_sub(override_rect.x + override_rect.width + 3)),
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            override_label,
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(ratatui::style::Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )),
+        override_rect,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            stop_label,
+            red.add_modifier(Modifier::REVERSED),
+        )),
+        stop_rect,
+    );
+    Some(CostLimitButtons {
+        override_rect,
+        stop_rect,
+    })
+}
+
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     let pa = match state.pending_approval() {
         Some(p) => p,
@@ -10781,6 +11015,21 @@ pub struct PendingApproval {
     pub timeout_secs: u64,
 }
 
+impl PendingApproval {
+    /// The daemon's budget-override prompt, not a tool call: rendered as the
+    /// red cost-limit notice instead of the tool approval card.
+    pub fn is_cost_limit(&self) -> bool {
+        self.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+    }
+}
+
+/// Click targets of the cost-limit notice from its last draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CostLimitButtons {
+    override_rect: Rect,
+    stop_rect: Rect,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     /// JSON-RPC request id to respond to. Echoed verbatim.
@@ -10807,7 +11056,31 @@ pub struct PendingElicitation {
     pub selected: Vec<bool>,
 }
 
+/// A pending elicitation cleared without an answer, awaiting its `cancel`.
+#[derive(Debug, Clone)]
+struct WithdrawnElicitation {
+    request_id: serde_json::Value,
+    /// Whether to note the withdrawal in this state's transcript. False when
+    /// the state has already moved to a different session.
+    note: bool,
+}
+
 impl PendingElicitation {
+    /// The chosen choice titles, comma-joined, for the transcript record.
+    fn answer_summary(&self) -> String {
+        if self.multi {
+            self.choices
+                .iter()
+                .zip(&self.selected)
+                .filter(|(_, on)| **on)
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.choices.get(self.cursor).cloned().unwrap_or_default()
+        }
+    }
+
     /// Number of currently-checked rows (multi-select only).
     pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|&&b| b).count()
@@ -11366,6 +11639,12 @@ pub struct ChatState {
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
+    /// Elicitations this state cleared without the user's answer (a reload,
+    /// a session reset, a newer prompt). The daemon is still waiting on each
+    /// one, so `Chat::answer_withdrawn_elicitations` sends it a `cancel` and
+    /// notes it in the transcript. Without this the tool call blocks until
+    /// its own timeout (600 s for `ask_user`) with nothing on screen.
+    withdrawn_elicitations: Vec<WithdrawnElicitation>,
     /// Why the sidebar shows this session red. Set when a turn ends
     /// `Failed`; cleared by the next prompt, a completed turn, a session
     /// reset, or a successful re-attach.
@@ -11379,6 +11658,10 @@ pub struct ChatState {
     /// closure and terminal notifications leave it intact.
     /// `(generation, entry index, prior durable count)` for the optimistic row.
     optimistic_user_message: Option<(u64, usize, usize)>,
+    /// Text of the queued message the current turn dispatched, keyed by turn
+    /// generation. A `SESSION_BUSY` refusal means the daemon never ran it, so
+    /// it goes back to the front of the queue instead of being dropped.
+    dispatched_prompt: Option<(u64, String)>,
     /// Set when any streaming text was flushed during the current turn.
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
@@ -11388,6 +11671,15 @@ pub struct ChatState {
     /// the same local generation extend this entry instead of creating a
     /// second `Agent:` block.
     prompt_settled_stream_entry: Option<(u64, usize)>,
+    /// The pane's own turn was settled from its `session/prompt` response
+    /// and that turn's terminal frame has not arrived yet. Frames still
+    /// streaming in belong to that turn, not to a turn someone else started.
+    prompt_settled_awaiting_terminal: bool,
+    /// The turn in flight was started by another connection (announced by a
+    /// `user_message` frame, or inferred from turn frames arriving while the
+    /// pane was idle). Its terminal frame carries the issuer's generation,
+    /// not this pane's, so it settles the turn whatever generation it names.
+    observing_foreign_turn: bool,
     /// Set when any `ToolCall` event arrived during the current turn.
     /// Used by `commit_turn` to distinguish "empty completion with tool
     /// calls" (normal — tool output is the visible record) from "empty
@@ -11505,6 +11797,9 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// Buttons of the cost-limit notice from the last draw; `None` when the
+    /// notice is not on screen.
+    cost_limit_buttons: Option<CostLimitButtons>,
     /// Exact close-cell target from the last Todo panel draw.
     #[cfg(test)]
     todo_close_hit_rect: Option<ratatui::layout::Rect>,
@@ -11555,12 +11850,16 @@ impl ChatState {
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
+            withdrawn_elicitations: Vec::new(),
             last_error: None,
             turn_in_flight: false,
             turn_generation: 0,
             optimistic_user_message: None,
+            dispatched_prompt: None,
             turn_had_streaming_text: false,
             prompt_settled_stream_entry: None,
+            prompt_settled_awaiting_terminal: false,
+            observing_foreign_turn: false,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -11612,6 +11911,7 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            cost_limit_buttons: None,
             #[cfg(test)]
             todo_close_hit_rect: None,
             thinking: crate::client::ThinkingOptionsResult::default(),
@@ -13176,8 +13476,49 @@ impl ChatState {
     /// before the first is answered is a protocol anomaly we resolve by
     /// keeping the newest).
     pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
+        self.withdraw_pending_elicitation(true);
+        self.record_elicitation_asked(&e);
         self.pending_elicitation = Some(e);
         self.mark_dirty_full();
+    }
+
+    /// Clear the pending elicitation without an answer, queueing the
+    /// `cancel` the daemon is waiting for. Every path that drops the modal
+    /// for a reason other than the user's answer goes through here.
+    fn withdraw_pending_elicitation(&mut self, note: bool) {
+        if let Some(e) = self.pending_elicitation.take() {
+            self.withdrawn_elicitations.push(WithdrawnElicitation {
+                request_id: e.request_id,
+                note,
+            });
+            self.mark_dirty_full();
+        }
+    }
+
+    fn take_withdrawn_elicitations(&mut self) -> Vec<WithdrawnElicitation> {
+        std::mem::take(&mut self.withdrawn_elicitations)
+    }
+
+    /// Write the question and its choices into the transcript when it
+    /// arrives, so the record outlives the modal.
+    fn record_elicitation_asked(&mut self, e: &PendingElicitation) {
+        self.freeze_prompt_settled_stream();
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
+        self.flush_streaming_thought();
+        let mut text =
+            crate::i18n::t_args("zc-chat-elicitation-asked", &[("question", &e.message)]);
+        for (i, choice) in e.choices.iter().enumerate() {
+            text.push_str(&format!("\n  {}. {choice}", i + 1));
+        }
+        self.record_elicitation_outcome(text);
+    }
+
+    fn record_elicitation_outcome(&mut self, text: String) {
+        self.entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(text)));
+        self.mark_dirty_append();
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -13260,6 +13601,19 @@ impl ChatState {
             return;
         }
         self.last_activity = Some(chrono::Utc::now().to_rfc3339());
+
+        // Turn activity while the pane believes it is idle, and not the tail
+        // of its own prompt-settled turn, means another connection started a
+        // turn on this session without an announcement (an older daemon, or a
+        // frame that raced ahead of it). Treat the session as busy until that
+        // turn's terminal frame: otherwise the queue dispatches into a session
+        // the daemon holds and the prompt is refused as SESSION_BUSY.
+        if !self.turn_in_flight
+            && !self.prompt_settled_awaiting_terminal
+            && update.is_turn_activity()
+        {
+            self.begin_observed_turn();
+        }
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
@@ -13502,13 +13856,24 @@ impl ChatState {
                 content,
                 ..
             } => {
-                if client_turn_generation
-                    .is_some_and(|generation| generation != self.turn_generation)
+                // A foreign turn's terminal carries the issuer's generation
+                // (or none); it settles the observed turn regardless.
+                if !self.observing_foreign_turn
+                    && client_turn_generation
+                        .is_some_and(|generation| generation != self.turn_generation)
                 {
                     return;
                 }
+                self.prompt_settled_awaiting_terminal = false;
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
+                }
+                // The turn that asked is over, so the daemon stopped waiting
+                // (its tool timed out or the turn was cancelled). Close the
+                // stale modal and record that it went unanswered.
+                if self.pending_elicitation.take().is_some() {
+                    self.record_elicitation_outcome(crate::i18n::t("zc-chat-elicitation-expired"));
+                    self.mark_dirty_full();
                 }
                 match outcome {
                     TurnEndOutcome::Completed => {
@@ -13550,14 +13915,21 @@ impl ChatState {
                 });
                 self.mark_dirty_append();
                 self.message_count = self.message_count.saturating_add(1);
-                self.turn_in_flight = true;
-                self.turn_generation = self.turn_generation.wrapping_add(1);
-                self.turn_had_streaming_text = false;
-                self.turn_had_tool_calls = false;
-                self.turn_status = TurnStatus::Working;
-                self.turn_started_at = Instant::now();
+                self.begin_observed_turn();
             }
         }
+    }
+
+    /// Enter the busy state for a turn this pane did not start.
+    fn begin_observed_turn(&mut self) {
+        self.prompt_settled_awaiting_terminal = false;
+        self.observing_foreign_turn = true;
+        self.turn_in_flight = true;
+        self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
+        self.turn_status = TurnStatus::Working;
+        self.turn_started_at = Instant::now();
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
@@ -13598,6 +13970,7 @@ impl ChatState {
     }
 
     fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
+        self.prompt_settled_awaiting_terminal = true;
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
@@ -13622,7 +13995,9 @@ impl ChatState {
 
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
+        self.observing_foreign_turn = false;
         self.optimistic_user_message = None;
+        self.dispatched_prompt = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         let mut cleanup_report = self.cleanup_active_turn_attachments();
@@ -13687,6 +14062,8 @@ impl ChatState {
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
         self.freeze_prompt_settled_stream();
+        self.prompt_settled_awaiting_terminal = false;
+        self.observing_foreign_turn = false;
         self.last_activity = Some(chrono::Utc::now().to_rfc3339());
         // A new prompt supersedes the previous failure: the red dot clears
         // until the daemon reports otherwise.
@@ -13728,6 +14105,33 @@ impl ChatState {
 
     fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
         cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
+    }
+
+    /// Put the message a refused prompt dispatched back at the front of the
+    /// queue, with its attachments, and pause the queue. Only for refusals
+    /// issued before the turn started (`SESSION_BUSY`): the daemon never ran
+    /// the message, so dropping it would lose what the user typed. The queue
+    /// pauses so a session that stays busy is not retried in a loop; the item
+    /// is re-queued as `Pending` (not `Injected`) for the same reason, since
+    /// injected items bypass the pause.
+    fn requeue_refused_dispatch(&mut self, generation: u64) -> bool {
+        let Some((marked_generation, text)) = self.dispatched_prompt.take() else {
+            return false;
+        };
+        if marked_generation != generation {
+            return false;
+        }
+        let attachments = std::mem::take(&mut self.active_turn_attachments);
+        let id = self.alloc_queue_id();
+        self.message_queue.push_front(QueuedMessage {
+            id,
+            text,
+            attachments,
+            status: QueueItemStatus::Pending,
+        });
+        self.queue_paused = Some(QueuePauseReason::Generic);
+        self.resume_override = false;
+        true
     }
 
     fn remove_optimistic_user_message(&mut self, generation: u64) {
@@ -13948,11 +14352,15 @@ impl ChatState {
     /// Restore the queue and composer state the client owns across a transport
     /// rebuild. Transcript, pending interactions, and terminal turn state come
     /// from (or are reconciled with) the daemon instead of being snapshotted.
+    /// The red-dot status is the exception: `load_history` never sets
+    /// `last_error`, so a failed last turn or a failed reconciliation is
+    /// carried from the old pane.
     fn restore_reconnect_state(
         &mut self,
         queue: ReconnectQueueState,
         interrupted: bool,
         recovery_required: bool,
+        turn_failed: bool,
     ) {
         self.message_queue = queue.messages;
         self.next_queue_id = queue.next_id;
@@ -13965,6 +14373,8 @@ impl ChatState {
         self.resume_override = false;
         if recovery_required {
             self.last_error = Some(SessionError::ResyncFailed);
+        } else if turn_failed {
+            self.last_error = Some(SessionError::TurnFailed);
         }
         if interrupted {
             self.entries
@@ -14257,7 +14667,7 @@ impl ChatState {
     fn prepare_for_reattach_resync(&mut self, mode: SessionResyncMode) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(true);
         if mode == SessionResyncMode::Reattach {
             self.lag_reattach = None;
         }
@@ -14271,7 +14681,10 @@ impl ChatState {
     fn reset_turn_for_resync_reload(&mut self) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        // A prompt that arrived while the reload ran is still awaited by the
+        // daemon; dropping it silently left the tool call hanging until its
+        // timeout. Withdraw it so it is answered.
+        self.withdraw_pending_elicitation(true);
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.streaming_selection_breaks = None;
@@ -14281,6 +14694,9 @@ impl ChatState {
         self.clear_transcript_selection();
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
+        self.dispatched_prompt = None;
+        self.prompt_settled_awaiting_terminal = false;
+        self.observing_foreign_turn = false;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
@@ -14379,12 +14795,18 @@ impl ChatState {
         self.entries
             .push(ChatEntry::SystemMessage(Arc::<str>::from(notice_text)));
         self.info_message = None;
-        // The reload clears `last_error` unconditionally: a stale `ResyncFailed`
-        // from this very resync must not stick once the snapshot proves the
-        // transcript is readable again. The carried outcome below then
-        // re-applies `SessionLost`/`TurnFailed` if the finished turn itself
-        // failed.
-        self.last_error = None;
+        // The reload clears the connection-class errors: a stale
+        // `ResyncFailed` from this very resync must not stick once the
+        // snapshot proves the transcript is readable again. `TurnFailed`
+        // survives: a lag reload covers every tracked session, idle ones
+        // included, and reloading does not change whether the last turn
+        // failed. Every dispatch from this pane clears it in
+        // `push_user_message`, so a `TurnFailed` here belongs to the last
+        // turn this pane sent. The carried outcome below then re-applies
+        // `SessionLost`/`TurnFailed` if the finished turn itself failed.
+        if self.last_error != Some(SessionError::TurnFailed) {
+            self.last_error = None;
+        }
         // Consume the outcome captured by the terminal-frame intercept
         // (`drain_notifications`), handed over by the apply that took
         // `lag_reattach` whole. Owner: that one reload; nothing else may
@@ -14819,7 +15241,7 @@ impl ChatState {
         self.context_menu = None;
         self.copy_feedback = None;
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(false);
         self.last_error = None;
         self.turn_in_flight = false;
         self.message_count = 0;
@@ -15757,6 +16179,7 @@ mod tests {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            turn_failed: false,
         }
     }
 
@@ -20779,7 +21202,12 @@ mod tests {
             }],
             false,
         );
-        rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+            entry.turn_failed,
+        );
         assert_eq!(rebuilt.queue_len(), 1);
         assert_eq!(
             rebuilt.queue_paused,
@@ -21142,6 +21570,101 @@ mod tests {
         let entries = chat.resume_entries();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].recovery_required);
+    }
+
+    /// A notification-lag reload covers idle sessions too. It resolves
+    /// `ResyncFailed` but must not turn a failed last turn green.
+    #[test]
+    fn notification_resync_reload_keeps_failed_turn_and_clears_resync_failed() {
+        let history = || {
+            vec![crate::client::MessageEntry {
+                role: "assistant".to_string(),
+                content: "durable answer".to_string(),
+                ..Default::default()
+            }]
+        };
+
+        let mut failed = state();
+        failed.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
+        failed.replace_history_after_notification_resync(
+            history(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
+        assert_eq!(failed.sidebar_status(), SidebarStatus::Errored);
+
+        let mut unreconciled = state();
+        unreconciled.last_error = Some(SessionError::ResyncFailed);
+        unreconciled.replace_history_after_notification_resync(
+            history(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        assert_eq!(unreconciled.last_error, None);
+        assert_eq!(unreconciled.sidebar_status(), SidebarStatus::Ready);
+    }
+
+    /// A daemon restart rebuilds the pane, and the rebuilt `ChatState` starts
+    /// with `last_error` clear. A failed last turn must keep its red dot; a
+    /// lost session is resolved by the rebuild's own re-attach and comes back
+    /// ready.
+    #[tokio::test]
+    async fn reconnect_rebuild_keeps_failed_turn_red_and_clears_session_lost() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(ref mut focused) = chat.phase else {
+            panic!("focused session must be active");
+        };
+        focused.apply_update(turn_complete(
+            "sess-a",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        assert_eq!(focused.last_error, Some(SessionError::TurnFailed));
+        chat.background[0].apply_update(turn_complete(
+            "sess-b",
+            TurnEndOutcome::Failed,
+            "prompt failed: session_not_found",
+        ));
+        assert_eq!(
+            chat.background[0].last_error,
+            Some(SessionError::SessionLost)
+        );
+
+        let entries = chat.resume_entries();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let mut rebuilt = state_for(&entry.session_id, &entry.agent_alias);
+            assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Ready);
+            rebuilt.restore_reconnect_state(
+                entry.queue,
+                entry.interrupted,
+                entry.recovery_required,
+                entry.turn_failed,
+            );
+            match entry.session_id.as_str() {
+                "sess-a" => {
+                    assert_eq!(rebuilt.last_error, Some(SessionError::TurnFailed));
+                    assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Errored);
+                }
+                "sess-b" => {
+                    assert_eq!(rebuilt.last_error, None);
+                    assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Ready);
+                }
+                other => panic!("unexpected resume entry {other}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -28838,6 +29361,117 @@ mod tests {
         );
     }
 
+    fn foreign_frame(params: serde_json::Value) -> RpcNotification {
+        RpcNotification {
+            method: "session/update".to_string(),
+            params,
+        }
+    }
+
+    // A turn another connection started streams into this idle pane with no
+    // announcement (an older daemon). The pane must read the session as busy
+    // and hold its queue until that turn's terminal frame, whose generation is
+    // the issuer's, not the pane's.
+    #[tokio::test]
+    async fn unannounced_foreign_turn_holds_queue_until_its_terminal() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let (notif_tx, notif_rx) = broadcast::channel(16);
+        chat.notif_rx = notif_rx;
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        notif_tx
+            .send(foreign_frame(serde_json::json!({
+                "type": "tool_call",
+                "session_id": "sess-1",
+                "tool_call_id": "t1",
+                "name": "shell",
+                "raw_input": {"command": "go test ./..."}
+            })))
+            .unwrap();
+        chat.drain_notifications();
+        assert!(
+            active_state(&mut chat).turn_in_flight,
+            "turn frames while idle mean someone else's turn is running"
+        );
+        assert_eq!(
+            active_state(&mut chat).sidebar_status(),
+            SidebarStatus::Running
+        );
+
+        active_state(&mut chat)
+            .enqueue_message("typed during the foreign turn".to_string(), Vec::new())
+            .unwrap();
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the queue must not dispatch into a session another turn holds"
+        );
+
+        notif_tx
+            .send(foreign_frame(serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "completed",
+                "content": "done",
+                "client_turn_generation": 4242
+            })))
+            .unwrap();
+        chat.drain_notifications();
+        // The foreign terminal settles the observed turn despite naming the
+        // issuer's generation; the drain then pumps the queue, so the held
+        // message is what dispatches next.
+        let request = next_rpc_request(
+            &mut writer_rx,
+            "the foreign terminal must settle the observed turn and release the queue",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_PROMPT);
+        assert_eq!(request["params"]["prompt"], "typed during the foreign turn");
+    }
+
+    // The announced path: a `user_message` frame from the daemon starts the
+    // observed turn; the terminal frame carries the issuer's generation.
+    #[test]
+    fn announced_foreign_turn_settles_on_foreign_generation_terminal() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::UserMessage {
+            session_id: "sess-1".to_string(),
+            text: "[wake] new activity".to_string(),
+            source: Some("external".to_string()),
+        });
+        assert!(s.turn_in_flight);
+        s.apply_update(SessionUpdate::TurnComplete {
+            session_id: "sess-1".to_string(),
+            outcome: TurnEndOutcome::Completed,
+            content: "ok".to_string(),
+            client_turn_generation: Some(4242),
+            message_count: None,
+        });
+        assert!(
+            !s.turn_in_flight,
+            "a foreign turn's terminal must not be dropped as a stale generation"
+        );
+    }
+
+    // The pane's own turn settled from its prompt response; its terminal and
+    // trailing chunks may still arrive. Those must not read as a new foreign
+    // turn, or the queue would stall behind a turn that already ended.
+    #[test]
+    fn own_turn_tail_after_prompt_settle_is_not_a_foreign_turn() {
+        let mut s = state();
+        s.push_user_message(Some("mine".to_string()), Vec::new());
+        s.settle_turn_from_prompt_response(QueuePauseReason::MissingCompletion);
+        assert!(!s.turn_in_flight);
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "late tail".to_string(),
+        });
+        assert!(
+            !s.turn_in_flight,
+            "a late chunk of the pane's own settled turn must not mark it busy"
+        );
+    }
+
     #[test]
     fn user_message_update_for_other_session_is_ignored() {
         let mut s = state();
@@ -30424,6 +31058,141 @@ mod tests {
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
         );
+    }
+
+    fn cost_limit_request() -> SessionUpdate {
+        SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-cost".to_string(),
+            tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            arguments_summary: "Today's cost limit is reached: $3.00 spent of $1.00.".to_string(),
+            timeout_secs: 600,
+        }
+    }
+
+    #[test]
+    fn cost_limit_request_renders_the_red_notice_not_the_tool_card() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        s.apply_update(cost_limit_request());
+        assert!(
+            s.pending_approval()
+                .is_some_and(PendingApproval::is_cost_limit)
+        );
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_plan_placement(
+                    frame,
+                    &mut s,
+                    area,
+                    PaneKind::Chat,
+                    PlanPlacement::Legacy,
+                )
+            })
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            text.contains(&crate::i18n::t("zc-chat-cost-limit-title")),
+            "{text}"
+        );
+        assert!(text.contains("$3.00 spent of $1.00"), "{text}");
+        assert!(!text.contains("Approval Required"), "{text}");
+
+        let buttons = s.cost_limit_buttons.expect("buttons recorded at draw");
+        let row = |rect: Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| buffer[(x, rect.y)].symbol().to_string())
+                .collect()
+        };
+        assert!(
+            row(buttons.override_rect).contains(&crate::i18n::t("zc-chat-cost-limit-override"))
+        );
+        assert!(row(buttons.stop_rect).contains(&crate::i18n::t("zc-chat-cost-limit-stop")));
+        assert_eq!(
+            buffer[(buttons.override_rect.x + 1, buttons.override_rect.y)]
+                .style()
+                .bg,
+            Some(ratatui::style::Color::Red)
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_cost_limit_buttons_answers_the_prompt() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        for (override_clicked, expected) in [(true, "allow_once"), (false, "reject")] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc_out = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(
+                Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out))),
+                PaneKind::Chat,
+            );
+            let mut s = state();
+            s.apply_update(cost_limit_request());
+            let buttons = CostLimitButtons {
+                override_rect: Rect::new(10, 20, 25, 1),
+                stop_rect: Rect::new(40, 20, 12, 1),
+            };
+            s.cost_limit_buttons = Some(buttons);
+            chat.phase = ChatPhase::Active(Box::new(s));
+            let target = if override_clicked {
+                buttons.override_rect
+            } else {
+                buttons.stop_rect
+            };
+
+            // A click outside both buttons is swallowed and answers nothing.
+            chat.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 100, 30),
+            )
+            .await;
+            assert_no_rpc_request(&mut rx, "a click off the buttons must not answer").await;
+
+            let click = tokio::spawn(async move {
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x + 2,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    Rect::new(0, 0, 100, 30),
+                )
+                .await;
+                chat
+            });
+            let request = next_rpc_request(&mut rx, "a button click must answer").await;
+            assert_eq!(request["method"], method::SESSION_APPROVE);
+            assert_eq!(request["params"]["request_id"], "req-cost");
+            assert_eq!(request["params"]["decision"], expected);
+            respond_ok(&rpc_out, &request, serde_json::json!({}));
+            let chat = tokio::time::timeout(Duration::from_secs(2), click)
+                .await
+                .expect("click handled")
+                .unwrap();
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert!(state.pending_approval().is_none());
+        }
     }
 
     #[test]
@@ -34505,6 +35274,177 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_for_session_queues_a_cancel_for_the_dropped_elicitation() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1, "the daemon is still waiting on it");
+        assert_eq!(withdrawn[0].request_id, serde_json::json!("elicit-1"));
+        assert!(
+            !withdrawn[0].note,
+            "the old session's note does not belong in the new one"
+        );
+    }
+
+    fn system_texts(state: &ChatState) -> Vec<String> {
+        state
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::SystemMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression (2026-10-09): a prompt that arrives while a reattach reload
+    /// is in flight was installed, then wiped by the reload's turn reset with
+    /// no reply. The daemon's `ask_user` waited out its 600 s timeout and the
+    /// user never saw the question. It must be answered `cancel` and noted.
+    #[tokio::test]
+    async fn elicitation_installed_during_reload_is_answered_not_dropped() {
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        chat.session_resync_in_flight.insert(
+            "sess-1".to_string(),
+            ResyncInFlight {
+                mode: SessionResyncMode::Reattach,
+                owned_turn: None,
+            },
+        );
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-mid", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: "sess-1".to_string(),
+            result: Ok(SessionResyncSnapshot {
+                messages: Vec::new(),
+                message_count: 0,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        chat.answer_withdrawn_elicitations();
+
+        let frame = next_rpc_request(&mut writer_rx, "the dropped prompt must be answered").await;
+        assert_eq!(frame["id"], "e-mid");
+        assert_eq!(frame["result"]["action"], "cancel");
+        let state = active_state(&mut chat);
+        assert!(state.pending_elicitation.is_none());
+        let withdrawn = crate::i18n::t("zc-chat-elicitation-withdrawn");
+        assert_eq!(
+            system_texts(state).last(),
+            Some(&withdrawn),
+            "the note lands after the reloaded history"
+        );
+    }
+
+    // Keymap overrides are process-global; hold the test lock across the
+    // key dispatch so another test cannot remap Enter mid-test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_question_choices_and_answer_are_recorded() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-rec", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        let asked = system_texts(active_state(&mut chat));
+        let expected = format!(
+            "{}\n  1. Yes\n  2. No",
+            crate::i18n::t_args("zc-chat-elicitation-asked", &[("question", "Pick one")])
+        );
+        assert_eq!(asked.last(), Some(&expected));
+
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+
+        let frame = next_rpc_request(&mut writer_rx, "the answer must be sent").await;
+        assert_eq!(frame["id"], "e-rec");
+        assert_eq!(frame["result"]["content"]["choice"], "choice-1");
+        let answered = crate::i18n::t_args("zc-chat-elicitation-answered", &[("answer", "No")]);
+        let texts = system_texts(active_state(&mut chat));
+        assert_eq!(texts.last(), Some(&answered));
+        assert!(texts.contains(&expected), "the question stays on record");
+    }
+
+    #[test]
+    fn turn_complete_closes_a_stale_elicitation_and_records_it() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+        assert!(
+            s.pending_elicitation().is_none(),
+            "nobody is waiting on a prompt once its turn ends"
+        );
+        assert!(
+            system_texts(&s).contains(&crate::i18n::t("zc-chat-elicitation-expired")),
+            "the unanswered outcome is recorded"
+        );
+    }
+
+    #[test]
+    fn ask_user_card_leads_with_the_question_and_lists_choices() {
+        // Key-sorted, as the daemon serializes tool input.
+        let input = serde_json::json!({
+            "channel": "rpc",
+            "choices": [
+                "A+B+C as proposed, filing all three upstream tonight",
+                "Only A and C now, B waits for the dogfood rebase",
+                "Something else (I'll type)"
+            ],
+            "question": "Which plan should I follow for the three bugs?",
+            "timeout_secs": 600
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            120,
+            Some("Only A and C now, B waits for the dogfood rebase"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let text = rendered_text(&lines);
+        assert!(
+            text.contains("  question: Which plan should I follow for the three bugs?"),
+            "{text}"
+        );
+        assert!(text.contains("    1. A+B+C as proposed"), "{text}");
+        assert!(text.contains("    3. Something else (I'll type)"), "{text}");
+        assert!(
+            text.find("question:") < text.find("result:"),
+            "question before the outcome: {text}"
+        );
+    }
+
     // ── Inbound elicitation routing (ask_user intermittent-failure fix) ──
 
     /// Build an inbound `elicitation/create` request for `session_id` with a
@@ -35246,6 +36186,91 @@ mod tests {
         assert!(
             active.info_message.is_some(),
             "the dispatch error must be surfaced"
+        );
+        let queued: Vec<_> = active
+            .message_queue
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["busy prompt".to_string(), "queued follow-up".to_string()],
+            "a busy refusal never ran the message, so it returns to the front of the queue"
+        );
+        assert!(
+            active.queue_paused(),
+            "the requeued message waits for an explicit resume, not a retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_session_busy_requeues_ahead_of_pending_with_attachments() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let clip = dir.path().join("shot.png");
+        std::fs::write(&clip, b"png").expect("write clipboard attachment");
+        let mut active = state();
+        active
+            .enqueue_message("first".to_string(), vec![clipboard_att(&clip, "shot.png")])
+            .unwrap();
+        active
+            .enqueue_message("second".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "first prompt should be sent").await;
+        assert_eq!(request["params"]["prompt"], "first");
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_BUSY,
+            "Session busy: Timed out waiting for session sess-1",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        let queued: Vec<_> = active
+            .message_queue
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(queued, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(active.message_queue[0].attachments.len(), 1);
+        assert!(
+            clip.exists(),
+            "settling a refused turn must not delete the requeued clipboard temp"
+        );
+        assert!(active.queue_paused());
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a paused queue must not redispatch into the busy session"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_non_busy_error_does_not_requeue() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("bad prompt".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt should be sent").await;
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::INVALID_PARAMS,
+            "bad params",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        assert_eq!(
+            active_state(&mut chat).queue_len(),
+            0,
+            "only a refusal issued before the turn started requeues"
         );
     }
 

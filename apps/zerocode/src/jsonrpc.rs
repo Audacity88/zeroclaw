@@ -79,7 +79,6 @@ pub mod error_codes {
     pub const INTERNAL_ERROR: i32 = -32603;
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
-    #[cfg(test)]
     pub const SESSION_BUSY: i32 = -32002;
 }
 

@@ -6414,7 +6414,15 @@ impl RpcDispatcher {
     /// issuer and owner are the same connection (or the owner is not
     /// connected), this is just the issuer's own outbound — exactly one copy
     /// of each notification, as before.
-    async fn turn_notification_outbound(&self, session_id: &str) -> Arc<RpcOutbound> {
+    ///
+    /// The second value is the owner's outbound alone, present only when the
+    /// owner is a different connection: frames meant for the owner and not
+    /// the issuer (the announcement of a prompt the owner did not type) go
+    /// there directly.
+    async fn turn_notification_outbound(
+        &self,
+        session_id: &str,
+    ) -> (Arc<RpcOutbound>, Option<Arc<RpcOutbound>>) {
         let owner_outbound = super::turn_notifications::owner_turn_outbound(
             Arc::clone(&self.ctx),
             session_id,
@@ -6438,10 +6446,11 @@ impl RpcDispatcher {
             message
         );
         match owner_outbound {
-            Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => {
-                fanout_outbound(vec![Arc::clone(&self.rpc), owner])
-            }
-            _ => Arc::clone(&self.rpc),
+            Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => (
+                fanout_outbound(vec![Arc::clone(&self.rpc), Arc::clone(&owner)]),
+                Some(owner),
+            ),
+            _ => (Arc::clone(&self.rpc), None),
         }
     }
 
@@ -6500,7 +6509,7 @@ impl RpcDispatcher {
         // and, when a different live connection owns the session, to that
         // owner as well — a pane must see a turn triggered on its session by
         // any caller, not only by itself.
-        let turn_rpc = self.turn_notification_outbound(sid).await;
+        let (turn_rpc, foreign_owner_rpc) = self.turn_notification_outbound(sid).await;
 
         let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
         if let Some(expected) = expected_generation
@@ -7077,10 +7086,50 @@ impl RpcDispatcher {
                 .with_attrs(::serde_json::json!({ "session_id": sid })),
             "turn dispatch: registered cancel token, starting turn"
         );
-        // An agent-injected prompt was not typed by the pane that owns this
-        // session: tell that pane the message exists before the turn starts,
-        // so the stream it is about to receive reads as a reply to a visible
-        // prompt instead of appearing from nowhere.
+        // A prompt from any connection other than the owner's was not typed
+        // in the owner pane: tell that pane the message exists before the
+        // turn starts, so it knows the session is busy and the stream it is
+        // about to receive reads as a reply to a visible prompt. Without this
+        // a pane fed a foreign turn's frames stays idle and dispatches into a
+        // session the daemon holds (SESSION_BUSY after the admission wait).
+        // Agent-injected prompts carry the injecting alias; any other
+        // foreign caller (a script on the socket, another client) is labelled
+        // `external`, and the announcement goes to the owner only so a
+        // client that typed the prompt never receives its own words back.
+        if req.injected_by.is_none()
+            && let Some(owner_rpc) = foreign_owner_rpc.as_ref()
+        {
+            let update = SessionUpdateEvent::UserMessage {
+                session_id: sid.to_string(),
+                text: prompt.clone(),
+                source: Some(EXTERNAL_PROMPT_SOURCE.to_string()),
+            };
+            if let Ok(params) = serde_json::to_value(update)
+                && let Ok(frame) = serde_json::to_string(&JsonRpcNotification::new(
+                    notification::SESSION_UPDATE,
+                    params,
+                ))
+            {
+                let queued = owner_rpc.send_raw(frame).await;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(if queued {
+                            ::zeroclaw_log::EventOutcome::Success
+                        } else {
+                            ::zeroclaw_log::EventOutcome::Failure
+                        })
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "issuer": self.peer_label,
+                            "prompt_chars": prompt.chars().count(),
+                        })),
+                    "turn dispatch: external prompt user_message update queued to session owner"
+                );
+            }
+        }
+        drop(foreign_owner_rpc);
         if let Some(source) = req.injected_by.as_deref() {
             let update = SessionUpdateEvent::UserMessage {
                 session_id: sid.to_string(),
@@ -7897,6 +7946,32 @@ impl RpcDispatcher {
                 overrides: merged,
                 thinking_options,
             });
+        }
+
+        // A running turn holds this session's `model_provider_update` guard
+        // for its whole duration (see `handle_session_prompt`), and the agent
+        // lock with it. Waiting for that guard here would park this
+        // connection's serial request loop until the turn ends — so a
+        // `session/cancel` sent to stop the turn would queue behind the very
+        // switch that is waiting on it, the client's RPC deadline would fire,
+        // and the switch would still commit silently after the turn. Refuse
+        // instead. Checked before `config_write_lock` so a refused switch
+        // never stalls other config writers either. Residual window: a turn
+        // admitted between this check and the guard acquisition below still
+        // makes configure wait for that turn. Closing it would need the
+        // admission and this check under one lock; the window is the few
+        // awaits between here and `lock_model_provider_update`.
+        if self
+            .ctx
+            .sessions
+            .inflight_turn_generation(&req.session_id)
+            .is_some()
+        {
+            return Err(rpc_err(
+                SESSION_BUSY,
+                "turn in progress: model and provider switches apply between turns; \
+                 switch after this turn ends, or cancel it first",
+            ));
         }
 
         // Wait for a provisional binding to be confirmed, for the same reason
@@ -10197,6 +10272,23 @@ impl RpcDispatcher {
                 if !in_scope {
                     continue;
                 }
+            }
+
+            // In scope and mid-turn: the turn holds this session's guard for
+            // its whole duration, so waiting here would park the issuing
+            // connection (and every config writer, since the caller holds
+            // `config_write_lock`) until the turn ends. Nothing has been
+            // saved yet — preparation runs before the commit — so refusing
+            // leaves both the stored and the live config untouched.
+            if ctx.sessions.inflight_turn_generation(&session_id).is_some() {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    format!(
+                        "turn in progress on live session `{session_id}`: this change \
+                         rebuilds its model provider, which happens between turns; \
+                         retry after the turn ends, or cancel it first"
+                    ),
+                ));
             }
 
             // Acquire the per-session ordering boundary. This serialises
@@ -14393,6 +14485,10 @@ fn replace_rpc_chat_conversation_state(
 /// untouched: one `send_raw` reaches every target. The forwarder lives only
 /// as long as some handle to the fanout does — a turn drops it when its
 /// last notification is sent, so nothing long-lived is leaked per turn.
+/// `UserMessage.source` for a prompt the owner pane did not type and no agent
+/// injected: a script on the daemon socket or another client.
+pub(crate) const EXTERNAL_PROMPT_SOURCE: &str = "external";
+
 fn fanout_outbound(targets: Vec<Arc<RpcOutbound>>) -> Arc<RpcOutbound> {
     let (tx, mut rx) = mpsc::channel::<String>(64);
     zeroclaw_spawn::spawn!(async move {
@@ -39228,6 +39324,160 @@ mod tests {
         );
     }
 
+    /// A model switch issued while the session's turn is running must not
+    /// park the connection. `handle_session_prompt` holds the session's
+    /// `model_provider_update` guard for the whole turn, and requests on one
+    /// connection are processed serially, so a configure that waited for the
+    /// guard would hold up every later request on that connection —
+    /// including the `session/cancel` the user sends to stop the turn.
+    /// Configure must answer SESSION_BUSY promptly and leave the overrides
+    /// untouched, and the following cancel must be processed.
+    #[tokio::test]
+    async fn model_switch_during_turn_is_refused_and_does_not_block_cancel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(
+            make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp))
+                .ctx
+                .clone(),
+            tx,
+            "test-peer".into(),
+        );
+        dispatcher.set_authenticated_for_test();
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Simulate a running turn the way `handle_session_prompt` does: a
+        // registered cancel token plus the held provider-update guard.
+        let turn_token = tokio_util::sync::CancellationToken::new();
+        let session_generation = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .expect("live session");
+        dispatcher
+            .ctx
+            .sessions
+            .register_cancel_token_for_generation_for_test(
+                &session_id,
+                session_generation,
+                turn_token.clone(),
+            );
+        let turn_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let configure = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/configure",
+            "params": {"session_id": session_id, "overrides": {"model": "new-model"}}
+        })
+        .to_string();
+        let cancel = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/cancel",
+            "params": {"session_id": session_id}
+        })
+        .to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            dispatcher.process_line(&configure).await;
+            dispatcher.process_line(&cancel).await;
+        })
+        .await
+        .expect("configure during a turn must not park the connection ahead of cancel");
+
+        let mut responses = std::collections::HashMap::new();
+        while responses.len() < 2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("response frame")
+                .expect("writer open");
+            let value: Value = serde_json::from_str(&frame).unwrap();
+            if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                responses.insert(id, value);
+            }
+        }
+        assert_eq!(
+            responses[&1]["error"]["code"].as_i64(),
+            Some(i64::from(SESSION_BUSY)),
+            "configure must be refused as busy: {}",
+            responses[&1]
+        );
+        assert!(
+            responses[&2].get("error").is_none(),
+            "cancel must succeed: {}",
+            responses[&2]
+        );
+        assert!(
+            turn_token.is_cancelled(),
+            "cancel must reach the running turn"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|o| o.model),
+            None,
+            "a refused switch must not be recorded to apply later"
+        );
+        drop(turn_guard);
+    }
+
+    /// The config-screen form of the same hazard: a route-affecting
+    /// `config/set` whose scope includes a session that is mid-turn must be
+    /// refused promptly, with nothing saved, instead of holding
+    /// `config_write_lock` until that turn ends.
+    #[tokio::test]
+    async fn config_set_for_mid_turn_agent_is_refused_without_saving() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .sessions
+            .register_cancel_token(&session_id, tokio_util::sync::CancellationToken::new());
+        let turn_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            })),
+        )
+        .await
+        .expect("config/set must not wait for the running turn")
+        .expect_err("config/set must be refused while an in-scope turn runs");
+        assert_eq!(error.code, SESSION_BUSY, "{}", error.message);
+        assert!(error.message.contains(&session_id), "{}", error.message);
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .find("openai", "test-provider")
+                .and_then(|entry| entry.model.clone())
+                .as_deref(),
+            Some("old-model"),
+            "a refused edit must not be committed"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        drop(turn_guard);
+    }
+
     #[tokio::test]
     async fn model_provider_update_does_not_block_unrelated_session_configure() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -41087,10 +41337,25 @@ mod tests {
              another connection — before the fanout it saw nothing until a \
              durable resync"
         );
+        // The owner did not type this prompt, so it is announced to the
+        // owner (and only the owner) before the turn streams: that frame is
+        // what tells the pane the session is busy.
+        let announce = &owner_frames[0];
+        assert_eq!(announce["params"]["type"], "user_message");
+        assert_eq!(announce["params"]["text"], "hello from another connection");
+        assert_eq!(announce["params"]["source"], EXTERNAL_PROMPT_SOURCE);
+        assert!(
+            issuer_frames
+                .iter()
+                .all(|f| f["params"]["type"] != "user_message"),
+            "the issuer typed the prompt and must not receive it back"
+        );
         assert_eq!(
-            owner_frames, issuer_frames,
-            "owner and issuer must receive the same notification sequence, \
-             including turn_complete, with no divergence or reordering"
+            owner_frames[1..],
+            issuer_frames[..],
+            "after the announcement, owner and issuer must receive the same \
+             notification sequence, including turn_complete, with no \
+             divergence or reordering"
         );
         assert_eq!(
             owner_frames.last().expect("sequence must be non-empty")["params"]["type"],
@@ -41133,6 +41398,12 @@ mod tests {
         assert_eq!(
             chunk_count, 1,
             "the owner must receive exactly one copy of each streamed event"
+        );
+        assert!(
+            owner_frames
+                .iter()
+                .all(|f| f["params"]["type"] != "user_message"),
+            "the owner typed its own prompt; announcing it would duplicate the row"
         );
         assert!(
             matches!(
