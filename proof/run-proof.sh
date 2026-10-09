@@ -192,6 +192,8 @@ def retain_runtime_diagnostics(rc):
                 'inbound deadline', 'listener closed', 'listener task', 'listener shutdown deadline',
                 'HTTP observation deadline', 'server task', 'server shutdown deadline',
                 'restart resync inbound', 'synthetic event ID', 'reply observation transport',
+                'bootstrap health readiness', 'queued first event',
+                'queued event escaped live policy', 'unexpected queue event',
                 'reply observation status', 'reply observation JSON', 'reply events',
                 'outbound thread relation', 'outbound root relation', 'reply event deadline',
                 'real encryption refusal', 'real encryption preflight reached, zero PUTs',
@@ -243,10 +245,25 @@ def retain_runtime_diagnostics(rc):
     found_stages, found_contexts, found_events, found_classes, interfaces = set(), set(), set(), set(), set()
     found_matrix_errors, found_host_contexts, http_statuses = set(), set(), set()
     entered = capture_installed = False
+    oversized_lines = max_line_bytes = line_bytes = 0
+    overlap = b''
+    def record_line(length):
+        nonlocal oversized_lines, max_line_bytes
+        oversized_lines += length > 1024 * 1024
+        max_line_bytes = max(max_line_bytes, length)
     with log.open('rb') as source:
-        for line in source:
-            if len(line) > 1024 * 1024: continue
-            text = line.decode('utf-8', errors='replace')
+        while chunk := source.read(64 * 1024):
+            parts = chunk.split(b'\n')
+            if len(parts) == 1:
+                line_bytes += len(chunk)
+            else:
+                record_line(line_bytes + len(parts[0]))
+                for part in parts[1:-1]:
+                    record_line(len(part))
+                line_bytes = len(parts[-1])
+            window = overlap + chunk
+            text = window.decode('utf-8', errors='replace')
+            overlap = window[-512:]
             entered |= 'proof-runtime-entered' in text
             capture_installed |= 'proof-runtime-entered capture-installed=true' in text
             for values, found in ((stages, found_stages), (contexts, found_contexts), (events, found_events),
@@ -260,12 +277,14 @@ def retain_runtime_diagnostics(rc):
             # Only wasi:cli/clocks/filesystem/http/io/random/sockets interface names.
             for interface in re.findall(r'\bwasi:(?:cli|clocks|filesystem|http|io|random|sockets)/[a-z][a-z-]{0,63}@[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b', text):
                 if len(interfaces) < 20: interfaces.add(interface)
+    record_line(line_bytes)
     report = {'phase': 'host-cases', 'exit_code': rc, 'test_entered': entered,
               'capture_installed': capture_installed, 'matched_stages': sorted(found_stages),
               'matched_contexts': sorted(found_contexts), 'matched_host_events': sorted(found_events),
               'matched_error_classes': sorted(found_classes), 'wasi_interfaces': sorted(interfaces),
               'matched_matrix_errors': sorted(found_matrix_errors),
               'matched_host_contexts': sorted(found_host_contexts),
+              'oversized_lines': oversized_lines, 'max_line_bytes': max_line_bytes,
               'matrix_http_statuses': [{'method': method, 'status': status} for method, status in sorted(http_statuses)]}
     (Path(os.environ['MATRIX_PROOF_PUBLIC'])/'host-runtime.json').write_text(json.dumps(report, sort_keys=True))
 def terminate(p):

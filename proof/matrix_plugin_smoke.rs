@@ -846,6 +846,54 @@ fn scripted_event(id: &str, body: &str) -> Value {
            "origin_server_ts": 1, "content": {"msgtype": "m.text", "body": body}})
 }
 
+fn queue_checkpoint(
+    stage: &'static str,
+    server: &Server,
+    listening: Option<&Listening>,
+    event_class: Option<&'static str>,
+) -> Result<()> {
+    static RECORDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 128 {
+        return Ok(());
+    }
+    let (whoami, syncs, incremental) = server.read(|s| (s.whoami, s.syncs, s.incremental));
+    let path = PathBuf::from(std::env::var("MATRIX_PROOF_PUBLIC")?).join("progress.jsonl");
+    let mut out = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(
+        out,
+        "{}",
+        json!({
+            "stage": stage, "event_class": event_class,
+            "whoami": whoami, "syncs": syncs, "incremental": incremental,
+            "listener_finished": listening.map(|value| value.task.is_finished()),
+        })
+    )?;
+    Ok(())
+}
+
+fn queue_event_class(
+    id: &str,
+    one: &str,
+    two: &str,
+    three: &str,
+    four: &str,
+    sentinel: &str,
+) -> &'static str {
+    if id == one {
+        "first"
+    } else if id == two {
+        "second"
+    } else if id == three {
+        "queued-third"
+    } else if id == four {
+        "queued-fourth"
+    } else if id == sentinel {
+        "sentinel"
+    } else {
+        "unclassified"
+    }
+}
+
 async fn scripted(server: &Server) -> Result<()> {
     let config = operator_config(&server.url, "synthetic-current-token", ROOM, true)?;
     let mut bad = config.clone();
@@ -1110,16 +1158,20 @@ async fn scripted(server: &Server) -> Result<()> {
 }
 
 async fn queued_policy(server: &Server, config: Config) -> Result<()> {
+    queue_checkpoint("queue-activation-start", server, None, None)?;
     let (live, channel) = activate(config).await?;
+    queue_checkpoint("queue-activation-complete", server, None, None)?;
     let mut listening = Listening::start(channel.clone(), 1);
     let result = async {
         wait_ready(&channel).await?;
+        queue_checkpoint("queue-ready", server, Some(&listening), None)?;
         // Two events can have crossed poll_message before publication (one in
         // mpsc and one blocked on tx.send). Subsequent events remain guest-owned.
         for (case, key, value) in [
             ("queued-live-mention-policy", "mention_only", "true".to_string()),
             ("queued-live-room-policy", "allowed_rooms", json!(["!other:proof.test"]).to_string()),
         ] {
+            queue_checkpoint(case, server, Some(&listening), None)?;
             let before_one = format!("${case}-before-1");
             let before_two = format!("${case}-before-2");
             let queued_three = format!("${case}-queued-3");
@@ -1133,12 +1185,18 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
                 scripted_event(&before_one, "before-one"), scripted_event(&before_two, "before-two"),
                 scripted_event(&queued_three, "must-be-filtered"), scripted_event(&queued_four, "must-be-filtered"),
             ])));
+            queue_checkpoint("queue-batch-published", server, Some(&listening), None)?;
             // The observed batch response plus the next whoami proves the
             // first export completed and the second poll began. Capacity one
             // prevents a third export until the receiver is drained.
             server.wait(|s| s.issued_batch.as_ref().is_some_and(|(tag, auth)| tag == case && s.whoami > *auth)).await?;
+            queue_checkpoint("queue-batch-auth-observed", server, Some(&listening), None)?;
             publish(&live, |c| { c.plugins.entries[0].config.insert(key.into(), value.clone()); })?;
+            queue_checkpoint("queue-policy-published", server, Some(&listening), None)?;
             let one = listening.next().await?;
+            queue_checkpoint("queue-first-event", server, Some(&listening), Some(queue_event_class(
+                &one.id, &before_one, &before_two, &queued_three, &queued_four, &sentinel_id,
+            )))?;
             ensure!(one.id == before_one, "queued first event");
             // A policy change may win before the second export. Do not require
             // it; use a permitted marker in the next sync as the drain barrier.
@@ -1151,8 +1209,12 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
                 }});
             }
             server.edit(|s| s.batch.push_back(marker));
+            queue_checkpoint("queue-marker-published", server, Some(&listening), None)?;
             loop {
                 let next = listening.next().await?;
+                queue_checkpoint("queue-received-event", server, Some(&listening), Some(queue_event_class(
+                    &next.id, &before_one, &before_two, &queued_three, &queued_four, &sentinel_id,
+                )))?;
                 ensure!(next.id != queued_three && next.id != queued_four, "queued event escaped live policy");
                 if next.id == sentinel_id { break; }
                 ensure!(next.id == before_two, "unexpected queue event");
@@ -1166,7 +1228,20 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
         ensure!(server.read(|s| s.puts) == puts, "invalid config zero PUTs");
         passed("live-unreadable-config-fails-closed")
     }.await;
+    if result.is_err() {
+        let _ = queue_checkpoint("queue-failure", server, Some(&listening), None);
+    }
     let stopped = listening.stop().await;
+    queue_checkpoint(
+        if stopped.is_ok() {
+            "queue-listener-stop-ok"
+        } else {
+            "queue-listener-stop-failed"
+        },
+        server,
+        None,
+        None,
+    )?;
     result?;
     stopped
 }
@@ -1175,6 +1250,13 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
 async fn matrix_plugin_smoke() -> Result<()> {
     let capture_installed = zeroclaw_log::try_install_line_sink_for_tests(|line| eprint!("{line}"));
     eprintln!("proof-runtime-entered capture-installed={capture_installed}");
+    let path = PathBuf::from(std::env::var("MATRIX_PROOF_PUBLIC")?).join("progress.jsonl");
+    let mut out = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(
+        out,
+        "{}",
+        json!({"stage":"runtime-entered", "capture_installed":capture_installed})
+    )?;
     ensure!(
         !cfg!(feature = "channel-matrix"),
         "native Matrix build forbidden"
