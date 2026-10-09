@@ -12142,15 +12142,20 @@ impl ChatState {
             }
         }
         // History rows carry the turn's finish time on its last output; mark
-        // each turn's last entry as its end so the footer follows it.
+        // each turn's last entry as its end so the footer follows it. A turn
+        // that ends in a system row (an interruption or recovery marker) is
+        // left without an end: recovery stamps its rows when it runs, which
+        // can be hours after the turn stopped.
         self.entry_times
             .resize(self.entries.len(), entry_time::EntryStamp::default());
         for index in 0..self.entries.len() {
-            let ends_turn = !matches!(self.entries[index], ChatEntry::UserMessage { .. })
-                && self
-                    .entries
-                    .get(index + 1)
-                    .is_none_or(|next| matches!(next, ChatEntry::UserMessage { .. }));
+            let ends_turn = !matches!(
+                self.entries[index],
+                ChatEntry::UserMessage { .. } | ChatEntry::SystemMessage(_)
+            ) && self
+                .entries
+                .get(index + 1)
+                .is_none_or(|next| matches!(next, ChatEntry::UserMessage { .. }));
             if ends_turn && self.entry_times[index].ends_turn == entry_time::TurnEnd::No {
                 self.entry_times[index].ends_turn = entry_time::TurnEnd::Loaded;
             }
@@ -12545,6 +12550,26 @@ mod tests {
                 assert!(!line.starts_with("─── ") && !line.contains("── Today "));
             }
         }
+    }
+
+    #[test]
+    fn a_recovered_turn_gets_no_footer_from_its_recovery_time() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "long task", today_at(1, 0, 0)),
+                timed("assistant", "partial", today_at(9, 0, 0)),
+                // Recovery wrote both rows hours later, with one time.
+                timed("system", "[stream interrupted]", today_at(9, 0, 0)),
+            ],
+            true,
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        assert!(
+            !text.iter().any(|line| line.starts_with("─── ")),
+            "{text:#?}"
+        );
     }
 
     #[test]
