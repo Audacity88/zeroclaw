@@ -35,6 +35,7 @@ const SENDER: &str = "@sender:proof.test";
 const DENY: &str = "@deny:proof.test";
 const ROOM: &str = "!script:proof.test";
 const WAIT: Duration = Duration::from_secs(45);
+static QUEUE_ACTIVATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Deserialize)]
 struct User {
@@ -168,8 +169,32 @@ async fn channels(config: &Config, live: &LiveConfig) -> Vec<Arc<dyn Channel>> {
 }
 
 async fn activate(config: Config) -> Result<(LiveConfig, Arc<dyn Channel>)> {
+    activate_observed(config, None).await
+}
+
+async fn activate_observed(
+    config: Config,
+    server: Option<&Server>,
+) -> Result<(LiveConfig, Arc<dyn Channel>)> {
     let live = LiveConfig::new(config.clone());
     let mut built = channels(&config, &live).await;
+    if let Some(server) = server {
+        let (whoami, syncs, incremental, active_request) =
+            server.read(|s| (s.whoami, s.syncs, s.incremental, s.active_request));
+        let path = PathBuf::from(std::env::var("MATRIX_PROOF_PUBLIC")?).join("progress.jsonl");
+        let mut out = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(
+            out,
+            "{}",
+            json!({
+                "stage": "queue-construction-result", "built": built.len(),
+                "endpoint_matches": built.first().map(|c| c.name() == "plugin"),
+                "identity_matches": built.first().map(|c| c.self_handle().as_deref() == Some(BOT)),
+                "whoami": whoami, "syncs": syncs, "incremental": incremental,
+                "fixture_finished": server.task.is_finished(), "active_request": active_request,
+            })
+        )?;
+    }
     ensure!(built.len() == 1, "one actual configured plugin required");
     let channel = built.remove(0);
     ensure!(channel.name() == "plugin", "host endpoint type");
@@ -1159,7 +1184,10 @@ async fn scripted(server: &Server) -> Result<()> {
 
 async fn queued_policy(server: &Server, config: Config) -> Result<()> {
     queue_checkpoint("queue-activation-start", server, None, None)?;
-    let (live, channel) = activate(config).await?;
+    QUEUE_ACTIVATING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let activated = activate_observed(config, Some(server)).await;
+    QUEUE_ACTIVATING.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (live, channel) = activated?;
     queue_checkpoint("queue-activation-complete", server, None, None)?;
     let mut listening = Listening::start(channel.clone(), 1);
     let result = async {
@@ -1248,7 +1276,71 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn matrix_plugin_smoke() -> Result<()> {
-    let capture_installed = zeroclaw_log::try_install_line_sink_for_tests(|line| eprint!("{line}"));
+    // Keep raw diagnostics private; only fixed classifications reach the artifact.
+    let fragments = Mutex::new((String::new(), 0u32));
+    let capture_installed = zeroclaw_log::try_install_line_sink_for_tests(move |line| {
+        if QUEUE_ACTIVATING.load(std::sync::atomic::Ordering::Relaxed) {
+            const CLASSES: &[(&str, &str)] = &[
+                ("Failed to discover WASM channel plugins", "discovery"),
+                ("Failed to admit logical plugin instances", "admission"),
+                ("Failed to bind WASM channel plugin endpoint", "binding"),
+                ("Failed to construct WASM channel plugin", "construction"),
+                ("Failed to load WASM component", "component-load"),
+                (
+                    "Failed to instantiate channel plugin",
+                    "component-instantiate",
+                ),
+                ("channel.configure trapped", "configure-trap"),
+                ("matrix: invalid public config", "invalid-public-config"),
+                ("matrix: access_token unavailable", "token-unavailable"),
+                ("matrix: invalid access_token", "token-invalid"),
+                ("matrix: invalid authenticated identity", "identity-invalid"),
+                ("matrix: binding changed", "binding-changed"),
+                ("matrix: config unavailable", "config-unavailable"),
+                ("matrix: HTTP GET status 401", "http-unauthorized"),
+                ("matrix: HTTP GET status 403", "http-forbidden"),
+                ("matrix: HTTP timeout", "http-timeout"),
+                ("matrix: HTTP deadline exceeded", "http-deadline"),
+                ("matrix: HTTP transport", "http-transport"),
+                ("matrix: HTTP target refused", "http-target-refused"),
+                ("matrix: invalid response JSON", "invalid-response-json"),
+            ];
+            if let Ok(mut capture) = fragments.lock() {
+                capture.0.extend(line.chars().take(2048));
+                for (index, (needle, class)) in CLASSES.iter().enumerate() {
+                    let bit = 1u32 << index;
+                    if capture.1 & bit == 0 && capture.0.contains(needle) {
+                        capture.1 |= bit;
+                        if let Ok(dir) = std::env::var("MATRIX_PROOF_PUBLIC") {
+                            if let Ok(mut out) = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(PathBuf::from(dir).join("progress.jsonl"))
+                            {
+                                let _ = writeln!(
+                                    out,
+                                    "{}",
+                                    json!({
+                                        "stage": "queue-construction-log", "class": class,
+                                    })
+                                );
+                            }
+                        }
+                    }
+                }
+                if capture.0.len() > 2048 {
+                    let keep = capture
+                        .0
+                        .char_indices()
+                        .rev()
+                        .nth(1023)
+                        .map_or(0, |(i, _)| i);
+                    capture.0.drain(..keep);
+                }
+            }
+        }
+        eprint!("{line}");
+    });
     eprintln!("proof-runtime-entered capture-installed={capture_installed}");
     let path = PathBuf::from(std::env::var("MATRIX_PROOF_PUBLIC")?).join("progress.jsonl");
     let mut out = OpenOptions::new().create(true).append(true).open(path)?;
