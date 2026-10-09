@@ -792,8 +792,16 @@ impl App {
     /// Handle a key event. Returns `Ok(true)` when the user wants to
     /// quit the entire TUI (never triggered from Config; use Ctrl+C at the app level).
     pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
-        match self.handle_key_inner(key, term).await {
-            Err(error) if self.absorb_rpc_timeout(&error) => Ok(false),
+        let result = self.handle_key_inner(key, term).await;
+        self.settle_handler_result(result, false)
+    }
+
+    /// Shared exit path of `handle_key` / `handle_mouse`: an RPC timeout is
+    /// absorbed into the status line and replaced by `absorbed` (for keys,
+    /// `false` = do not quit); every other result passes through unchanged.
+    fn settle_handler_result<T>(&mut self, result: Result<T>, absorbed: T) -> Result<T> {
+        match result {
+            Err(error) if self.absorb_rpc_timeout(&error) => Ok(absorbed),
             other => other,
         }
     }
@@ -903,10 +911,8 @@ impl App {
         area: Rect,
         term: &mut Term,
     ) -> Result<()> {
-        match self.handle_mouse_inner(mouse, area, term).await {
-            Err(error) if self.absorb_rpc_timeout(&error) => Ok(()),
-            other => other,
-        }
+        let result = self.handle_mouse_inner(mouse, area, term).await;
+        self.settle_handler_result(result, ())
     }
 
     async fn handle_mouse_inner(
@@ -5169,6 +5175,83 @@ mod tests {
                 .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
         );
+    }
+
+    /// A client whose outbound channel stays open but never gets a reply,
+    /// so `call_with_timeout` fails with the real typed `DaemonRpcTimeout`.
+    fn silent_rpc() -> (Arc<RpcClient>, tokio::sync::mpsc::Receiver<String>) {
+        use crate::jsonrpc::RpcOutbound;
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
+        (
+            Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)))),
+            rx,
+        )
+    }
+
+    async fn real_rpc_timeout() -> anyhow::Error {
+        let (rpc, _rx) = silent_rpc();
+        rpc.call_with_timeout::<serde_json::Value>(
+            "config/list",
+            serde_json::json!({}),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("no reply must time out")
+    }
+
+    #[tokio::test]
+    async fn key_and_mouse_handlers_turn_rpc_timeout_into_status_and_stay_alive() {
+        let error = real_rpc_timeout().await;
+        assert!(
+            crate::client::DaemonRpcTimeout::from_anyhow(&error).is_some(),
+            "call_with_timeout must return the typed timeout, got {error:#}"
+        );
+        let expected = crate::i18n::t_args(
+            "zc-config-status-load-failed",
+            &[("err", &format!("{error:#}"))],
+        );
+
+        // Key path: Ok(false) means "do not quit the TUI".
+        let mut mgr = test_manager();
+        let settled = mgr.settle_handler_result::<bool>(Err(error), false);
+        assert!(
+            matches!(settled, Ok(false)),
+            "a key-handler RPC timeout must not quit or propagate: {settled:?}"
+        );
+        assert_eq!(mgr.status_msg.as_deref(), Some(expected.as_str()));
+        assert!(
+            expected.contains("config/list"),
+            "status line should name the stalled method: {expected}"
+        );
+
+        // Mouse path, with the timeout wrapped in context the way inner
+        // helpers add it: still absorbed.
+        let wrapped = real_rpc_timeout().await.context("loading fields");
+        let mut mgr = test_manager();
+        let settled = mgr.settle_handler_result::<()>(Err(wrapped), ());
+        assert!(
+            settled.is_ok(),
+            "a mouse-handler RPC timeout must not propagate: {settled:?}"
+        );
+        assert!(mgr.status_msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn handlers_still_propagate_non_timeout_errors() {
+        let mut mgr = test_manager();
+        let settled = mgr.settle_handler_result::<bool>(
+            Err(anyhow::Error::msg("RPC config/list: boom (-32000)")),
+            false,
+        );
+        assert!(settled.is_err(), "only timeouts are absorbed");
+        assert!(mgr.status_msg.is_none());
+
+        // A successful quit request passes through untouched.
+        let mut mgr = test_manager();
+        assert!(matches!(
+            mgr.settle_handler_result(Ok(true), false),
+            Ok(true)
+        ));
     }
 
     fn test_manager() -> App {
