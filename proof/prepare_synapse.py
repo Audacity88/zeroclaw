@@ -2,11 +2,12 @@
 """Hosted-run-only, synthetic Synapse provisioning. Never reads real config.
 
 The immutable image must already have been acquired. No request or helper
-output is copied to public evidence. Container listener is bridge-local;
-Docker publishes only 127.0.0.1 on the host, on an internal-only network.
+output is copied to public evidence. The host reaches the single test-owned
+container directly on its internal bridge. No container port is published.
 """
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -75,6 +76,32 @@ def request(base, path, body=None, token=None):
         return json.load(response)
 
 
+def internal_endpoint(details, network, network_name, owner):
+    if (details["Config"]["Labels"].get(LABEL) != owner
+            or network["Labels"].get(LABEL) != owner
+            or network["Driver"] != "bridge" or not network["Internal"]
+            or set(details["NetworkSettings"]["Networks"]) != {network_name}
+            or set(network["Containers"]) != {details["Id"]}
+            or details["HostConfig"].get("PortBindings")
+            or any(details["NetworkSettings"]["Ports"].values())):
+        raise RuntimeError("isolation")
+    attachment = details["NetworkSettings"]["Networks"][network_name]
+    if attachment["NetworkID"] != network["Id"]:
+        raise RuntimeError("isolation")
+    address = ipaddress.IPv4Address(attachment["IPAddress"])
+    pools = network["IPAM"]["Config"]
+    if len(pools) != 1:
+        raise RuntimeError("isolation")
+    subnet = ipaddress.IPv4Network(pools[0]["Subnet"])
+    private = (ipaddress.IPv4Network("10.0.0.0/8"),
+               ipaddress.IPv4Network("172.16.0.0/12"),
+               ipaddress.IPv4Network("192.168.0.0/16"))
+    if (not any(subnet.subnet_of(pool) for pool in private)
+            or address not in subnet or address in (subnet.network_address, subnet.broadcast_address)):
+        raise RuntimeError("isolation")
+    return "http://" + str(address) + ":8008"
+
+
 def prepare(root):
     os.umask(0o077)
     root = root.resolve(strict=True)
@@ -138,7 +165,7 @@ root:
     docker(
         "run", "--detach", "--pull=never", "--name", container,
         "--label", LABEL + "=" + owner, "--network", network,
-        "--publish", "127.0.0.1::8008", "--user", f"{os.getuid()}:{os.getgid()}",
+        "--user", f"{os.getuid()}:{os.getgid()}",
         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--log-driver=none",
         "--mount", f"type=bind,src={data},dst=/data", "--entrypoint", "/bin/sh",
         IMAGE, "-ec",
@@ -149,15 +176,11 @@ root:
     details = json.loads(docker("inspect", container))[0]
     SETUP_FACTS["container_running"] = bool(details["State"]["Running"])
     SETUP_FACTS["container_exit_code"] = int(details["State"]["ExitCode"])
-    mapping = details["NetworkSettings"]["Ports"]["8008/tcp"]
-    SETUP_FACTS["port_mapping_present"] = isinstance(mapping, list)
-    SETUP_FACTS["port_binding_count"] = len(mapping) if isinstance(mapping, list) else 0
-    if len(mapping) != 1 or mapping[0]["HostIp"] != "127.0.0.1":
-        raise RuntimeError("isolation")
-    SETUP_FACTS["internal_network"] = bool(json.loads(docker("network", "inspect", network))[0]["Internal"])
-    if not SETUP_FACTS["internal_network"]:
-        raise RuntimeError("isolation")
-    base = "http://127.0.0.1:" + mapping[0]["HostPort"]
+    network_details = json.loads(docker("network", "inspect", network))[0]
+    SETUP_FACTS["internal_network"] = bool(network_details["Internal"])
+    SETUP_FACTS["ports_published"] = bool(details["HostConfig"].get("PortBindings"))
+    base = internal_endpoint(details, network_details, network, owner)
+    SETUP_FACTS["owned_internal_endpoint_verified"] = True
     deadline = time.monotonic() + 60
     setup_stage("server-readiness")
     while True:

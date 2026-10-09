@@ -1141,8 +1141,18 @@ async fn matrix_plugin_smoke() -> Result<()> {
     let fixture: Fixture = serde_json::from_slice(&std::fs::read(&config_path)?)?;
     let url = reqwest::Url::parse(&fixture.homeserver)?;
     ensure!(
-        url.scheme() == "http" && url.host_str() == Some("127.0.0.1"),
-        "loopback fixture only"
+        url.scheme() == "http"
+            && url.port() == Some(8008)
+            && url
+                .host_str()
+                .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+                .is_some_and(|address| address.is_private())
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "test-owned internal bridge fixture only"
     );
     let relay = Server::start(Some(fixture.homeserver.clone())).await?;
     let result = primary(&relay, &fixture).await;
