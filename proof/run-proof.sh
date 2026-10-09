@@ -177,6 +177,47 @@ def retain_build_diagnostics(rc):
     report = {'phase': 'host-build', 'exit_code': rc, 'cargo_build_success': success,
               'compiler_error_count': total, 'errors': errors, 'truncated': total > len(errors)}
     (Path(os.environ['MATRIX_PROOF_PUBLIC'])/'host-build.json').write_text(json.dumps(report, sort_keys=True))
+def retain_runtime_diagnostics(rc):
+    # Match only frozen labels and interface identifiers. Never export raw text.
+    stages = ('proof-stage-relay-start', 'proof-stage-primary', 'proof-stage-startup-backlog',
+              'proof-stage-operator-config', 'proof-stage-production-activation',
+              'proof-stage-relay-stop', 'proof-stage-scripted-start', 'proof-stage-scripted',
+              'proof-stage-scripted-stop')
+    contexts = ('synthetic operator config', 'package admission', 'manifest identity',
+                'default host call limit', 'one actual configured plugin required',
+                'host endpoint type', 'authenticated self identity', 'synthetic API transport',
+                'synthetic API status', 'synthetic API JSON', 'synthetic users only',
+                'native Matrix build forbidden', 'private fixture path', 'fixture mode 0600',
+                'test-owned internal bridge fixture only')
+    events = ('Failed to discover WASM channel plugins', 'Failed to admit logical plugin instances',
+              'Failed to bind WASM channel plugin endpoint', 'Failed to construct WASM channel plugin')
+    classes = {'component-instantiation': ('failed to instantiate', 'unknown import', 'component imports'),
+               'component-type': ('type mismatch', 'incompatible import', 'failed to parse'),
+               'guest-execution': ('error while executing', 'wasm trap', 'fuel consumed'),
+               'config-schema': ('schema validation', 'missing required', 'RequiredFieldEmpty', 'DanglingReference'),
+               'egress-policy': ('egress denied', 'egress blocked', 'destination denied'),
+               'authentication': ('M_UNKNOWN_TOKEN', 'M_FORBIDDEN')}
+    found_stages, found_contexts, found_events, found_classes, interfaces = set(), set(), set(), set(), set()
+    entered = capture_installed = False
+    with log.open('rb') as source:
+        for line in source:
+            if len(line) > 1024 * 1024: continue
+            text = line.decode('utf-8', errors='replace')
+            entered |= 'proof-runtime-entered' in text
+            capture_installed |= 'proof-runtime-entered capture-installed=true' in text
+            for values, found in ((stages, found_stages), (contexts, found_contexts), (events, found_events)):
+                for value in values:
+                    if re.search(r'(?<![a-z0-9-])' + re.escape(value) + r'(?![a-z0-9-])', text): found.add(value)
+            for name, patterns in classes.items():
+                if any(pattern in text for pattern in patterns): found_classes.add(name)
+            # Only wasi:cli/clocks/filesystem/http/io/random/sockets interface names.
+            for interface in re.findall(r'\bwasi:(?:cli|clocks|filesystem|http|io|random|sockets)/[a-z][a-z-]{0,63}@[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b', text):
+                if len(interfaces) < 20: interfaces.add(interface)
+    report = {'phase': 'host-cases', 'exit_code': rc, 'test_entered': entered,
+              'capture_installed': capture_installed, 'matched_stages': sorted(found_stages),
+              'matched_contexts': sorted(found_contexts), 'matched_host_events': sorted(found_events),
+              'matched_error_classes': sorted(found_classes), 'wasi_interfaces': sorted(interfaces)}
+    (Path(os.environ['MATRIX_PROOF_PUBLIC'])/'host-runtime.json').write_text(json.dumps(report, sort_keys=True))
 def terminate(p):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -226,6 +267,8 @@ with log.open('wb') as out:
         rc = 1
     if os.environ.get('PROOF_BUILD_DIAGNOSTICS') == '1':
         retain_build_diagnostics(rc)
+    if os.environ.get('PROOF_RUNTIME_DIAGNOSTICS') == '1':
+        retain_runtime_diagnostics(rc)
     raise SystemExit(rc)
 PY
 }
@@ -261,7 +304,7 @@ classification=synapse-setup
 python3 "$proof/prepare_synapse.py" prepare "$MATRIX_PROOF_PRIVATE" >"$MATRIX_PROOF_PRIVATE/setup.log" 2>&1
 classification=host-cases
 cd "$root/host"
-owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke -- --test-threads=1
+PROOF_RUNTIME_DIAGNOSTICS=1 owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke -- --test-threads=1 --show-output
 python3 - <<'PY'
 import hashlib, json, os
 from pathlib import Path

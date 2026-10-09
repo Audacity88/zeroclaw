@@ -656,9 +656,14 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()?;
-    let backlog = event(&client, fixture, &fixture.sender, "old-backlog", None).await?;
-    let config = operator_config(&server.url, &fixture.bot.token, &fixture.room, true)?;
-    let (_live, channel) = activate(config.clone()).await?;
+    let backlog = event(&client, fixture, &fixture.sender, "old-backlog", None)
+        .await
+        .context("proof-stage-startup-backlog")?;
+    let config = operator_config(&server.url, &fixture.bot.token, &fixture.room, true)
+        .context("proof-stage-operator-config")?;
+    let (_live, channel) = activate(config.clone())
+        .await
+        .context("proof-stage-production-activation")?;
     passed("actual-package-ABI-config-authenticated-identity")?;
     let mut listening = Listening::start(channel.clone(), 8);
     let result = async {
@@ -1124,6 +1129,8 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn matrix_plugin_smoke() -> Result<()> {
+    let capture_installed = zeroclaw_log::try_install_line_sink_for_tests(|line| eprint!("{line}"));
+    eprintln!("proof-runtime-entered capture-installed={capture_installed}");
     ensure!(
         !cfg!(feature = "channel-matrix"),
         "native Matrix build forbidden"
@@ -1154,16 +1161,20 @@ async fn matrix_plugin_smoke() -> Result<()> {
             && url.fragment().is_none(),
         "test-owned internal bridge fixture only"
     );
-    let relay = Server::start(Some(fixture.homeserver.clone())).await?;
+    let relay = Server::start(Some(fixture.homeserver.clone()))
+        .await
+        .context("proof-stage-relay-start")?;
     let result = primary(&relay, &fixture).await;
     let stopped = relay.stop().await;
-    result?;
-    stopped?;
-    let server = Server::start(None).await?;
+    result.context("proof-stage-primary")?;
+    stopped.context("proof-stage-relay-stop")?;
+    let server = Server::start(None)
+        .await
+        .context("proof-stage-scripted-start")?;
     let result = scripted(&server).await;
     let stopped = server.stop().await;
-    result?;
-    stopped?;
+    result.context("proof-stage-scripted")?;
+    stopped.context("proof-stage-scripted-stop")?;
     passed("all-owned-HTTP-fixtures-finished")?;
     Ok(())
 }
