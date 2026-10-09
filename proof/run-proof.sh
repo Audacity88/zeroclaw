@@ -188,7 +188,14 @@ def retain_runtime_diagnostics(rc):
                 'host endpoint type', 'authenticated self identity', 'synthetic API transport',
                 'synthetic API status', 'synthetic API JSON', 'synthetic users only',
                 'native Matrix build forbidden', 'private fixture path', 'fixture mode 0600',
-                'test-owned internal bridge fixture only')
+                'test-owned internal bridge fixture only',
+                'inbound deadline', 'listener closed', 'listener task', 'listener shutdown deadline',
+                'HTTP observation deadline', 'server task', 'server shutdown deadline',
+                'restart resync inbound', 'synthetic event ID', 'reply observation transport',
+                'reply observation status', 'reply observation JSON', 'reply events',
+                'outbound thread relation', 'outbound root relation', 'reply event deadline',
+                'real encryption refusal', 'real encryption preflight reached, zero PUTs',
+                'encryption events', 'encrypted plaintext absent')
     events = ('Failed to discover WASM channel plugins', 'Failed to admit logical plugin instances',
               'Failed to bind WASM channel plugin endpoint', 'Failed to construct WASM channel plugin')
     # Closed error literals from the frozen Matrix lib.rs and matrix.rs.
