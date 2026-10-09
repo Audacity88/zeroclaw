@@ -18,7 +18,7 @@ env:
   CARGO_NET_RETRY: '0'
   RUSTUP_TOOLCHAIN: 1.98.0
   # Local prepared snapshot; publication and execution need separate approval.
-  FROZEN_INPUTS_SHA256: 650ab5a02c6cec976f90f9c0fb1c67e35ca68f6e35080a3ccd2ff145d124e32b
+  FROZEN_INPUTS_SHA256: c540e7c91ed6b531e1ffb20b8df62983559b09bcf67cdaea3cde0fc4924b58d5
 
 jobs:
   proof:
@@ -71,6 +71,7 @@ jobs:
           name: matrix-host-proof-${{ github.sha }}
           path: |
             proof-public/identity.json
+            proof-public/host-build.json
             proof-public/cases.jsonl
             proof-public/result.json
           if-no-files-found: warn

@@ -128,10 +128,55 @@ PY
 # invokes pkill, deletes caches, or sends signals to other jobs/process groups.
 owned_cargo() {
   python3 - "$@" <<'PY'
-import os, shutil, signal, subprocess, sys, time
+import json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
 private = Path(os.environ['MATRIX_PROOF_PRIVATE'])
 log = private / ('cargo-' + str(time.monotonic_ns()) + '.log')
+def retain_build_diagnostics(rc):
+    # Export no compiler prose, source snippets, absolute paths or runtime logs.
+    # Error codes and source locations are sufficient to inspect the frozen code.
+    errors = []
+    total = 0
+    success = None
+    with log.open('rb') as source:
+        for line in source:
+            if len(line) > 1024 * 1024:
+                continue
+            try: item = json.loads(line)
+            except (ValueError, UnicodeDecodeError): continue
+            if not isinstance(item, dict): continue
+            if item.get('reason') == 'build-finished':
+                value = item.get('success')
+                if isinstance(value, bool): success = value
+            if item.get('reason') != 'compiler-message': continue
+            message = item.get('message', {})
+            if not isinstance(message, dict) or message.get('level') != 'error': continue
+            total += 1
+            if len(errors) >= 20: continue
+            code = message.get('code')
+            code = code.get('code') if isinstance(code, dict) else None
+            if not isinstance(code, str) or not re.fullmatch(r'E[0-9]{4}', code): code = None
+            locations = []
+            for span in message.get('spans', []):
+                if not isinstance(span, dict): continue
+                name = span.get('file_name')
+                if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_./-]{1,240}', name): continue
+                path = Path(name)
+                if path.is_absolute() or '..' in path.parts: continue
+                if not name.endswith('.rs') or path.parts[0] not in ('src', 'tests', 'crates', 'apps', 'tools', 'xtask', 'build.rs'): continue
+                values = [span.get(key) for key in ('line_start', 'column_start', 'line_end', 'column_end')]
+                if not all(type(value) is int and 0 < value <= 10000000 for value in values): continue
+                locations.append({'file': name, 'line_start': values[0], 'column_start': values[1],
+                                  'line_end': values[2], 'column_end': values[3],
+                                  'primary': span.get('is_primary') is True})
+                if len(locations) == 8: break
+            target = item.get('target', {})
+            target = target.get('name') if isinstance(target, dict) else None
+            if not isinstance(target, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}', target): target = None
+            errors.append({'code': code, 'target': target, 'locations': locations})
+    report = {'phase': 'host-build', 'exit_code': rc, 'cargo_build_success': success,
+              'compiler_error_count': total, 'errors': errors, 'truncated': total > len(errors)}
+    (Path(os.environ['MATRIX_PROOF_PUBLIC'])/'host-build.json').write_text(json.dumps(report, sort_keys=True))
 def terminate(p):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -179,11 +224,11 @@ with log.open('wb') as out:
     else:
         terminate(p)
         rc = 1
+    if os.environ.get('PROOF_BUILD_DIAGNOSTICS') == '1':
+        retain_build_diagnostics(rc)
     raise SystemExit(rc)
 PY
 }
-classification=image-acquisition
-docker pull --platform linux/amd64 ghcr.io/element-hq/synapse@sha256:43fd704aedef503a6fba2e5696439ef7bac24479a3472e364561973f550e4aad >"$MATRIX_PROOF_PRIVATE/image.log" 2>&1
 classification=plugin-build
 cd "$root/plugins/plugins/matrix"
 owned_cargo cargo build --locked --release --target wasm32-wasip2
@@ -207,9 +252,14 @@ identity['cargo'] = subprocess.check_output(['cargo', '-V'], text=True).strip()
 assert identity['rustc'].startswith('rustc 1.98.0 ')
 p.write_text(json.dumps(identity, sort_keys=True))
 PY
+classification=host-build
+cd "$root/host"
+PROOF_BUILD_DIAGNOSTICS=1 owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke --no-run --message-format=json
+classification=image-acquisition
+docker pull --platform linux/amd64 ghcr.io/element-hq/synapse@sha256:43fd704aedef503a6fba2e5696439ef7bac24479a3472e364561973f550e4aad >"$MATRIX_PROOF_PRIVATE/image.log" 2>&1
 classification=synapse-setup
 python3 "$proof/prepare_synapse.py" prepare "$MATRIX_PROOF_PRIVATE" >"$MATRIX_PROOF_PRIVATE/setup.log" 2>&1
-classification=host-build-or-cases
+classification=host-cases
 cd "$root/host"
 owned_cargo cargo test --locked --no-default-features --features plugins-wasm-cranelift --test matrix_plugin_smoke -- --test-threads=1
 python3 - <<'PY'
