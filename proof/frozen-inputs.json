@@ -3,7 +3,7 @@
   "harness_sha256": {
     "run-proof.sh": "a1c0c260a1d6617017bc0ef6895d3b5cea6ac08c998ce8c12d6aaaec38de4ee5",
     "prepare_synapse.py": "030d4cb2c05cd3924c5e6594b0e46cc4fb486a7a6997fd7a1eafee821cccf757",
-    "matrix_plugin_smoke.rs": "07c34acb42efdd720fb46e6e68c343d6ddd2ae93aa1ca4f4ac5a2ce24ea6fe5c"
+    "matrix_plugin_smoke.rs": "b1055868a9f087451192e10ae0cb6139ab8dfdf89e49dba9feb5e3b8666af3d8"
   },
   "base_archive_sha256": {
     "host": "f40966b770286adc3901ebf99494fa3a16e1fccd4d40ca652c24e412f1caed65",

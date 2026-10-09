@@ -35,7 +35,59 @@ const SENDER: &str = "@sender:proof.test";
 const DENY: &str = "@deny:proof.test";
 const ROOM: &str = "!script:proof.test";
 const WAIT: Duration = Duration::from_secs(45);
-static QUEUE_ACTIVATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PHASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn diagnostic(value: Value) {
+    static RECORDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 64 {
+        return;
+    }
+    if let Ok(dir) = std::env::var("MATRIX_PROOF_PUBLIC") {
+        if let Ok(mut out) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(PathBuf::from(dir).join("progress.jsonl"))
+        {
+            let _ = out.write_all(format!("{value}\n").as_bytes());
+        }
+    }
+}
+
+fn failure_checkpoint(stage: &'static str, result: &Result<()>) {
+    if let Err(error) = result {
+        let text = format!("{error:#}");
+        const LABELS: &[&str] = &[
+            "synthetic operator config",
+            "package admission",
+            "manifest identity",
+            "bad token must construct zero channels",
+            "bad token reached authentication endpoint",
+            "unreadable config must construct zero channels",
+            "denied egress must construct zero channels",
+            "denied egress zero network hits",
+            "one actual configured plugin required",
+            "host endpoint type",
+            "authenticated self identity",
+            "bootstrap health readiness",
+            "inbound deadline",
+            "listener closed",
+            "listener task",
+            "listener shutdown deadline",
+            "HTTP observation deadline",
+            "queued first event",
+            "queued event escaped live policy",
+            "unexpected queue event",
+            "server task",
+            "server shutdown deadline",
+        ];
+        let labels: Vec<_> = LABELS
+            .iter()
+            .filter(|label| text.contains(**label))
+            .copied()
+            .collect();
+        diagnostic(json!({"stage": stage, "labels": labels, "unclassified": labels.is_empty()}));
+    }
+}
 
 #[derive(Deserialize)]
 struct User {
@@ -920,15 +972,24 @@ fn queue_event_class(
 }
 
 async fn scripted(server: &Server) -> Result<()> {
+    queue_checkpoint("scripted-start", server, None, None)?;
     let config = operator_config(&server.url, "synthetic-current-token", ROOM, true)?;
+    queue_checkpoint("scripted-config-ready", server, None, None)?;
     let mut bad = config.clone();
     bad.plugins.entries[0]
         .config
         .insert("access_token".into(), "invalid-synthetic-token".into());
     let live = LiveConfig::new(bad.clone());
     let wrong_auth = server.read(|s| s.wrong_auth);
+    queue_checkpoint("bad-token-construction-start", server, None, None)?;
+    let bad_channels = channels(&bad, &live).await;
+    diagnostic(
+        json!({"stage": "bad-token-construction-result", "built": bad_channels.len(),
+        "auth_observed": server.read(|s| s.wrong_auth) > wrong_auth,
+        "fixture_finished": server.task.is_finished()}),
+    );
     ensure!(
-        channels(&bad, &live).await.is_empty(),
+        bad_channels.is_empty(),
         "bad token must construct zero channels"
     );
     ensure!(
@@ -1183,10 +1244,9 @@ async fn scripted(server: &Server) -> Result<()> {
 }
 
 async fn queued_policy(server: &Server, config: Config) -> Result<()> {
+    PHASE.store(3, std::sync::atomic::Ordering::Relaxed);
     queue_checkpoint("queue-activation-start", server, None, None)?;
-    QUEUE_ACTIVATING.store(true, std::sync::atomic::Ordering::Relaxed);
     let activated = activate_observed(config, Some(server)).await;
-    QUEUE_ACTIVATING.store(false, std::sync::atomic::Ordering::Relaxed);
     let (live, channel) = activated?;
     queue_checkpoint("queue-activation-complete", server, None, None)?;
     let mut listening = Listening::start(channel.clone(), 1);
@@ -1276,10 +1336,50 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn matrix_plugin_smoke() -> Result<()> {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("");
+        let class = if payload.contains("poison") {
+            "lock-poison"
+        } else if payload.contains("borrow") {
+            "borrow"
+        } else if payload.contains("stderr") || payload.contains("printing") {
+            "stdio"
+        } else if payload.contains("unwrap") {
+            "unwrap"
+        } else {
+            "unclassified"
+        };
+        let location = info.location();
+        let file = location
+            .map(|l| l.file().rsplit('/').next().unwrap_or(""))
+            .unwrap_or("");
+        let file = match file {
+            "matrix_plugin_smoke.rs"
+            | "plugin_runtime.rs"
+            | "subscriber.rs"
+            | "layer.rs"
+            | "log_bridge.rs"
+            | "event.rs"
+            | "component.rs"
+            | "wasm_channel.rs"
+            | "schema.rs"
+            | "live.rs" => file,
+            _ => "other",
+        };
+        diagnostic(json!({"stage":"panic", "class":class, "file":file,
+            "line":location.map(|l| l.line()), "column":location.map(|l| l.column())}));
+        previous_hook(info);
+    }));
     // Keep raw diagnostics private; only fixed classifications reach the artifact.
-    let fragments = Mutex::new((String::new(), 0u32));
+    let fragments = Mutex::new((String::new(), 0u32, usize::MAX));
     let capture_installed = zeroclaw_log::try_install_line_sink_for_tests(move |line| {
-        if QUEUE_ACTIVATING.load(std::sync::atomic::Ordering::Relaxed) {
+        {
             const CLASSES: &[(&str, &str)] = &[
                 ("Failed to discover WASM channel plugins", "discovery"),
                 ("Failed to admit logical plugin instances", "admission"),
@@ -1306,26 +1406,18 @@ async fn matrix_plugin_smoke() -> Result<()> {
                 ("matrix: invalid response JSON", "invalid-response-json"),
             ];
             if let Ok(mut capture) = fragments.lock() {
+                let phase = PHASE.load(std::sync::atomic::Ordering::Relaxed);
+                if capture.2 != phase {
+                    *capture = (String::new(), 0, phase);
+                }
                 capture.0.extend(line.chars().take(2048));
                 for (index, (needle, class)) in CLASSES.iter().enumerate() {
                     let bit = 1u32 << index;
                     if capture.1 & bit == 0 && capture.0.contains(needle) {
                         capture.1 |= bit;
-                        if let Ok(dir) = std::env::var("MATRIX_PROOF_PUBLIC") {
-                            if let Ok(mut out) = OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(PathBuf::from(dir).join("progress.jsonl"))
-                            {
-                                let _ = writeln!(
-                                    out,
-                                    "{}",
-                                    json!({
-                                        "stage": "queue-construction-log", "class": class,
-                                    })
-                                );
-                            }
-                        }
+                        diagnostic(
+                            json!({"stage": "construction-log", "class": class, "phase": phase}),
+                        );
                     }
                 }
                 if capture.0.len() > 2048 {
@@ -1382,15 +1474,21 @@ async fn matrix_plugin_smoke() -> Result<()> {
     let relay = Server::start(Some(fixture.homeserver.clone()))
         .await
         .context("proof-stage-relay-start")?;
+    PHASE.store(1, std::sync::atomic::Ordering::Relaxed);
     let result = primary(&relay, &fixture).await;
     let stopped = relay.stop().await;
+    failure_checkpoint("primary-failure", &result);
+    failure_checkpoint("relay-stop-failure", &stopped);
     result.context("proof-stage-primary")?;
     stopped.context("proof-stage-relay-stop")?;
     let server = Server::start(None)
         .await
         .context("proof-stage-scripted-start")?;
+    PHASE.store(2, std::sync::atomic::Ordering::Relaxed);
     let result = scripted(&server).await;
     let stopped = server.stop().await;
+    failure_checkpoint("scripted-failure", &result);
+    failure_checkpoint("scripted-stop-failure", &stopped);
     result.context("proof-stage-scripted")?;
     stopped.context("proof-stage-scripted-stop")?;
     passed("all-owned-HTTP-fixtures-finished")?;
