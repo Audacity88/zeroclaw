@@ -1997,21 +1997,27 @@ mod tests {
 
     /// True while `pid` names a live process. A killed descendant whose new
     /// parent has not reaped it yet still answers `kill(pid, 0)`, so a zombie
-    /// counts as exited.
+    /// counts as exited. Only `kill(pid, 0)` failing or `ps` reporting a
+    /// zombie state counts as exited; a `ps` that fails or reports no state
+    /// counts as running, and the caller's next poll repeats both checks.
     #[cfg(unix)]
     fn descendant_running(pid: libc::pid_t) -> bool {
         // SAFETY: signal 0 only checks that the PID exists.
         if unsafe { libc::kill(pid, 0) } != 0 {
             return false;
         }
-        let Ok(state) = std::process::Command::new("ps")
+        let Ok(output) = std::process::Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
         else {
             return true;
         };
-        let state = String::from_utf8_lossy(&state.stdout);
-        !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        if !output.status.success() || state.is_empty() {
+            return true;
+        }
+        !state.starts_with('Z')
     }
 
     #[cfg(unix)]
