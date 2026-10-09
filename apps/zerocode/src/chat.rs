@@ -36194,8 +36194,8 @@ mod tests {
             .collect();
         assert_eq!(
             queued,
-            vec!["busy prompt".to_string()],
-            "a busy refusal never ran the message, so it returns to the queue"
+            vec!["busy prompt".to_string(), "queued follow-up".to_string()],
+            "a busy refusal never ran the message, so it returns to the front of the queue"
         );
         assert!(
             active.queue_paused(),
