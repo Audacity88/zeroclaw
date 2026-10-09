@@ -9625,14 +9625,31 @@ impl RpcDispatcher {
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let session_ids = ctx.sessions.list_ids().await;
         let mut prepared = Vec::new();
+        // Application paths are recorded only on prepared sessions; with none
+        // live, skip the semantic diff and metadata derivation under the
+        // config writer lock.
+        if session_ids.is_empty() {
+            return Ok(prepared);
+        }
         let previous = ctx.config.snapshot();
         let changed_paths = Config::semantic_changed_paths(&previous, config).unwrap_or_default();
+        // Derive each snapshot's property metadata once, not once per path.
+        let (candidate_capabilities, previous_capabilities) = if changed_paths.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(config.application_capabilities()),
+                Some(previous.application_capabilities()),
+            )
+        };
         let application_paths: Vec<_> = changed_paths
             .into_iter()
             .filter(|path| {
                 use zeroclaw_config::traits::ApplicationCapability::ModelProviderRefresh;
-                config.application_capability(path) == ModelProviderRefresh
-                    || previous.application_capability(path) == ModelProviderRefresh
+                [&candidate_capabilities, &previous_capabilities]
+                    .into_iter()
+                    .flatten()
+                    .any(|capabilities| capabilities.capability(path) == ModelProviderRefresh)
             })
             .collect();
         for session_id in session_ids {

@@ -25,6 +25,43 @@ use tokio::io::AsyncWriteExt;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_macros::Configurable;
 
+/// One config snapshot's property application metadata, built once by
+/// [`Config::application_capabilities`] and queried per changed path.
+#[derive(Debug, Clone)]
+pub struct ApplicationCapabilities {
+    fields: Vec<(String, ApplicationCapability)>,
+}
+
+impl ApplicationCapabilities {
+    /// Resolve potential application for `path`, defaulting to reload.
+    pub fn capability(&self, path: &[String]) -> ApplicationCapability {
+        // Dotted metadata cannot distinguish an opaque dotted key from nesting.
+        if path.is_empty()
+            || path
+                .iter()
+                .any(|part| part.is_empty() || part.contains('.'))
+        {
+            return ApplicationCapability::ReloadRequired;
+        }
+        let name = path.join(".");
+        let subtree = format!("{name}.");
+        let mut matched = false;
+        for (field_name, application) in &self.fields {
+            if *field_name == name || field_name.starts_with(&subtree) {
+                matched = true;
+                if *application != ApplicationCapability::ModelProviderRefresh {
+                    return ApplicationCapability::ReloadRequired;
+                }
+            }
+        }
+        if matched {
+            ApplicationCapability::ModelProviderRefresh
+        } else {
+            ApplicationCapability::ReloadRequired
+        }
+    }
+}
+
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.anthropic",
     "model_provider.compatible",
@@ -22238,30 +22275,23 @@ impl Config {
     }
 
     /// Resolve potential application from generated metadata, defaulting to reload.
+    ///
+    /// Builds this snapshot's property metadata on every call. To classify
+    /// several paths against one snapshot, build
+    /// [`Config::application_capabilities`] once and query it per path.
     pub fn application_capability(&self, path: &[String]) -> ApplicationCapability {
-        // Dotted metadata cannot distinguish an opaque dotted key from nesting.
-        if path.is_empty()
-            || path
-                .iter()
-                .any(|part| part.is_empty() || part.contains('.'))
-        {
-            return ApplicationCapability::ReloadRequired;
-        }
-        let name = path.join(".");
-        let subtree = format!("{name}.");
-        let mut matched = false;
-        for field in self.prop_fields() {
-            if field.name == name || field.name.starts_with(&subtree) {
-                matched = true;
-                if field.application != ApplicationCapability::ModelProviderRefresh {
-                    return ApplicationCapability::ReloadRequired;
-                }
-            }
-        }
-        if matched {
-            ApplicationCapability::ModelProviderRefresh
-        } else {
-            ApplicationCapability::ReloadRequired
+        self.application_capabilities().capability(path)
+    }
+
+    /// Snapshot this config's per-property application metadata once, so
+    /// many paths can be classified without re-deriving `prop_fields()`.
+    pub fn application_capabilities(&self) -> ApplicationCapabilities {
+        ApplicationCapabilities {
+            fields: self
+                .prop_fields()
+                .into_iter()
+                .map(|field| (field.name, field.application))
+                .collect(),
         }
     }
 
@@ -28335,6 +28365,7 @@ mod tests {
             ..ModelRouteConfig::default()
         });
         let fields = config.prop_fields();
+        let capabilities = config.application_capabilities();
         let live: Vec<_> = fields
             .iter()
             .filter(|field| field.application == ApplicationCapability::ModelProviderRefresh)
@@ -28365,11 +28396,15 @@ mod tests {
             vec!["agents", "ops_team", "model_provider"],
             vec!["model_routes"],
         ] {
+            let path: Vec<_> = path.into_iter().map(str::to_string).collect();
             assert_eq!(
-                config.application_capability(
-                    &path.into_iter().map(str::to_string).collect::<Vec<_>>()
-                ),
+                config.application_capability(&path),
                 ApplicationCapability::ModelProviderRefresh
+            );
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ModelProviderRefresh,
+                "the reusable snapshot index must agree with the per-call lookup for {path:?}"
             );
         }
         for path in [
@@ -28384,11 +28419,15 @@ mod tests {
             vec!["agents", "ops_team", "enabled"],
             vec!["providers.models", "openai", "prod_v2", "api_key"],
         ] {
+            let path: Vec<_> = path.into_iter().map(str::to_string).collect();
             assert_eq!(
-                config.application_capability(
-                    &path.into_iter().map(str::to_string).collect::<Vec<_>>()
-                ),
+                config.application_capability(&path),
                 ApplicationCapability::ReloadRequired
+            );
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ReloadRequired,
+                "the reusable snapshot index must agree with the per-call lookup for {path:?}"
             );
         }
         assert_eq!(
