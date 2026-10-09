@@ -195,7 +195,11 @@ def retain_runtime_diagnostics(rc):
                 'reply observation status', 'reply observation JSON', 'reply events',
                 'outbound thread relation', 'outbound root relation', 'reply event deadline',
                 'real encryption refusal', 'real encryption preflight reached, zero PUTs',
-                'encryption events', 'encrypted plaintext absent')
+                'encryption events', 'encrypted plaintext absent',
+                'proof-restart-received-prior-fixture-event',
+                'proof-restart-received-unclassified-event',
+                'proof-restart-initial-cursor-reused', 'proof-restart-initial-cursor-different',
+                'proof-restart-initial-cursor-unobserved')
     events = ('Failed to discover WASM channel plugins', 'Failed to admit logical plugin instances',
               'Failed to bind WASM channel plugin endpoint', 'Failed to construct WASM channel plugin')
     # Closed error literals from the frozen Matrix lib.rs and matrix.rs.

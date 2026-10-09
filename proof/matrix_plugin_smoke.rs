@@ -226,6 +226,8 @@ struct Script {
     whoami: usize,
     syncs: usize,
     incremental: usize,
+    first_initial_cursor: Option<String>,
+    repeated_initial_cursor: Option<bool>,
     encryption_gets: usize,
     puts: usize,
     wrong_auth: usize,
@@ -245,6 +247,8 @@ impl Default for Script {
             whoami: 0,
             syncs: 0,
             incremental: 0,
+            first_initial_cursor: None,
+            repeated_initial_cursor: None,
             encryption_gets: 0,
             puts: 0,
             wrong_auth: 0,
@@ -417,6 +421,16 @@ impl Server {
                             state.syncs += 1;
                             if request.path.contains("since=") {
                                 state.incremental += 1;
+                            } else if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                                if let Some(cursor) =
+                                    value.get("next_batch").and_then(Value::as_str)
+                                {
+                                    if let Some(first) = &state.first_initial_cursor {
+                                        state.repeated_initial_cursor = Some(first == cursor);
+                                    } else {
+                                        state.first_initial_cursor = Some(cursor.to_string());
+                                    }
+                                }
                             }
                         }
                         Response::Raw(status, body)
@@ -666,9 +680,11 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
         .context("proof-stage-production-activation")?;
     passed("actual-package-ABI-config-authenticated-identity")?;
     let mut listening = Listening::start(channel.clone(), 8);
+    let mut earlier_event_ids = vec![backlog.clone()];
     let result = async {
         server.wait(|s| s.syncs >= 1 && s.incremental >= 1).await?;
         let root_a = event(&client, fixture, &fixture.sender, "top-level-a", None).await?;
+        earlier_event_ids.push(root_a.clone());
         let inbound = listening.next().await?;
         ensure!(
             inbound.id == root_a && inbound.id != backlog,
@@ -686,10 +702,12 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
         replied(&client, fixture, "reply-top-level-a", &root_a).await?;
         passed("real-unencrypted-roundtrip-top-level-root-backlog-suppression")?;
         let root_b = event(&client, fixture, &fixture.sender, "top-level-b", None).await?;
+        earlier_event_ids.push(root_b.clone());
         let inbound = listening.next().await?;
         ensure!(inbound.id == root_b, "second root inbound");
         for (tag, root) in [("thread-a", &root_a), ("thread-b", &root_b)] {
             let id = event(&client, fixture, &fixture.sender, tag, Some(root)).await?;
+            earlier_event_ids.push(id.clone());
             let inbound = listening.next().await?;
             endpoint(&inbound, &fixture.room)?;
             ensure!(
@@ -711,6 +729,7 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
         let deny = event(&client, fixture, &fixture.deny, "deny-body", None).await?;
         let echo = event(&client, fixture, &fixture.bot, "self-echo-body", None).await?;
         let sentinel = event(&client, fixture, &fixture.sender, "policy-sentinel", None).await?;
+        earlier_event_ids.extend([deny.clone(), echo.clone(), sentinel.clone()]);
         let inbound = listening.next().await?;
         ensure!(
             inbound.id == sentinel && inbound.id != deny && inbound.id != echo,
@@ -732,6 +751,20 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
         server.wait(|s| s.syncs >= syncs + 2).await?;
         let id = event(&client, fixture, &fixture.sender, "restart-text", None).await?;
         let inbound = listening.next().await?;
+        if inbound.id != id {
+            let provenance = if earlier_event_ids.contains(&inbound.id) {
+                "proof-restart-received-prior-fixture-event"
+            } else {
+                "proof-restart-received-unclassified-event"
+            };
+            eprintln!("{provenance}");
+            let cursor = match server.read(|state| state.repeated_initial_cursor) {
+                Some(true) => "proof-restart-initial-cursor-reused",
+                Some(false) => "proof-restart-initial-cursor-different",
+                None => "proof-restart-initial-cursor-unobserved",
+            };
+            eprintln!("{cursor}");
+        }
         ensure!(inbound.id == id, "restart resync inbound");
         channel
             .send(&SendMessage::reply_to(&inbound, "reply-restart"))
