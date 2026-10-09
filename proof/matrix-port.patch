@@ -459,10 +459,10 @@ index 9042469..a99b71d 100644
  [profile.release]
  opt-level = "s"
 diff --git a/plugins/matrix/README.md b/plugins/matrix/README.md
-index 93cc35b..5b3759f 100644
+index 93cc35b..7dd2e82 100644
 --- a/plugins/matrix/README.md
 +++ b/plugins/matrix/README.md
-@@ -1,47 +1,42 @@
+@@ -1,47 +1,43 @@
 -# Matrix channel plugin
 +# Matrix text-only channel plugin
  
@@ -502,11 +502,12 @@ index 93cc35b..5b3759f 100644
 -## Configuration
 +## Text and lifecycle
 +
-+- Startup establishes a volatile `/sync` cursor and learns bounded room metadata without replaying backlog. A limited startup timeline is allowed because its backlog is deliberately suppressed. Subsequent polls deliver new unencrypted `m.text` events in joined rooms. Restarting loses the cursor and suppresses the new startup backlog; this is not durable replay.
++- Startup establishes a volatile `/sync` cursor and learns bounded room metadata while suppressing initial and advancing catch-up timelines, including limited timelines. An unchanged valid incremental cursor ends bootstrap; that response's events are also suppressed. Subsequent polls deliver new unencrypted `m.text` events in joined rooms and reject limited timelines. Restarting loses the cursor and repeats bootstrap. Messages arriving during bootstrap may be suppressed.
++- This cutoff is experimental, not a universal freshness guarantee. Busy or unrelated streams can prevent an unchanged cursor indefinitely, leaving the channel unready. Synapse worker catch-up timeouts can also return an unchanged cursor, so this does not establish multi-worker restart safety or durable replay. The integration proof uses a pinned single-process Synapse.
 +- Server-owned `m.direct` membership and summary member counts survive sync responses that omit them. Each `m.direct` event replaces the previous direct-room set, including an empty replacement. Summary count fields update when present; an omitted field leaves the prior count unchanged. A leave clears that room's metadata and pending messages. These are account/homeserver-bound protocol facts, not cached configuration policy.
 +- Current room policy excludes disallowed rooms before queue counting. Pending events retain room, direct-room and mention provenance. Current room, mention and reply policy also applies when they leave the queue. Self echoes, encrypted events, media and edits are ignored.
 +- Thread replies preserve their genuine root as `interruption_scope_id`. A top-level event used as a new outbound reply anchor has no interruption scope.
-+- Authentication failure never falls back to a configured identity. Poll failures emit scrubbed structured logs and make health unhealthy until a successful sync. A successful whoami health probe alone does not clear a poll failure. Initial health is unhealthy until the first successful sync.
++- Authentication failure never falls back to a configured identity. Poll failures emit scrubbed structured logs and make health unhealthy until a successful sync. A successful whoami health probe alone does not clear a poll failure. Initial health stays unhealthy until bootstrap completes.
 +- Polling retries at most once per call, with exponential delay from one to thirty seconds. Batch admission commits the cursor, queue and room metadata together. Queue or metadata overflow, malformed timeline structure, and a limited incremental timeline in a currently allowed room reject the batch without advancing any of those states or clearing sync failure. If a timeline is present, it must be an object with an events array and any `limited` field must be boolean. Sustained overflow or a timeline gap requires operator attention; the plugin does not fetch history or silently skip missing events.
 +
 +## Deliberately unencrypted rooms only
@@ -1310,7 +1311,7 @@ index ed4fca0..339b2ac 100644
      export!(MatrixChannel);
  }
 diff --git a/plugins/matrix/src/matrix.rs b/plugins/matrix/src/matrix.rs
-index 72b6005..af9d68d 100644
+index 72b6005..7e06517 100644
 --- a/plugins/matrix/src/matrix.rs
 +++ b/plugins/matrix/src/matrix.rs
 @@ -1,27 +1,26 @@
@@ -1350,7 +1351,7 @@ index 72b6005..af9d68d 100644
      pub user_id: Option<String>,
      #[serde(default)]
      pub allowed_rooms: Vec<String>,
-@@ -32,402 +31,465 @@ pub struct MatrixConfig {
+@@ -32,402 +31,472 @@ pub struct MatrixConfig {
  }
  
  impl MatrixConfig {
@@ -2002,6 +2003,7 @@ index 72b6005..af9d68d 100644
 +    pub self_id: String,
 +    homeserver: String,
 +    invalidated: bool,
++    bootstrapping: bool,
 +    pub since: Option<String>,
 +    pub pending: VecDeque<Pending>,
 +    pub rooms: HashMap<String, RoomMetadata>,
@@ -2013,6 +2015,7 @@ index 72b6005..af9d68d 100644
 +            self_id,
 +            homeserver: cfg.homeserver().to_string(),
 +            invalidated: false,
++            bootstrapping: true,
 +            since: None,
 +            pending: VecDeque::new(),
 +            rooms: HashMap::new(),
@@ -2049,6 +2052,7 @@ index 72b6005..af9d68d 100644
 +            || cfg.user_id.as_deref().is_some_and(|id| id != authenticated)
 +        {
 +            self.invalidated = true;
++            self.bootstrapping = true;
 +            self.since = None;
 +            self.pending.clear();
 +            self.rooms.clear();
@@ -2090,9 +2094,13 @@ index 72b6005..af9d68d 100644
 +            &self.self_id,
 +            self.rooms.clone(),
 +            self.pending.clone(),
-+            self.since.is_none(),
++            self.bootstrapping,
 +        ) {
 +            Ok(batch) => {
++                // Suppress cached catch-up through the first unchanged incremental cursor.
++                if self.bootstrapping && self.since.as_ref() == Some(&batch.cursor) {
++                    self.bootstrapping = false;
++                }
 +                self.since = Some(batch.cursor);
 +                self.rooms = batch.rooms;
 +                self.pending = batch.pending;
@@ -2130,14 +2138,14 @@ index 72b6005..af9d68d 100644
 +        None
 +    }
 +    pub fn healthy(&self) -> bool {
-+        !self.invalidated && !self.sync_failed && self.since.is_some()
++        !self.invalidated && !self.bootstrapping && !self.sync_failed && self.since.is_some()
      }
  }
 diff --git a/plugins/matrix/tests/matrix.rs b/plugins/matrix/tests/matrix.rs
-index e4e3875..0769fe0 100644
+index e4e3875..2c22c82 100644
 --- a/plugins/matrix/tests/matrix.rs
 +++ b/plugins/matrix/tests/matrix.rs
-@@ -1,44 +1,595 @@
+@@ -1,44 +1,670 @@
 -use matrix::matrix::{build_send_body, parse_sync, send_url, sync_url, whoami_url, MatrixConfig};
 -use serde_json::json;
 +use matrix::matrix::{
@@ -2159,9 +2167,15 @@ index e4e3875..0769fe0 100644
 +    json!({"next_batch":"s2", "rooms":{"join":{"!room:example":{
 +        "summary":{"m.joined_member_count":4}, "timeline":{"events":events}}}}})
 +}
++fn finish_bootstrap(state: &mut Session, cfg: &MatrixConfig) {
++    let cursor = state.since.clone().unwrap();
++    state.ingest(&json!({"next_batch":cursor}), cfg).unwrap();
++    assert!(state.healthy());
++}
 +fn messages(value: &Value, cfg: &MatrixConfig) -> Vec<Inbound> {
 +    let mut state = Session::new(cfg, SELF.into());
 +    state.ingest(&json!({"next_batch":"start"}), cfg).unwrap();
++    finish_bootstrap(&mut state, cfg);
 +    state.ingest(value, cfg).unwrap();
 +    let mut messages = Vec::new();
 +    while let Some(message) = state.next(cfg) {
@@ -2394,6 +2408,7 @@ index e4e3875..0769fe0 100644
 +    state
 +        .ingest(&json!({"next_batch":"start"}), &config)
 +        .unwrap();
++    finish_bootstrap(&mut state, &config);
 +    state.ingest(&value, &config).unwrap();
 +    config.mention_only = true;
 +    config.reply_in_thread = false;
@@ -2439,6 +2454,7 @@ index e4e3875..0769fe0 100644
 +                &config,
 +            )
 +            .unwrap();
++        finish_bootstrap(&mut state, &config);
 +        let value = sync(vec![text(
 +            "$queued",
 +            "@user:example",
@@ -2477,6 +2493,8 @@ index e4e3875..0769fe0 100644
 +    )]);
 +    state.ingest(&value, &config).unwrap();
 +    assert!(state.next(&config).is_none());
++    assert!(!state.healthy());
++    finish_bootstrap(&mut state, &config);
 +    assert!(state.healthy());
 +    state.sync_failed = true;
 +    assert!(state.check_binding(&config, SELF).is_ok());
@@ -2485,6 +2503,65 @@ index e4e3875..0769fe0 100644
 +        .ingest(&json!({"next_batch":"recovered"}), &config)
 +        .unwrap();
 +    assert!(state.healthy());
++}
++
++#[test]
++fn cached_startup_catch_up_is_suppressed_until_unchanged_incremental_cursor() {
++    let config = cfg();
++    let mut state = Session::new(&config, SELF.into());
++    for cursor in ["cached", "catch-up-one", "catch-up-two"] {
++        let mut batch = sync(vec![text(
++            "$historical",
++            "@user:example",
++            json!({"msgtype":"m.text","body":"old"}),
++        )]);
++        batch["next_batch"] = json!(cursor);
++        batch["rooms"]["join"]["!room:example"]["timeline"]["limited"] = json!(true);
++        state.ingest(&batch, &config).unwrap();
++        assert_eq!(state.since.as_deref(), Some(cursor));
++        assert!(!state.healthy());
++        assert!(state.next(&config).is_none());
++    }
++    let prior = state.rooms.clone();
++    for invalid in [
++        json!({"next_batch":"catch-up-two", "rooms":{"join":{"!new:example":{"timeline":{}}}}}),
++        json!({"next_batch":"x".repeat(4097)}),
++        json!({"next_batch":"catch-up-two", "account_data":{"events":[
++            {"type":"m.direct","content":{"@user:example":(0..=MAX_ROOM_METADATA)
++                .map(|i| format!("!overflow{i}:example")).collect::<Vec<_>>()}}
++        ]}}),
++    ] {
++        assert!(state.ingest(&invalid, &config).is_err());
++        assert_eq!(state.since.as_deref(), Some("catch-up-two"));
++        assert_eq!(state.rooms, prior);
++        assert!(!state.healthy());
++        assert!(state.next(&config).is_none());
++    }
++    let mut equality = sync(vec![text(
++        "$boundary",
++        "@user:example",
++        json!({"msgtype":"m.text","body":"still suppressed"}),
++    )]);
++    equality["next_batch"] = json!("catch-up-two");
++    equality["rooms"]["join"]["!room:example"]["summary"]["m.joined_member_count"] = json!(2);
++    state.ingest(&equality, &config).unwrap();
++    assert!(state.healthy());
++    assert!(state.next(&config).is_none());
++    let mut fresh = sync(vec![text(
++        "$fresh",
++        "@user:example",
++        json!({"msgtype":"m.text","body":"new"}),
++    )]);
++    fresh["next_batch"] = json!("fresh");
++    fresh["rooms"]["join"]["!room:example"]
++        .as_object_mut()
++        .unwrap()
++        .remove("summary");
++    let mut mention_only = config.clone();
++    mention_only.mention_only = true;
++    state.ingest(&fresh, &mention_only).unwrap();
++    assert_eq!(state.next(&mention_only).unwrap().id, "$fresh");
++    assert!(state.next(&mention_only).is_none());
 +}
 +
 +#[test]
@@ -2503,6 +2580,7 @@ index e4e3875..0769fe0 100644
 +    let mut state = Session::new(&config, SELF.into());
 +    state.ingest(&value, &config).unwrap();
 +    assert!(state.pending.is_empty());
++    finish_bootstrap(&mut state, &config);
 +    assert!(state.ingest(&value, &config).is_err());
 +    assert_eq!(state.since.as_deref(), Some("s2"));
 +    // Startup can suppress a backlog larger than the delivery queue.
@@ -2560,6 +2638,7 @@ index e4e3875..0769fe0 100644
 +                json!(2);
 +        }
 +        state.ingest(&initial, &config).unwrap();
++        finish_bootstrap(&mut state, &config);
 +        let mut later = sync(vec![text(
 +            "$later",
 +            "@user:example",
@@ -2613,6 +2692,7 @@ index e4e3875..0769fe0 100644
 +            &config,
 +        )
 +        .unwrap();
++    finish_bootstrap(&mut state, &config);
 +    state
 +        .ingest(
 +            &sync(vec![text(
@@ -2646,6 +2726,8 @@ index e4e3875..0769fe0 100644
 +    initial["rooms"]["join"]["!room:example"]["timeline"]["limited"] = json!(true);
 +    state.ingest(&initial, &config).unwrap();
 +    assert!(state.pending.is_empty());
++    assert!(!state.healthy());
++    finish_bootstrap(&mut state, &config);
 +    assert!(state.healthy());
 +    state
 +        .ingest(
@@ -2691,6 +2773,7 @@ index e4e3875..0769fe0 100644
 +    let config = cfg();
 +    let mut state = Session::new(&config, SELF.into());
 +    state.ingest(&sync(Vec::new()), &config).unwrap();
++    finish_bootstrap(&mut state, &config);
 +    let prior = state.rooms.clone();
 +    let rooms: Vec<_> = (0..MAX_ROOM_METADATA)
 +        .map(|i| format!("!direct{i}:example"))

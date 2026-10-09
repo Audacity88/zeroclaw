@@ -234,6 +234,7 @@ struct Script {
     active_request: bool,
     batch: VecDeque<Value>,
     issued_batch: Option<(String, usize)>,
+    last_cursor: String,
     sync_response: Option<Response>,
     encryption: Response,
     put_bodies: Vec<Value>,
@@ -255,6 +256,7 @@ impl Default for Script {
             active_request: false,
             batch: VecDeque::new(),
             issued_batch: None,
+            last_cursor: "cursor-start".into(),
             sync_response: None,
             encryption: Response::Json(404, json!({"errcode": "M_NOT_FOUND"})),
             put_bodies: vec![],
@@ -451,10 +453,15 @@ impl Server {
                             }
                             state.sync_response.clone().unwrap_or_else(|| {
                                 let value = if let Some(value) = state.batch.pop_front() {
-                                    state.issued_batch = Some((value["next_batch"].as_str().unwrap_or("").into(), state.whoami));
+                                    state.issued_batch = Some((
+                                        value["next_batch"].as_str().unwrap_or("").into(),
+                                        state.whoami,
+                                    ));
+                                    state.last_cursor =
+                                        value["next_batch"].as_str().unwrap_or("").into();
                                     value
                                 } else {
-                                    json!({"next_batch": format!("cursor-{}", state.syncs), "rooms": {"join": {}}})
+                                    json!({"next_batch": state.last_cursor, "rooms": {"join": {}}})
                                 };
                                 Response::Json(200, value)
                             })
@@ -661,6 +668,15 @@ async fn replied(
     }
 }
 
+async fn wait_ready(channel: &Arc<dyn Channel>) -> Result<()> {
+    let deadline = Instant::now() + WAIT;
+    while !channel.health_check().await {
+        ensure!(Instant::now() < deadline, "bootstrap health readiness");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(())
+}
+
 async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
     ensure!(
         fixture.bot.id == BOT && fixture.sender.id == SENDER && fixture.deny.id == DENY,
@@ -682,7 +698,7 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
     let mut listening = Listening::start(channel.clone(), 8);
     let mut earlier_event_ids = vec![backlog.clone()];
     let result = async {
-        server.wait(|s| s.syncs >= 1 && s.incremental >= 1).await?;
+        wait_ready(&channel).await?;
         let root_a = event(&client, fixture, &fixture.sender, "top-level-a", None).await?;
         earlier_event_ids.push(root_a.clone());
         let inbound = listening.next().await?;
@@ -745,10 +761,9 @@ async fn primary(server: &Server, fixture: &Fixture) -> Result<()> {
     stopped?;
     drop(channel);
     let (_live, channel) = activate(config).await?;
-    let syncs = server.read(|s| s.syncs);
     let mut listening = Listening::start(channel.clone(), 8);
     let result = async {
-        server.wait(|s| s.syncs >= syncs + 2).await?;
+        wait_ready(&channel).await?;
         let id = event(&client, fixture, &fixture.sender, "restart-text", None).await?;
         let inbound = listening.next().await?;
         if inbound.id != id {
@@ -1049,10 +1064,7 @@ async fn scripted(server: &Server) -> Result<()> {
     let (_live, channel) = activate(config.clone()).await?;
     let listening = Listening::start(channel.clone(), 8);
     let result = async {
-        let syncs = server.read(|s| s.syncs);
-        server
-            .wait(|s| s.syncs > syncs && s.incremental > 0)
-            .await?;
+        wait_ready(&channel).await?;
         for response in [
             Response::Json(500, json!({"errcode": "M_UNKNOWN"})),
             Response::Raw(200, b"not-json".to_vec()),
@@ -1101,8 +1113,7 @@ async fn queued_policy(server: &Server, config: Config) -> Result<()> {
     let (live, channel) = activate(config).await?;
     let mut listening = Listening::start(channel.clone(), 1);
     let result = async {
-        let syncs = server.read(|s| s.syncs);
-        server.wait(|s| s.syncs > syncs).await?;
+        wait_ready(&channel).await?;
         // Two events can have crossed poll_message before publication (one in
         // mpsc and one blocked on tx.send). Subsequent events remain guest-owned.
         for (case, key, value) in [
