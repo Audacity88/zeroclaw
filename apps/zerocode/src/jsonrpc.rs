@@ -80,8 +80,6 @@ pub mod error_codes {
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
     pub const SESSION_BUSY: i32 = -32002;
-    #[cfg(test)]
-    pub const INVALID_PARAMS: i32 = -32602;
 }
 
 pub const ACP_PROTOCOL_VERSION: u64 = 1;

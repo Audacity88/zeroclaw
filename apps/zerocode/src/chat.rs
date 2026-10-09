@@ -35427,6 +35427,7 @@ mod tests {
             &mut lines,
             "ask_user",
             &input,
+            120,
             Some("Only A and C now, B waits for the dogfood rebase"),
             false,
             ToolDisclosure::Collapsed,
