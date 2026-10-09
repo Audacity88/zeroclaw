@@ -12489,6 +12489,11 @@ mod tests {
             .to_rfc3339()
     }
 
+    /// RFC 3339 time `minutes` before now: a past time on any clock.
+    fn minutes_ago(minutes: i64) -> String {
+        (chrono::Local::now() - chrono::TimeDelta::minutes(minutes)).to_rfc3339()
+    }
+
     fn timed(role: &str, content: &str, at: String) -> crate::client::MessageEntry {
         crate::client::MessageEntry {
             role: role.to_string(),
@@ -12577,8 +12582,10 @@ mod tests {
         let mut s = state();
         s.load_history(
             vec![
-                timed("user", "long task", today_at(1, 0, 0)),
-                timed("assistant", "partial so far", today_at(1, 10, 0)),
+                // Relative to now: the live settle below stamps the end
+                // with the current time, so the start must be in the past.
+                timed("user", "long task", minutes_ago(40)),
+                timed("assistant", "partial so far", minutes_ago(30)),
             ],
             true,
         );
