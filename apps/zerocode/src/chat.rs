@@ -13889,6 +13889,8 @@ impl ChatState {
         self.entries.push(ChatEntry::UserMessage {
             text: Some(Arc::<str>::from(text)),
             attachments: vec![],
+            // Typed in this pane, so not a peer-injected prompt.
+            source: None,
         });
         self.mark_dirty_append();
         self.message_count = self.message_count.saturating_add(1);
