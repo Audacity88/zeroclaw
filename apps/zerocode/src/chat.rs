@@ -2798,14 +2798,24 @@ impl Chat {
                 // this turn; retain the interrupted state for reconnect.
                 continue;
             }
-            if completion.error.is_some() {
-                state.remove_optimistic_user_message(completion.turn_generation);
-            }
+            let refused_text = if completion.error.is_some() {
+                state.remove_optimistic_user_message(completion.turn_generation)
+            } else {
+                None
+            };
             // A busy refusal never started the turn: return the message to
             // the queue before settling, so settling neither cleans up its
-            // attachments nor loses its text.
-            let requeued = completion.error_code == Some(crate::jsonrpc::error_codes::SESSION_BUSY)
-                && state.requeue_refused_dispatch(completion.turn_generation);
+            // attachments nor loses its text. The text comes from the
+            // optimistic row just removed, the one place it is held.
+            let requeued = match refused_text {
+                Some(text)
+                    if completion.error_code == Some(crate::jsonrpc::error_codes::SESSION_BUSY) =>
+                {
+                    state.requeue_refused_dispatch(text);
+                    true
+                }
+                _ => false,
+            };
             // Keep a known pause or cancellation reason. Other successful
             // responses still cannot prove clean completion without a terminal
             // notification, so queued work stays paused conservatively.
@@ -3612,7 +3622,6 @@ impl Chat {
         state.own_active_turn_attachments(attachments);
         state.push_user_message(prompt, att_names);
         let turn_generation = state.turn_generation;
-        state.dispatched_prompt = Some((turn_generation, text.clone()));
         Self::spawn_prompt_on(
             rpc_out,
             rpc,
@@ -9734,10 +9743,6 @@ pub struct ChatState {
     /// closure and terminal notifications leave it intact.
     /// `(generation, entry index, prior durable count)` for the optimistic row.
     optimistic_user_message: Option<(u64, usize, usize)>,
-    /// Text of the queued message the current turn dispatched, keyed by turn
-    /// generation. A `SESSION_BUSY` refusal means the daemon never ran it, so
-    /// it goes back to the front of the queue instead of being dropped.
-    dispatched_prompt: Option<(u64, String)>,
     /// Set when any streaming text was flushed during the current turn.
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
@@ -9902,7 +9907,6 @@ impl ChatState {
             turn_in_flight: false,
             turn_generation: 0,
             optimistic_user_message: None,
-            dispatched_prompt: None,
             turn_had_streaming_text: false,
             prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
@@ -11627,7 +11631,6 @@ impl ChatState {
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
-        self.dispatched_prompt = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         let mut cleanup_report = self.cleanup_active_turn_attachments();
@@ -11740,13 +11743,7 @@ impl ChatState {
     /// pauses so a session that stays busy is not retried in a loop; the item
     /// is re-queued as `Pending` (not `Injected`) for the same reason, since
     /// injected items bypass the pause.
-    fn requeue_refused_dispatch(&mut self, generation: u64) -> bool {
-        let Some((marked_generation, text)) = self.dispatched_prompt.take() else {
-            return false;
-        };
-        if marked_generation != generation {
-            return false;
-        }
+    fn requeue_refused_dispatch(&mut self, text: String) {
         let attachments = std::mem::take(&mut self.active_turn_attachments);
         let id = self.alloc_queue_id();
         self.message_queue.push_front(QueuedMessage {
@@ -11757,36 +11754,35 @@ impl ChatState {
         });
         self.queue_paused = Some(QueuePauseReason::Generic);
         self.resume_override = false;
-        true
     }
 
-    fn remove_optimistic_user_message(&mut self, generation: u64) {
-        let Some((marked_generation, entry_index, prior_message_count)) =
-            self.optimistic_user_message.take()
-        else {
-            return;
-        };
+    /// Remove the optimistic row of a turn the daemon rejected and return the
+    /// text it carried (empty for an attachment-only message), or `None` when
+    /// no row of `generation` was removed.
+    fn remove_optimistic_user_message(&mut self, generation: u64) -> Option<String> {
+        let (marked_generation, entry_index, prior_message_count) =
+            self.optimistic_user_message.take()?;
         if marked_generation != generation {
-            return;
+            return None;
         }
         self.message_count = prior_message_count;
-        if matches!(
-            self.entries.get(entry_index),
-            Some(ChatEntry::UserMessage { .. })
-        ) {
-            self.entries.remove(entry_index);
-            self.first_message = self.entries.iter().find_map(|entry| {
-                let ChatEntry::UserMessage {
-                    text: Some(text), ..
-                } = entry
-                else {
-                    return None;
-                };
-                let display = strip_enrichment_prefix(text.as_ref());
-                (!display.trim().is_empty()).then(|| display.to_string())
-            });
-            self.mark_dirty_full();
-        }
+        let Some(ChatEntry::UserMessage { text, .. }) = self.entries.get(entry_index) else {
+            return None;
+        };
+        let removed = text.as_deref().unwrap_or_default().to_string();
+        self.entries.remove(entry_index);
+        self.first_message = self.entries.iter().find_map(|entry| {
+            let ChatEntry::UserMessage {
+                text: Some(text), ..
+            } = entry
+            else {
+                return None;
+            };
+            let display = strip_enrichment_prefix(text.as_ref());
+            (!display.trim().is_empty()).then(|| display.to_string())
+        });
+        self.mark_dirty_full();
+        Some(removed)
     }
 
     const QUEUE_CAP: usize = 32;
@@ -12267,7 +12263,6 @@ impl ChatState {
         self.streaming_thought.clear();
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
-        self.dispatched_prompt = None;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
@@ -30868,6 +30863,77 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "a paused queue must not redispatch into the busy session"
+        );
+    }
+
+    /// `Injected` items bypass the pause, so a refused inject that kept its
+    /// status would be retried straight back into the busy session. It must
+    /// come back as `Pending`, wait out the pause, and go out once on resume
+    /// with its text and attachment intact.
+    #[tokio::test]
+    async fn prompt_session_busy_requeues_injected_as_pending_until_resume() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let clip = dir.path().join("shot.png");
+        std::fs::write(&clip, b"png").expect("write clipboard attachment");
+        let mut active = state();
+        active
+            .inject_message("urgent".to_string(), vec![clipboard_att(&clip, "shot.png")])
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "injected prompt should be sent").await;
+        assert_eq!(request["params"]["prompt"], "urgent");
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_BUSY,
+            "Session busy: Timed out waiting for session sess-1",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert_eq!(active.queue_len(), 1);
+        assert_eq!(active.message_queue[0].text, "urgent");
+        assert_eq!(
+            active.message_queue[0].status,
+            QueueItemStatus::Pending,
+            "a refused inject must not keep the status that bypasses the pause"
+        );
+        assert_eq!(active.message_queue[0].attachments.len(), 1);
+        assert!(active.queue_paused());
+        assert!(
+            !active.entries.iter().any(|entry| matches!(
+                entry,
+                ChatEntry::UserMessage { text: Some(text), .. } if text.as_ref() == "urgent"
+            )),
+            "the refused message lives in the queue, not as a transcript row"
+        );
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the paused queue must not redispatch the refused inject"
+        );
+
+        active_state(&mut chat).resume_queue();
+        chat.pump_all_queues();
+        let retry = next_rpc_request(&mut writer_rx, "resume sends the refused inject").await;
+        assert_eq!(retry["method"], method::SESSION_PROMPT);
+        assert_eq!(retry["params"]["prompt"], "urgent");
+        assert_eq!(
+            retry["params"]["attachments"].as_array().map(Vec::len),
+            Some(1),
+            "the retry carries the original attachment"
+        );
+        assert!(
+            clip.exists(),
+            "the attachment temp survives until the retry runs"
+        );
+        assert_eq!(active_state(&mut chat).queue_len(), 0);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the refused inject is sent exactly once on resume"
         );
     }
 
