@@ -6827,7 +6827,6 @@ fn render_tool_entry(
     name: &str,
     input_json: &str,
     result: Option<&str>,
-    time_label: Option<&str>,
     is_selected: bool,
     disclosure: ToolDisclosure,
 ) -> Option<usize> {
@@ -6837,14 +6836,10 @@ fn render_tool_entry(
         Modifier::empty()
     };
     let marker = if disclosure.is_open() { "▼" } else { "▶" };
-    let mut header = vec![Span::styled(
+    lines.push(Line::from(vec![Span::styled(
         format!("{marker} [tool: {name}] "),
         theme::tool_label_style().add_modifier(sel_mod),
-    )];
-    if let Some(time) = time_label {
-        header.push(header_time_span(time, sel_mod));
-    }
-    lines.push(Line::from(header));
+    )]));
 
     let preview = |text: &str, max_bytes: usize| {
         let (compact, limited) = terminal_safe_tool_text_limited(text, max_bytes, 1);
@@ -7033,7 +7028,6 @@ fn render_tool_entry(
 /// The transcript layout owner uses this renderer in every rebuild mode.
 fn render_entry_into(
     entry: &ChatEntry,
-    time_label: Option<&str>,
     is_selected: bool,
     show_thoughts: bool,
     tool_disclosure: ToolDisclosure,
@@ -7063,9 +7057,6 @@ fn render_entry_into(
                 let mut spans = Vec::new();
                 if idx == 0 {
                     spans.push(label_span.clone());
-                    if let Some(time) = time_label {
-                        spans.push(header_time_span(time, sel_mod));
-                    }
                 }
                 spans.push(Span::styled((*line_text).to_string(), body_style));
                 let mut line = Line::from(spans);
@@ -7085,10 +7076,10 @@ fn render_entry_into(
             }
         }
         ChatEntry::AgentMessage(text) => {
-            render_agent_message_into(text, time_label, is_selected, width, lines);
+            render_agent_message_into(text, is_selected, width, lines);
         }
         ChatEntry::AgentMessageContinuation(text) => {
-            render_agent_message_into(text, time_label, is_selected, width, lines);
+            render_agent_message_into(text, is_selected, width, lines);
         }
         ChatEntry::AgentThought(text) => {
             if show_thoughts {
@@ -7099,18 +7090,11 @@ fn render_entry_into(
             }
         }
         ChatEntry::SystemMessage(text) => {
-            for (idx, line_text) in text.lines().enumerate() {
-                let body = Span::styled(
+            for line_text in text.lines() {
+                lines.push(Line::from(Span::styled(
                     line_text.to_string(),
                     theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
-                );
-                // A notice has no label; its time leads the first line.
-                match time_label.filter(|_| idx == 0) {
-                    Some(time) => {
-                        lines.push(Line::from(vec![header_time_span(time, sel_mod), body]))
-                    }
-                    None => lines.push(Line::from(body)),
-                }
+                )));
             }
         }
         ChatEntry::Tool {
@@ -7124,7 +7108,6 @@ fn render_entry_into(
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
-                time_label,
                 is_selected,
                 tool_disclosure,
             );
@@ -7133,14 +7116,8 @@ fn render_entry_into(
     None
 }
 
-/// Dim message time placed on a header line, after the label.
-fn header_time_span(time: &str, sel_mod: Modifier) -> Span<'static> {
-    Span::styled(format!("{time} "), theme::dim_style().add_modifier(sel_mod))
-}
-
 fn render_agent_message_into(
     text: &str,
-    time_label: Option<&str>,
     is_selected: bool,
     width: u16,
     lines: &mut Vec<Line<'static>>,
@@ -7150,14 +7127,10 @@ fn render_agent_message_into(
     } else {
         Modifier::empty()
     };
-    let mut header = vec![Span::styled(
+    lines.push(Line::from(vec![Span::styled(
         format!("{} ", crate::i18n::t("zc-chat-label-agent")),
         theme::agent_label_style().add_modifier(sel_mod),
-    )];
-    if let Some(time) = time_label {
-        header.push(header_time_span(time, sel_mod));
-    }
-    lines.push(Line::from(header));
+    )]));
     let md_lines = markdown_to_lines(text, width);
     for mut line in md_lines {
         if is_selected {
@@ -9106,6 +9079,13 @@ impl PendingElicitation {
     }
 }
 
+/// Which cached transcript lines a turn-end mark invalidates.
+enum TurnEndChange {
+    None,
+    Tail(usize),
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
@@ -9334,15 +9314,12 @@ pub struct ChatState {
     /// reaches a terminal outcome.
     active_turn_attachments: Vec<PendingAttachment>,
     entries: Vec<ChatEntry>,
-    /// Local wall-clock time each entry in `entries` started, index-aligned.
-    /// A shorter vector means "no time" for the tail (entries pushed without
-    /// `push_entry`). Kept in step by `push_entry*`, `remove_entry` and
-    /// `clear_entries`.
-    entry_times: Vec<Option<chrono::DateTime<chrono::Local>>>,
+    /// Time facts per entry in `entries`, index-aligned; they place the
+    /// transcript's gap dividers and turn footers. A shorter vector means
+    /// "no time" for the tail. Kept in step by `push_entry*`, `remove_entry`
+    /// and `clear_entries`.
+    entry_times: Vec<entry_time::EntryStamp>,
     streaming_text: String,
-    /// When the uncommitted `streaming_text` began, so the committed agent
-    /// message carries the time of its first chunk rather than of its flush.
-    streaming_text_started_at: Option<chrono::DateTime<chrono::Local>>,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
@@ -9517,7 +9494,6 @@ impl ChatState {
             entries: Vec::new(),
             entry_times: Vec::new(),
             streaming_text: String::new(),
-            streaming_text_started_at: None,
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
@@ -9586,9 +9562,59 @@ impl ChatState {
 
     /// Append a transcript entry with a known start time (`None`: unknown).
     fn push_entry_at(&mut self, at: Option<chrono::DateTime<chrono::Local>>, entry: ChatEntry) {
-        self.entry_times.resize(self.entries.len(), None);
+        self.entry_times
+            .resize(self.entries.len(), entry_time::EntryStamp::default());
         self.entries.push(entry);
-        self.entry_times.push(at);
+        self.entry_times.push(entry_time::EntryStamp {
+            at,
+            ends_turn: entry_time::TurnEnd::No,
+        });
+    }
+
+    /// Mark the turn's last output as its end, at `at`, so its footer
+    /// follows it. The first live settle wins: a later terminal frame, or a
+    /// local notice pushed after it, does not move the end. An end inferred
+    /// from a history load (possibly taken mid-turn) is replaced. A turn with
+    /// no output has no end.
+    /// Returns which cached lines the change invalidates.
+    fn mark_turn_end(&mut self, at: chrono::DateTime<chrono::Local>) -> TurnEndChange {
+        let Some(last) = self.entries.len().checked_sub(1) else {
+            return TurnEndChange::None;
+        };
+        if matches!(self.entries[last], ChatEntry::UserMessage { .. }) {
+            return TurnEndChange::None;
+        }
+        self.entry_times
+            .resize(self.entries.len(), entry_time::EntryStamp::default());
+        let mut first = last;
+        while first > 0 && !matches!(self.entries[first - 1], ChatEntry::UserMessage { .. }) {
+            first -= 1;
+        }
+        if self.entry_times[first..=last]
+            .iter()
+            .any(|stamp| stamp.ends_turn == entry_time::TurnEnd::Settled)
+        {
+            return TurnEndChange::None;
+        }
+        let start = first
+            .checked_sub(1)
+            .and_then(|user_index| self.entry_times[user_index].at);
+        let mut moved = false;
+        for stamp in &mut self.entry_times[first..last] {
+            moved |= std::mem::take(&mut stamp.ends_turn) != entry_time::TurnEnd::No;
+        }
+        let stamp = &mut self.entry_times[last];
+        let end = stamp.at.map_or(at, |known| known.max(at));
+        stamp.at = Some(end);
+        stamp.ends_turn = entry_time::TurnEnd::Settled;
+        if moved {
+            // An earlier footer may already be drawn in the cache.
+            TurnEndChange::Full
+        } else if start.is_some_and(|start| entry_time::shows_footer(start, end)) {
+            TurnEndChange::Tail(last)
+        } else {
+            TurnEndChange::None
+        }
     }
 
     fn remove_entry(&mut self, index: usize) -> ChatEntry {
@@ -9605,7 +9631,7 @@ impl ChatState {
 
     #[cfg(test)]
     fn entry_time(&self, index: usize) -> Option<chrono::DateTime<chrono::Local>> {
-        self.entry_times.get(index).copied().flatten()
+        self.entry_times.get(index).and_then(|stamp| stamp.at)
     }
 
     fn mark_dirty_append(&mut self) {
@@ -10419,8 +10445,13 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
-        let entry_times = &self.entry_times;
         let today = chrono::Local::now().date_naive();
+        let is_user: Vec<bool> = self
+            .entries
+            .iter()
+            .map(|entry| matches!(entry, ChatEntry::UserMessage { .. }))
+            .collect();
+        let marks = entry_time::time_marks(&is_user, &self.entry_times);
         let inputs =
             self.entries[range.clone()]
                 .iter()
@@ -10445,11 +10476,12 @@ impl ChatState {
                     EntryLayoutInput {
                         index,
                         entry,
-                        time_label: entry_times
-                            .get(index)
-                            .copied()
-                            .flatten()
-                            .map(|at| entry_time::header_label(&at, today)),
+                        divider: marks[index]
+                            .divider
+                            .map(|at| entry_time::divider_label(&at, today)),
+                        footer: marks[index]
+                            .footer
+                            .map(|(start, end)| entry_time::footer_label(&start, &end, today)),
                         highlighted,
                         disclosure,
                     }
@@ -10538,18 +10570,10 @@ impl ChatState {
     fn build_overlay_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if !self.streaming_text.is_empty() {
-            let mut header = vec![Span::styled(
+            lines.push(Line::from(vec![Span::styled(
                 format!("{} ", crate::i18n::t("zc-chat-label-agent")),
                 theme::agent_label_style(),
-            )];
-            if let Some(at) = self.streaming_text_started_at {
-                let today = chrono::Local::now().date_naive();
-                header.push(header_time_span(
-                    &entry_time::header_label(&at, today),
-                    Modifier::empty(),
-                ));
-            }
-            lines.push(Line::from(header));
+            )]));
             lines.extend(markdown_to_lines(&self.streaming_text, width));
         }
         if self.show_thoughts && !self.streaming_thought.is_empty() {
@@ -10917,12 +10941,8 @@ impl ChatState {
     /// Returns `true` if any text was flushed.
     fn flush_streaming_text(&mut self) -> bool {
         let text = std::mem::take(&mut self.streaming_text);
-        let started_at = self.streaming_text_started_at.take();
         if !text.is_empty() {
-            self.push_entry_at(
-                started_at.or_else(|| Some(chrono::Local::now())),
-                ChatEntry::AgentMessage(Arc::<str>::from(text)),
-            );
+            self.push_entry(ChatEntry::AgentMessage(Arc::<str>::from(text)));
             self.mark_dirty_append();
             true
         } else {
@@ -10987,7 +11007,6 @@ impl ChatState {
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
                     self.flush_streaming_thought();
-                    self.streaming_text_started_at = Some(chrono::Local::now());
                 }
                 self.streaming_text.push_str(&text);
                 // Guard: don't mutate turn_status after commit_turn has already
@@ -11266,14 +11285,10 @@ impl ChatState {
     fn settle_turn_from_prompt_response(&mut self) {
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
-        let started_at = self.streaming_text_started_at.take();
         if !text.is_empty() {
             self.turn_had_streaming_text = true;
             let entry_index = self.entries.len();
-            self.push_entry_at(
-                started_at.or_else(|| Some(chrono::Local::now())),
-                ChatEntry::AgentMessageContinuation(text),
-            );
+            self.push_entry(ChatEntry::AgentMessageContinuation(text));
             self.prompt_settled_stream_entry = Some((self.turn_generation, entry_index));
             self.mark_dirty_append();
         }
@@ -11291,6 +11306,13 @@ impl ChatState {
     }
 
     fn settle_turn_lifecycle(&mut self, clean: bool) {
+        // A new footer lands under the last cached entry: re-render that
+        // tail; a footer that moved needs every index.
+        match self.mark_turn_end(chrono::Local::now()) {
+            TurnEndChange::None => {}
+            TurnEndChange::Tail(entry_index) => self.mark_dirty_tail(entry_index),
+            TurnEndChange::Full => self.mark_dirty_full(),
+        }
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
@@ -11897,7 +11919,6 @@ impl ChatState {
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.streaming_text.clear();
-        self.streaming_text_started_at = None;
         self.streaming_thought.clear();
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
@@ -12120,6 +12141,20 @@ impl ChatState {
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
         }
+        // History rows carry the turn's finish time on its last output; mark
+        // each turn's last entry as its end so the footer follows it.
+        self.entry_times
+            .resize(self.entries.len(), entry_time::EntryStamp::default());
+        for index in 0..self.entries.len() {
+            let ends_turn = !matches!(self.entries[index], ChatEntry::UserMessage { .. })
+                && self
+                    .entries
+                    .get(index + 1)
+                    .is_none_or(|next| matches!(next, ChatEntry::UserMessage { .. }));
+            if ends_turn && self.entry_times[index].ends_turn == entry_time::TurnEnd::No {
+                self.entry_times[index].ends_turn = entry_time::TurnEnd::Loaded;
+            }
+        }
         self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
@@ -12142,7 +12177,6 @@ impl ChatState {
         let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.clear_entries();
         self.streaming_text.clear();
-        self.streaming_text_started_at = None;
         self.streaming_thought.clear();
         self.transcript_layout.reset();
         self.entry_rects.clear();
@@ -12425,83 +12459,212 @@ mod tests {
         }
     }
 
-    fn header_text(lines: &[Line<'static>]) -> String {
-        lines[0]
-            .spans
+    fn transcript_text(state: &ChatState) -> Vec<String> {
+        state
+            .transcript_layout
+            .view()
+            .cached_lines
             .iter()
-            .map(|span| span.content.as_ref())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect()
     }
 
-    #[test]
-    fn message_headers_carry_the_time_label_on_the_existing_line() {
-        let user = ChatEntry::UserMessage {
-            text: Some(Arc::from("hello\nsecond line")),
-            attachments: Vec::new(),
-        };
-        let agent = ChatEntry::AgentMessage(Arc::from("reply"));
-        let tool = ChatEntry::Tool {
-            tool_call_id: Arc::from("call-1"),
-            name: Arc::from("shell"),
-            input_json: Arc::from("{}"),
-            result: None,
-        };
-        let notice = ChatEntry::SystemMessage(Arc::from("Turn cancelled."));
-        for entry in [&user, &agent, &tool, &notice] {
-            let mut plain = Vec::new();
-            render_entry_into(
-                entry,
-                None,
-                false,
-                false,
-                ToolDisclosure::Collapsed,
-                80,
-                &mut plain,
-            );
-            let mut stamped = Vec::new();
-            render_entry_into(
-                entry,
-                Some("09:41"),
-                false,
-                false,
-                ToolDisclosure::Collapsed,
-                80,
-                &mut stamped,
-            );
-            assert_eq!(
-                plain.len(),
-                stamped.len(),
-                "the time adds no rows: {entry:?}"
-            );
-            assert!(header_text(&stamped).contains("09:41"), "{entry:?}");
-            assert!(!header_text(&plain).contains("09:41"));
-            assert!(
-                stamped[1..]
-                    .iter()
-                    .all(|line| !line.spans.iter().any(|span| span.content.contains("09:41"))),
-                "the time appears on the header line only: {entry:?}"
-            );
-            let time_span = stamped[0]
-                .spans
-                .iter()
-                .find(|span| span.content.contains("09:41"))
-                .unwrap();
-            assert_eq!(time_span.style, theme::dim_style(), "{entry:?}");
+    fn today_at(hour: u32, minute: u32, second: u32) -> String {
+        use chrono::TimeZone;
+        let day = chrono::Local::now().date_naive();
+        chrono::Local
+            .from_local_datetime(&day.and_hms_opt(hour, minute, second).unwrap())
+            .earliest()
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    fn timed(role: &str, content: &str, at: String) -> crate::client::MessageEntry {
+        crate::client::MessageEntry {
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: Some(at),
+            ..Default::default()
         }
-        let mut lines = Vec::new();
-        render_entry_into(
-            &agent,
-            Some("09:41"),
-            false,
-            false,
-            ToolDisclosure::Collapsed,
-            80,
-            &mut lines,
+    }
+
+    #[test]
+    fn transcript_shows_gap_dividers_and_long_turn_footers_not_message_times() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "first ask", today_at(1, 0, 0)),
+                timed("assistant", "slow answer", today_at(1, 31, 40)),
+                // Four minutes later, a quick follow-up: no divider, no footer.
+                timed("user", "quick follow-up", today_at(1, 35, 0)),
+                timed("assistant", "quick answer", today_at(1, 35, 20)),
+                // After a 25-minute gap: a divider.
+                timed("user", "after a break", today_at(2, 0, 0)),
+                timed("assistant", "done", today_at(2, 0, 5)),
+            ],
+            true,
         );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        let dividers: Vec<_> = text
+            .iter()
+            .filter(|line| line.contains("── Today "))
+            .collect();
+        assert_eq!(dividers.len(), 2, "{text:#?}");
+        assert!(dividers[0].trim() == "── Today 01:00 ──");
+        assert!(dividers[1].trim() == "── Today 02:00 ──");
+        let footers: Vec<_> = text
+            .iter()
+            .filter(|line| line.starts_with("─── "))
+            .collect();
+        assert_eq!(footers, ["─── 01:00 → 01:31 · 31m 40s"], "{text:#?}");
+        let footer_at = text
+            .iter()
+            .position(|line| line.starts_with("─── "))
+            .unwrap();
+        assert_eq!(text[footer_at - 1], "slow answer");
+        assert!(text[footer_at + 1].starts_with(&crate::i18n::t("zc-chat-label-you")));
         assert!(
-            header_text(&lines)
-                .starts_with(&format!("{} 09:41", crate::i18n::t("zc-chat-label-agent")))
+            text.iter()
+                .filter(
+                    |line| line.starts_with(&crate::i18n::t("zc-chat-label-you"))
+                        || line.starts_with(&crate::i18n::t("zc-chat-label-agent"))
+                )
+                .all(|line| !line.contains(":0") && !line.contains(":3")),
+            "message headers carry no time: {text:#?}"
         );
+        // The marks sit outside the entries' own line ranges.
+        let view = s.transcript_layout.view();
+        for &(_, lo, hi) in &view.cached_line_ranges {
+            for line in &text[lo..hi] {
+                assert!(!line.starts_with("─── ") && !line.contains("── Today "));
+            }
+        }
+    }
+
+    #[test]
+    fn a_history_load_taken_mid_turn_hands_the_footer_to_the_live_settle() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "long task", today_at(1, 0, 0)),
+                timed("assistant", "partial so far", today_at(1, 10, 0)),
+            ],
+            true,
+        );
+        s.rebuild_lines(80);
+        assert_eq!(
+            transcript_text(&s)
+                .iter()
+                .filter(|line| line.starts_with("─── "))
+                .count(),
+            1,
+            "the loaded turn looks finished at first"
+        );
+        // The turn was still running: more output arrives, then it settles.
+        s.push_entry(ChatEntry::AgentMessage(Arc::from("final answer")));
+        s.mark_dirty_append();
+        s.rebuild_lines(80);
+        s.turn_had_streaming_text = true;
+        s.commit_turn(String::new(), true);
+        assert_eq!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::Full,
+            "a footer that moves invalidates the cached copy"
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        let footers: Vec<_> = text
+            .iter()
+            .filter(|line| line.starts_with("─── "))
+            .collect();
+        assert_eq!(
+            footers.len(),
+            1,
+            "the stale cached footer must go: {text:#?}"
+        );
+        assert_eq!(text.last(), Some(footers[0]), "{text:#?}");
+    }
+
+    #[test]
+    fn a_footer_on_a_divided_entry_keeps_one_divider() {
+        let mut s = state();
+        // A tool-only turn: its single output entry may be the one re-rendered.
+        s.push_user_message(Some("long task".to_string()), Vec::new());
+        s.entry_times[0].at = Some(chrono::Local::now() - chrono::TimeDelta::minutes(5));
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        // Re-render the divided user entry itself as a tail change.
+        s.mark_dirty_tail(0);
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.contains("── Today "))
+                .count(),
+            1,
+            "{text:#?}"
+        );
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        assert_eq!(transcript_text(&s), text);
+    }
+
+    #[test]
+    fn a_live_turn_gets_its_footer_when_it_settles() {
+        let mut s = state();
+        s.push_user_message(Some("long task".to_string()), Vec::new());
+        // Pretend the prompt went out five minutes ago.
+        s.entry_times[0].at = Some(chrono::Local::now() - chrono::TimeDelta::minutes(5));
+        // A streamed reply, committed before the terminal frame.
+        s.push_entry(ChatEntry::AgentMessage(Arc::from("working on it")));
+        s.turn_had_streaming_text = true;
+        s.mark_dirty_append();
+        s.rebuild_lines(80);
+        assert!(
+            !transcript_text(&s)
+                .iter()
+                .any(|line| line.starts_with("─── ")),
+            "no footer while the turn runs"
+        );
+        s.commit_turn(String::new(), true);
+        assert_eq!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::TailChanged(1),
+            "a new footer re-renders only the tail"
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        let footers: Vec<_> = text
+            .iter()
+            .filter(|line| line.starts_with("─── "))
+            .collect();
+        assert_eq!(footers.len(), 1, "{text:#?}");
+        assert!(footers[0].ends_with("· 5m 00s"), "{}", footers[0]);
+        assert_eq!(text.last(), Some(footers[0]), "the footer closes the turn");
+
+        // A later terminal frame (here it adds a notice) does not move the
+        // end: the footer stays under the turn's output.
+        s.commit_turn(String::new(), true);
+        s.rebuild_lines(80);
+        let later = transcript_text(&s);
+        assert_eq!(later[..text.len()], text[..], "{later:#?}");
+        assert_eq!(
+            later.iter().filter(|line| line.starts_with("─── ")).count(),
+            1,
+            "{later:#?}"
+        );
+        let text = later;
+
+        // The incremental result equals a full rebuild.
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        assert_eq!(transcript_text(&s), text);
     }
 
     #[test]
@@ -12580,7 +12743,6 @@ mod tests {
                 text: Some(Arc::from("visit https://example.com")),
                 attachments: Vec::new(),
             },
-            None,
             false,
             false,
             ToolDisclosure::Collapsed,
@@ -25233,7 +25395,6 @@ mod tests {
             "shell",
             &input,
             Some(&result),
-            None,
             false,
             ToolDisclosure::Collapsed,
         );
@@ -25250,7 +25411,6 @@ mod tests {
             "shell",
             &input,
             Some(&result),
-            None,
             false,
             ToolDisclosure::Full,
         );
@@ -25277,7 +25437,6 @@ mod tests {
             "shell",
             &input,
             Some(&result),
-            None,
             false,
             ToolDisclosure::Full,
         );
@@ -25313,7 +25472,6 @@ mod tests {
             "file_edit",
             &edit_input,
             Some("done"),
-            None,
             false,
             ToolDisclosure::Collapsed,
         );
@@ -25340,7 +25498,6 @@ mod tests {
             "file_write",
             &write_input,
             Some(&result),
-            None,
             false,
             ToolDisclosure::Preview,
         );
@@ -25371,7 +25528,6 @@ mod tests {
             "file_write",
             &write_input,
             Some(&result),
-            None,
             false,
             ToolDisclosure::Full,
         );
@@ -25399,7 +25555,6 @@ mod tests {
             "file_write",
             &base64_input,
             None,
-            None,
             false,
             ToolDisclosure::Preview,
         );
@@ -25415,7 +25570,6 @@ mod tests {
             &mut malformed_lines,
             "file_write",
             malformed,
-            None,
             None,
             false,
             ToolDisclosure::Preview,
