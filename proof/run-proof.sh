@@ -191,6 +191,38 @@ def retain_runtime_diagnostics(rc):
                 'test-owned internal bridge fixture only')
     events = ('Failed to discover WASM channel plugins', 'Failed to admit logical plugin instances',
               'Failed to bind WASM channel plugin endpoint', 'Failed to construct WASM channel plugin')
+    # Closed error literals from the frozen Matrix lib.rs and matrix.rs.
+    matrix_errors = (
+        'matrix: HTTP body unavailable', 'matrix: HTTP byte budget exceeded',
+        'matrix: HTTP completion already taken', 'matrix: HTTP deadline exceeded',
+        'matrix: HTTP finish failed', 'matrix: HTTP flush failed',
+        'matrix: HTTP input unavailable', 'matrix: HTTP output unavailable',
+        'matrix: HTTP response already taken', 'matrix: HTTP response incomplete',
+        'matrix: HTTP response too large', 'matrix: HTTP response unavailable',
+        'matrix: HTTP target refused', 'matrix: HTTP timeout refused',
+        'matrix: HTTP transport failed', 'matrix: HTTP transport refused',
+        'matrix: HTTP write failed', 'matrix: access_token unavailable',
+        'matrix: attachments unsupported', 'matrix: binding changed; fresh configure required',
+        'matrix: config unavailable', 'matrix: conflicting sync membership',
+        'matrix: encryption state present or uncertain; send refused', 'matrix: fresh configure required',
+        'matrix: incremental timeline gap; sync refused', 'matrix: invalid HTTP headers',
+        'matrix: invalid HTTP target', 'matrix: invalid access_token',
+        'matrix: invalid alias resolution', 'matrix: invalid authenticated identity',
+        'matrix: invalid direct-room metadata', 'matrix: invalid public config',
+        'matrix: invalid recipient', 'matrix: invalid response JSON',
+        'matrix: invalid room member count', 'matrix: invalid room summary',
+        'matrix: invalid sync cursor', 'matrix: invalid sync departure',
+        'matrix: invalid sync room', 'matrix: invalid sync room id',
+        'matrix: invalid sync structure', 'matrix: invalid sync timeline',
+        'matrix: invalid timeline limited flag', 'matrix: message too large',
+        'matrix: public config too large', 'matrix: room metadata limit exceeded',
+        'matrix: send body too large', 'matrix: sync queue limit exceeded',
+    )
+    host_contexts = ('invalid plugin config', 'permission denied', 'failed to load WASM component',
+                     'failed to add channel plugin imports to linker', 'failed to instantiate channel plugin',
+                     'channel.configure trapped', 'channel.get-channel-capabilities failed',
+                     'channel.self-handle failed', 'channel.self-addressed-mention failed',
+                     'plugin call exceeded wall-clock deadline', 'IO error')
     classes = {'component-instantiation': ('failed to instantiate', 'unknown import', 'component imports'),
                'component-type': ('type mismatch', 'incompatible import', 'failed to parse'),
                'guest-execution': ('error while executing', 'wasm trap', 'fuel consumed'),
@@ -198,6 +230,7 @@ def retain_runtime_diagnostics(rc):
                'egress-policy': ('egress denied', 'egress blocked', 'destination denied'),
                'authentication': ('M_UNKNOWN_TOKEN', 'M_FORBIDDEN')}
     found_stages, found_contexts, found_events, found_classes, interfaces = set(), set(), set(), set(), set()
+    found_matrix_errors, found_host_contexts, http_statuses = set(), set(), set()
     entered = capture_installed = False
     with log.open('rb') as source:
         for line in source:
@@ -205,18 +238,24 @@ def retain_runtime_diagnostics(rc):
             text = line.decode('utf-8', errors='replace')
             entered |= 'proof-runtime-entered' in text
             capture_installed |= 'proof-runtime-entered capture-installed=true' in text
-            for values, found in ((stages, found_stages), (contexts, found_contexts), (events, found_events)):
+            for values, found in ((stages, found_stages), (contexts, found_contexts), (events, found_events),
+                                  (matrix_errors, found_matrix_errors), (host_contexts, found_host_contexts)):
                 for value in values:
                     if re.search(r'(?<![a-z0-9-])' + re.escape(value) + r'(?![a-z0-9-])', text): found.add(value)
             for name, patterns in classes.items():
                 if any(pattern in text for pattern in patterns): found_classes.add(name)
+            for method, status in re.findall(r'\bmatrix: HTTP (GET|PUT) status ([1-5][0-9]{2})(?![0-9])', text):
+                http_statuses.add((method, int(status)))
             # Only wasi:cli/clocks/filesystem/http/io/random/sockets interface names.
             for interface in re.findall(r'\bwasi:(?:cli|clocks|filesystem|http|io|random|sockets)/[a-z][a-z-]{0,63}@[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b', text):
                 if len(interfaces) < 20: interfaces.add(interface)
     report = {'phase': 'host-cases', 'exit_code': rc, 'test_entered': entered,
               'capture_installed': capture_installed, 'matched_stages': sorted(found_stages),
               'matched_contexts': sorted(found_contexts), 'matched_host_events': sorted(found_events),
-              'matched_error_classes': sorted(found_classes), 'wasi_interfaces': sorted(interfaces)}
+              'matched_error_classes': sorted(found_classes), 'wasi_interfaces': sorted(interfaces),
+              'matched_matrix_errors': sorted(found_matrix_errors),
+              'matched_host_contexts': sorted(found_host_contexts),
+              'matrix_http_statuses': [{'method': method, 'status': status} for method, status in sorted(http_statuses)]}
     (Path(os.environ['MATRIX_PROOF_PUBLIC'])/'host-runtime.json').write_text(json.dumps(report, sort_keys=True))
 def terminate(p):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "harness_sha256": {
-    "run-proof.sh": "fe6ab483c0e97b636d54c15efa22f8c7d374f8c0bfbb43c4ca05f1141c145b70",
+    "run-proof.sh": "f7295a6eedad9725b601e3f95605a31ccb91d28286b60bfbfc37857eb99417b5",
     "prepare_synapse.py": "030d4cb2c05cd3924c5e6594b0e46cc4fb486a7a6997fd7a1eafee821cccf757",
     "matrix_plugin_smoke.rs": "cb1b2123fc6706cfbf1c0e98b266a04f26e1ea2dfbe12b9fbbc3b0e09333d360"
   },
