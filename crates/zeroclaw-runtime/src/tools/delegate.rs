@@ -5289,7 +5289,13 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, CountingEchoTool, GateTool);
+    zeroclaw_api::mock_tool_attribution!(
+        EchoTool,
+        FakeMcpTool,
+        CountingEchoTool,
+        GateTool,
+        PanickingTool
+    );
 
     fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
         TaskRecord {
@@ -7059,6 +7065,30 @@ mod tests {
                 output: format!("echo:{value}").into(),
                 error: None,
             })
+        }
+    }
+
+    struct PanickingTool {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn name(&self) -> &str {
+            "panic_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Panics to exercise background worker exit recovery."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            panic!("background worker panic fixture");
         }
     }
 
@@ -10304,6 +10334,78 @@ mod tests {
             "sub-tool receipt must be tagged with the tool name and a zc-receipt- HMAC token, got: {}",
             receipts[0]
         );
+    }
+
+    #[tokio::test]
+    async fn execute_background_recovers_panicking_worker_through_check_result() {
+        let (server, _captured) = start_scripted_chat_server(&[chat_completion_tool_call(
+            "panic_tool",
+            "call_panic_bg",
+            json!({}),
+        )])
+        .await;
+        let temp = TempDir::new().unwrap();
+        let mut config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["target"], "bounded"),
+                ("target", &[], "bounded"),
+            ],
+            &[("bounded", 2, 20)],
+        );
+        Arc::get_mut(&mut config)
+            .unwrap()
+            .risk_profiles
+            .get_mut("target")
+            .unwrap()
+            .auto_approve
+            .push("panic_tool".into());
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let tool = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(temp.path().join("workspace"))
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(PanickingTool {
+                entered: Arc::clone(&entered),
+            })])));
+
+        // Exercise production spawning, not the supervisor helper directly.
+        let started = tool
+            .execute(json!({"agent": "target", "prompt": "panic", "background": true}))
+            .await
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the real background worker must invoke the panicking tool");
+
+        let checked = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let checked = tool
+                    .execute(json!({"action": "check_result", "task_id": task_id}))
+                    .await
+                    .unwrap();
+                let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+                if view["status"] != json!(TaskStatus::Running) {
+                    assert_eq!(view["status"], json!(TaskStatus::Failed), "{view}");
+                    break checked;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("production supervisor must settle the exited worker while its parent is alive");
+        assert!(!checked.success, "{checked:?}");
+        assert!(checked.error.is_some(), "{checked:?}");
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert_eq!(snapshot.task.owner_pid, std::process::id());
     }
 
     #[tokio::test]
