@@ -3724,6 +3724,16 @@ impl App {
             rows[0],
         );
 
+        // A transient status (e.g. a section preview whose RPC timed out)
+        // takes the hint row: with nothing loaded yet there is no detail
+        // screen whose own status line could show it.
+        if let Some(msg) = &self.status_msg {
+            frame.render_widget(
+                Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
+                rows[1],
+            );
+            return;
+        }
         let line = crate::i18n::t_args(
             "zc-config-section-detail-hint",
             &[
@@ -5177,81 +5187,216 @@ mod tests {
         );
     }
 
-    /// A client whose outbound channel stays open but never gets a reply,
-    /// so `call_with_timeout` fails with the real typed `DaemonRpcTimeout`.
-    fn silent_rpc() -> (Arc<RpcClient>, tokio::sync::mpsc::Receiver<String>) {
-        use crate::jsonrpc::RpcOutbound;
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
-        (
-            Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)))),
-            rx,
+    /// Fake daemon reply policy for the handler-level timeout tests.
+    const DAEMON_SILENT: u8 = 0;
+    const DAEMON_ANSWER: u8 = 1;
+    const DAEMON_FAIL: u8 = 2;
+
+    /// A config manager wired to an in-process fake daemon. The daemon reads
+    /// every request frame the client sends, records its method, and then
+    /// stays silent (so the client's own 5s `call` deadline fires), answers
+    /// with an empty field list, or answers with a JSON-RPC error, per
+    /// `mode`.
+    fn manager_with_fake_daemon() -> (
+        App,
+        Arc<std::sync::atomic::AtomicU8>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mode = Arc::new(AtomicU8::new(DAEMON_SILENT));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (daemon_mode, daemon_seen) = (mode.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let request: serde_json::Value =
+                    serde_json::from_str(&frame).expect("client sends JSON-RPC frames");
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                daemon_seen
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap_or_default().to_string());
+                match daemon_mode.load(Ordering::SeqCst) {
+                    DAEMON_ANSWER => outbound.dispatch_response(
+                        &id,
+                        Some(serde_json::json!({ "entries": [] })),
+                        None,
+                    ),
+                    DAEMON_FAIL => outbound.dispatch_response(
+                        &id,
+                        None,
+                        Some(JsonRpcError {
+                            code: -32000,
+                            message: "boom".to_string(),
+                            data: None,
+                        }),
+                    ),
+                    _ => {}
+                }
+            }
+        });
+        let mut mgr = App::new(rpc, std::path::Path::new("/tmp"));
+        mgr.sections = vec![
+            entry_with_cost("alpha", ""),
+            entry_with_cost("beta", ""),
+            entry_with_cost("gamma", ""),
+        ];
+        (mgr, mode, seen)
+    }
+
+    /// The real handlers take the app's `Term`. A fixed viewport never
+    /// queries the tty, and the section-list paths these tests drive never
+    /// draw through it, so nothing is written to stdout.
+    fn handler_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 160, 40)),
+            },
         )
+        .expect("fixed-viewport terminal")
     }
 
-    async fn real_rpc_timeout() -> anyhow::Error {
-        let (rpc, _rx) = silent_rpc();
-        rpc.call_with_timeout::<serde_json::Value>(
-            "config/list",
-            serde_json::json!({}),
-            std::time::Duration::from_millis(20),
-        )
-        .await
-        .expect_err("no reply must time out")
+    /// Render through `draw_into`, the same entry point `app::run` uses for
+    /// the Config mode, and return the screen as text.
+    fn render_config(mgr: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            mgr.draw_into(frame, area);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    #[tokio::test]
-    async fn key_and_mouse_handlers_turn_rpc_timeout_into_status_and_stay_alive() {
-        let error = real_rpc_timeout().await;
-        assert!(
-            crate::client::DaemonRpcTimeout::from_anyhow(&error).is_some(),
-            "call_with_timeout must return the typed timeout, got {error:#}"
-        );
-        let expected = crate::i18n::t_args(
-            "zc-config-status-load-failed",
-            &[("err", &format!("{error:#}"))],
-        );
-
-        // Key path: Ok(false) means "do not quit the TUI".
-        let mut mgr = test_manager();
-        let settled = mgr.settle_handler_result::<bool>(Err(error), false);
-        assert!(
-            matches!(settled, Ok(false)),
-            "a key-handler RPC timeout must not quit or propagate: {settled:?}"
-        );
-        assert_eq!(mgr.status_msg.as_deref(), Some(expected.as_str()));
-        assert!(
-            expected.contains("config/list"),
-            "status line should name the stalled method: {expected}"
-        );
-
-        // Mouse path, with the timeout wrapped in context the way inner
-        // helpers add it: still absorbed.
-        let wrapped = real_rpc_timeout().await.context("loading fields");
-        let mut mgr = test_manager();
-        let settled = mgr.settle_handler_result::<()>(Err(wrapped), ());
-        assert!(
-            settled.is_ok(),
-            "a mouse-handler RPC timeout must not propagate: {settled:?}"
-        );
-        assert!(mgr.status_msg.is_some());
+    fn mouse_at(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x + area.width / 2,
+            row: area.y + area.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
-    #[tokio::test]
-    async fn handlers_still_propagate_non_timeout_errors() {
-        let mut mgr = test_manager();
-        let settled = mgr.settle_handler_result::<bool>(
-            Err(anyhow::Error::msg("RPC config/list: boom (-32000)")),
-            false,
+    // Paused clock: the client's real 5s `call` deadline elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn config_pane_survives_rpc_timeout_on_real_key_and_mouse_input() {
+        use std::sync::atomic::Ordering;
+        let (mut mgr, mode, seen) = manager_with_fake_daemon();
+        let mut term = handler_term();
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        render_config(&mut mgr);
+        let section_pane = mgr.last_section_pane_area;
+        let area = Rect::new(0, 0, 160, 40);
+
+        // Key: Down previews `beta`; its config/list gets no reply.
+        let quit = mgr.handle_key(down, &mut term).await;
+        assert!(
+            matches!(quit, Ok(false)),
+            "a timed-out RPC under a key must neither quit nor propagate: {quit:?}"
         );
-        assert!(settled.is_err(), "only timeouts are absorbed");
+        let screen = render_config(&mut mgr);
+        assert!(
+            screen.contains("config/list") && screen.contains("timed out after 5s"),
+            "timeout must be visible in the status line after a key:\n{screen}"
+        );
+
+        // Mouse: scrolling over the section pane previews `gamma`, also
+        // unanswered.
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollDown, section_pane),
+                area,
+                &mut term,
+            )
+            .await;
+        assert!(
+            scrolled.is_ok(),
+            "a timed-out RPC under a mouse event must not propagate: {scrolled:?}"
+        );
+        assert_eq!(mgr.section_cursor, 2);
+        let screen = render_config(&mut mgr);
+        assert!(
+            screen.contains("timed out after 5s"),
+            "timeout must be visible in the status line after a mouse event:\n{screen}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["config/list", "config/list"],
+            "both inputs must have reached the daemon"
+        );
+
+        // The daemon recovers: further key and mouse input works normally.
+        mode.store(DAEMON_ANSWER, Ordering::SeqCst);
+        let quit = mgr.handle_key(up, &mut term).await;
+        assert!(matches!(quit, Ok(false)), "{quit:?}");
+        assert_eq!(
+            mgr.loaded_section,
+            Some(1),
+            "Up must load `beta` once answered"
+        );
         assert!(mgr.status_msg.is_none());
+        let screen = render_config(&mut mgr);
+        assert!(
+            !screen.contains("timed out"),
+            "status clears on the next successful input:\n{screen}"
+        );
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollUp, section_pane),
+                area,
+                &mut term,
+            )
+            .await;
+        assert!(scrolled.is_ok(), "{scrolled:?}");
+        assert_eq!(
+            mgr.loaded_section,
+            Some(0),
+            "scroll must load `alpha` once answered"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 4);
+    }
 
-        // A successful quit request passes through untouched.
-        let mut mgr = test_manager();
-        assert!(matches!(
-            mgr.settle_handler_result(Ok(true), false),
-            Ok(true)
-        ));
+    #[tokio::test(start_paused = true)]
+    async fn config_pane_handlers_still_propagate_non_timeout_rpc_errors() {
+        use std::sync::atomic::Ordering;
+        let (mut mgr, mode, seen) = manager_with_fake_daemon();
+        mode.store(DAEMON_FAIL, Ordering::SeqCst);
+        let mut term = handler_term();
+        render_config(&mut mgr);
+        let section_pane = mgr.last_section_pane_area;
+
+        let quit = mgr
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        let error = quit.expect_err("a daemon error is not a timeout and must propagate");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert!(
+            mgr.status_msg.is_none(),
+            "only timeouts become a status line"
+        );
+
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollDown, section_pane),
+                Rect::new(0, 0, 160, 40),
+                &mut term,
+            )
+            .await;
+        assert!(scrolled.is_err(), "mouse path must propagate it too");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     fn test_manager() -> App {
