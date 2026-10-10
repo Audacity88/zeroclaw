@@ -1460,3 +1460,4 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 tool-shell-memory-unsupported = The shell memory watchdog requires a native Linux, macOS, or Windows command without a Docker sandbox. Use the container runtime's memory limit for containers.
 tool-shell-memory-exceeded = Command exceeded its { $limit } MiB resident-memory threshold (observed { $rss } MiB) and was stopped.
 tool-shell-memory-unavailable = Command stopped because resident-memory monitoring failed: { $error }
+skill-http-request-timeout = HTTP request timed out
