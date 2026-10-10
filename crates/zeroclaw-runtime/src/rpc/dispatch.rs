@@ -38407,6 +38407,85 @@ mod tests {
         );
     }
 
+    /// The inverse control: a limit lowered through `config/set` below the
+    /// spend already recorded today must make the next budget check refuse,
+    /// and the recorded usage must survive the swap untouched. Together with
+    /// the raised-limit case this pins both directions of the live refresh.
+    #[tokio::test]
+    async fn config_set_lowered_cost_limit_refuses_next_check_and_keeps_usage() {
+        use zeroclaw_config::cost::types::{BudgetCheck, TokenUsage, UsagePeriod};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cost = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 10.0,
+            ..Default::default()
+        };
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            cost: cost.clone(),
+            ..Default::default()
+        };
+        config.save().await.expect("seed config.toml");
+        let tracker =
+            Arc::new(zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path()).unwrap());
+        // $3.00 recorded today against a $10.00 daily limit.
+        tracker
+            .record_usage(TokenUsage::new(
+                "test-model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        let today = chrono::Utc::now().date_naive();
+        assert_eq!(tracker.get_daily_cost(today).unwrap(), 3.0);
+        assert!(
+            matches!(tracker.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "precondition: the seeded spend is within the startup limit"
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, Arc::clone(&tracker));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set",
+            json!({"prop": "cost.daily_limit_usd", "value": 1.0}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "config/set: {response}");
+
+        assert_eq!(tracker.config().daily_limit_usd, 1.0);
+        match tracker.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period: UsagePeriod::Day,
+                ..
+            } => {
+                assert_eq!(current_usd, 3.0, "recorded spend is what the check sees");
+                assert_eq!(
+                    limit_usd, 1.0,
+                    "the lowered limit is what the check enforces"
+                );
+            }
+            other => panic!("the lowered limit must refuse the next check, got {other:?}"),
+        }
+        // The swap replaced only the limits; today's recorded usage is intact.
+        assert_eq!(tracker.get_daily_cost(today).unwrap(), 3.0);
+    }
+
     /// Send one request through `process_line` (the wire dispatch path, not
     /// the handler) and return the parsed response frame.
     async fn rpc_roundtrip(
