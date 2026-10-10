@@ -686,7 +686,7 @@ fn apply_builtin_prompt_scope(
                 let section_end = message.content[body..]
                     .find("\n## ")
                     .map_or(message.content.len(), |offset| body + offset);
-                let end = if heading == "## Deferred Built-in Tools\n" {
+                let (end, complete) = if heading == "## Deferred Built-in Tools\n" {
                     let close = "</available-deferred-builtin-tools>";
                     // Prompt budgeting may cut the catalogue before its close,
                     // then append the runtime's timestamp orientation directly.
@@ -695,24 +695,27 @@ fn apply_builtin_prompt_scope(
                         .map_or(section_end, |offset| body + offset);
                     message.content[body..section_end]
                         .find(close)
-                        .map_or(section_end, |offset| body + offset + close.len())
+                        .map_or((section_end, false), |offset| {
+                            (body + offset + close.len(), true)
+                        })
                 } else {
-                    section_end
+                    (section_end, true)
                 };
-                let replacement =
-                    if heading == "## Deferred Built-in Tools\n" && !catalogue_inserted {
-                        catalogue_inserted = true;
-                        deferred_section.trim_end_matches('\n')
-                    } else {
-                        ""
-                    };
+                let catalogue = deferred_section.trim_end_matches('\n');
+                // Keep assembly's omission/budget decisions; projection may only shrink.
+                let replacement = if heading == "## Deferred Built-in Tools\n"
+                    && complete
+                    && !catalogue_inserted
+                    && catalogue.chars().count() <= message.content[start..end].chars().count()
+                {
+                    catalogue_inserted = true;
+                    catalogue
+                } else {
+                    ""
+                };
                 message.content.replace_range(start..end, replacement);
                 cursor = start + replacement.len();
             }
-        }
-        if !catalogue_inserted && !deferred_section.is_empty() {
-            message.content.push('\n');
-            message.content.push_str(deferred_section);
         }
         if !instructions.is_empty() {
             message.content.push('\n');
@@ -7013,32 +7016,60 @@ mod sop_step_reassembly_tests {
             activated.deferred_builtin_prompt_section_filtered(|name| search_names.contains(name));
         let catalogue = &prompt[prompt.find("## Deferred Built-in Tools").unwrap()
             ..prompt.find("\n\n## Context").unwrap()];
-        let incomplete = catalogue.replace("</available-deferred-builtin-tools>", "");
-        let truncated = crate::agent::system_prompt::finalize_system_prompt(
-            format!("{prompt}{}", crate::agent::prompt::TIMESTAMP_ORIENTATION),
-            prompt.find("</available-deferred-builtin-tools>").unwrap()
-                + crate::agent::prompt::TIMESTAMP_ORIENTATION.chars().count(),
+        let too_small = catalogue.to_string();
+        let prompt = prompt.replace(
+            catalogue,
+            activated
+                .deferred_builtin_prompt_section()
+                .trim_end_matches('\n'),
         );
-        assert!(truncated.contains(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+        let catalogue = &prompt[prompt.find("## Deferred Built-in Tools").unwrap()
+            ..prompt.find("\n\n## Context").unwrap()];
+        let incomplete = catalogue.replace("</available-deferred-builtin-tools>", "");
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let truncated_cap = prompt[..prompt.find("</available-deferred-builtin-tools>").unwrap()]
+            .chars()
+            .count()
+            + orientation.chars().count();
+        let truncated = crate::agent::system_prompt::finalize_system_prompt(
+            format!("{prompt}{orientation}"),
+            truncated_cap,
+        );
+        let omitted_cap = prompt[..prompt.find("## Deferred Built-in Tools").unwrap()]
+            .chars()
+            .count()
+            + orientation.chars().count();
+        let omitted = crate::agent::system_prompt::finalize_system_prompt(
+            format!("{prompt}{orientation}"),
+            omitted_cap,
+        );
+        assert!(truncated.contains(orientation));
         assert!(!truncated.contains("</available-deferred-builtin-tools>"));
-        for (input, native) in [
-            (format!("{prompt}\n{catalogue}"), false),
-            (format!("{prompt}\n{catalogue}"), true),
+        assert!(!omitted.contains("## Deferred Built-in Tools"));
+        for (input, native, catalogue_count, cap) in [
+            (format!("{prompt}\n{catalogue}"), false, 1, None),
+            (format!("{prompt}\n{catalogue}"), true, 1, None),
             (
                 format!("{incomplete}\n## Context\nKeep context.\n{catalogue}"),
                 false,
+                1,
+                None,
             ),
-            (truncated.clone(), false),
-            (truncated.clone(), true),
+            (truncated.clone(), false, 0, Some(truncated_cap)),
+            (truncated.clone(), true, 0, Some(truncated_cap)),
+            (omitted.clone(), false, 0, Some(omitted_cap)),
+            (omitted.clone(), true, 0, Some(omitted_cap)),
+            (too_small, false, 0, None),
         ] {
-            let mut history = vec![ChatMessage::system(prompt)];
-            let mut request = vec![ChatMessage::system(&input), ChatMessage::user(prompt)];
-            let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
+            let mut history = vec![ChatMessage::system(&input)];
+            let mut request = vec![ChatMessage::system(&input), ChatMessage::user(&prompt)];
+            let prompts = Arc::new(ToolProtocolPrompts::new(input.clone(), input.clone()));
             scope_tool_protocol_prompts(prompts, async {
                 refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native);
                 let parent_prompt = history[0].content.clone();
                 for _ in 0..2 {
                     refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native);
+                    let before_chars = request[0].content.chars().count();
                     apply_builtin_prompt_scope(
                         &mut request,
                         &tools,
@@ -7047,6 +7078,10 @@ mod sop_step_reassembly_tests {
                         native,
                         false,
                     );
+                    assert!(request[0].content.chars().count() <= before_chars);
+                    if let Some(cap) = cap {
+                        assert!(request[0].content.chars().count() <= cap);
+                    }
                     assert_eq!(history[0].content, parent_prompt);
                 }
             })
@@ -7056,9 +7091,12 @@ mod sop_step_reassembly_tests {
                     .content
                     .matches("<available-deferred-builtin-tools>")
                     .count(),
-                1
+                catalogue_count
             );
-            assert!(request[0].content.contains("allowed_tool - "));
+            assert_eq!(
+                request[0].content.contains("allowed_tool - "),
+                catalogue_count == 1
+            );
             assert!(!request[0].content.contains("denied_tool"));
             if input.contains("Keep context.") {
                 assert!(request[0].content.contains("Keep context."));
