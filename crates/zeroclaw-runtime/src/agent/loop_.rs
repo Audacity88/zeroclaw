@@ -818,16 +818,20 @@ pub(crate) fn build_system_prompt_for_turn(
         .iter()
         .map(|tool| tool.name())
         .filter(|name| !excluded_tool_names.contains(*name))
+        .collect();
+    let prompt_tool_names: HashSet<&str> = effective_tool_names
+        .iter()
+        .copied()
         .filter(|name| !hidden_builtin_names.contains(*name))
         .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
-    turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    turn_tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
     let mut turn_deferred_section = deferred_section.to_string();
     if let Some(state) = builtin_discovery {
         let section = state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .deferred_builtin_prompt_section();
+            .deferred_builtin_prompt_section_filtered(|name| effective_tool_names.contains(name));
         if !section.is_empty() {
             if !turn_deferred_section.is_empty() {
                 turn_deferred_section.push_str("\n\n");
@@ -847,7 +851,7 @@ pub(crate) fn build_system_prompt_for_turn(
             agent_workspace,
             model_name,
             &turn_tool_descs,
-            |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+            |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
             skills,
             identity_config,
             bootstrap_max_chars,
@@ -864,7 +868,7 @@ pub(crate) fn build_system_prompt_for_turn(
     if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
             tools_registry,
-            &effective_tool_names,
+            &prompt_tool_names,
         ));
     }
     if !turn_deferred_section.is_empty() {
@@ -3840,7 +3844,9 @@ async fn process_message_inner(
                 &state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .deferred_builtin_prompt_section(),
+                    .deferred_builtin_prompt_section_filtered(|name| {
+                        effective_tool_names.contains(name)
+                    }),
             );
         }
 
@@ -8500,7 +8506,7 @@ mod tests {
             }
         }
 
-        for native in [false, true] {
+        for (native, allow_search) in [(false, false), (true, false), (false, true), (true, true)] {
             let turn_id = uuid::Uuid::new_v4().to_string();
             let mut responses = vec![
                 ChatResponse {
@@ -8574,7 +8580,11 @@ mod tests {
                     title: "Scoped".to_string(),
                     body: "Use only allowed tools".to_string(),
                     scope: Some(crate::sop::StepToolScope {
-                        allow: Some(vec!["allowed_tool".to_string()]),
+                        allow: Some(if allow_search {
+                            vec!["allowed_tool".to_string(), "tool_search".to_string()]
+                        } else {
+                            vec!["allowed_tool".to_string()]
+                        }),
                         deny: Vec::new(),
                     }),
                     ..crate::sop::SopStep::default()
@@ -8744,9 +8754,17 @@ mod tests {
             };
             assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
             for index in [1, 2] {
-                assert!(!prompt(index).contains("<available-deferred-builtin-tools>"));
+                assert_eq!(
+                    prompt(index).contains("<available-deferred-builtin-tools>"),
+                    allow_search
+                );
+                assert!(!prompt(index).contains("denied_tool - "));
+                if allow_search {
+                    assert!(prompt(index).contains("allowed_tool - "));
+                    assert!(!prompt(index).contains("**allowed_tool**"));
+                }
                 assert!(prompt(index).contains("Retain hardware guidance."));
-                if !native {
+                if !native && !allow_search {
                     assert_eq!(prompt(index).matches("## Tool Use Protocol").count(), 1);
                     assert!(prompt(index).contains("**allowed_tool**"));
                     assert!(prompt(index).contains("Parameters:"));
@@ -16405,6 +16423,11 @@ Let me check the result."#;
         let initial = build(&[]);
         assert!(initial.contains("catalog_probe - "));
         assert!(!initial.contains("**catalog_probe**"));
+        let search_allowed = build(&["catalog_probe".into()]);
+        assert!(!search_allowed.contains("catalog_probe"));
+        assert!(!search_allowed.contains("<available-deferred-builtin-tools>"));
+        assert!(search_allowed.contains("tool_search"));
+        assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 1);
         let eager = build(&["tool_search".into()]);
         assert!(eager.contains("**catalog_probe**"));
         assert!(!eager.contains("catalog_probe - "));

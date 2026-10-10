@@ -645,50 +645,74 @@ fn replace_tool_protocol_section(
     }
 }
 
-fn apply_builtin_search_fallback(
+fn apply_builtin_prompt_scope(
     messages: &mut [ChatMessage],
     tools_registry: &[Box<dyn crate::tools::Tool>],
     effective_names: &HashSet<String>,
+    deferred_section: &str,
     use_native_tools: bool,
     strict_tool_parsing: bool,
 ) {
     let names: HashSet<&str> = effective_names.iter().map(String::as_str).collect();
-    let instructions = if use_native_tools || strict_tool_parsing {
-        String::new()
-    } else {
-        crate::agent::loop_::build_tool_instructions_for_names(tools_registry, &names)
-    };
+    let instructions =
+        if use_native_tools || strict_tool_parsing || effective_names.contains("tool_search") {
+            String::new()
+        } else {
+            crate::agent::loop_::build_tool_instructions_for_names(tools_registry, &names)
+        };
     for message in messages
         .iter_mut()
         .filter(|message| message.role == "system")
     {
         // A same-agent step shares history, but its discovery route is narrower.
         // Reconcile only the request clone, preserving unrelated prompt sections.
+        let mut catalogue_inserted = false;
         for heading in [
             "## Deferred Built-in Tools\n",
             "## Tools\n",
             "## Tool Use Protocol\n",
         ] {
             if heading != "## Deferred Built-in Tools\n"
-                && (use_native_tools || strict_tool_parsing)
+                && (use_native_tools
+                    || strict_tool_parsing
+                    || effective_names.contains("tool_search"))
             {
                 continue;
             }
-            while let Some(start) = message.content.find(heading) {
+            let mut cursor = 0;
+            while let Some(offset) = message.content[cursor..].find(heading) {
+                let start = cursor + offset;
                 let body = start + heading.len();
+                let section_end = message.content[body..]
+                    .find("\n## ")
+                    .map_or(message.content.len(), |offset| body + offset);
                 let end = if heading == "## Deferred Built-in Tools\n" {
                     let close = "</available-deferred-builtin-tools>";
-                    let Some(offset) = message.content[body..].find(close) else {
-                        break;
-                    };
-                    body + offset + close.len()
+                    // Prompt budgeting may cut the catalogue before its close,
+                    // then append the runtime's timestamp orientation directly.
+                    let section_end = message.content[body..section_end]
+                        .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .map_or(section_end, |offset| body + offset);
+                    message.content[body..section_end]
+                        .find(close)
+                        .map_or(section_end, |offset| body + offset + close.len())
                 } else {
-                    message.content[body..]
-                        .find("\n## ")
-                        .map_or(message.content.len(), |offset| body + offset)
+                    section_end
                 };
-                message.content.replace_range(start..end, "");
+                let replacement =
+                    if heading == "## Deferred Built-in Tools\n" && !catalogue_inserted {
+                        catalogue_inserted = true;
+                        deferred_section.trim_end_matches('\n')
+                    } else {
+                        ""
+                    };
+                message.content.replace_range(start..end, replacement);
+                cursor = start + replacement.len();
             }
+        }
+        if !catalogue_inserted && !deferred_section.is_empty() {
+            message.content.push('\n');
+            message.content.push_str(deferred_section);
         }
         if !instructions.is_empty() {
             message.content.push('\n');
@@ -1975,15 +1999,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let tool_specs = iteration_tool_specs.request_tool_specs();
         let use_native_tools = iteration_tool_specs.use_native_tools;
-        let builtin_search_unavailable = !iteration_tool_specs
-            .known_tool_names
-            .contains("tool_search")
-            && activated_tools.is_some_and(|state| {
-                state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .has_deferred_builtin_schemas()
-            });
+        let builtin_prompt_section = activated_tools.and_then(|state| {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.has_deferred_builtin_schemas().then(|| {
+                if iteration_tool_specs
+                    .known_tool_names
+                    .contains("tool_search")
+                    && (use_native_tools || !strict_tool_parsing)
+                {
+                    state.deferred_builtin_prompt_section_filtered(|name| {
+                        iteration_tool_specs.known_tool_names.contains(name)
+                    })
+                } else {
+                    String::new()
+                }
+            })
+        });
 
         // Tool protocol selection follows the provider-facing selector. Direct
         // Agent turns also refresh their scoped complete prompt after a hook
@@ -1995,11 +2026,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
-        if builtin_search_unavailable {
-            apply_builtin_search_fallback(
+        if let Some(section) = builtin_prompt_section.as_deref() {
+            apply_builtin_prompt_scope(
                 &mut provider_request_messages,
                 tools_registry,
                 &iteration_tool_specs.known_tool_names,
+                section,
                 use_native_tools,
                 strict_tool_parsing,
             );
@@ -2152,11 +2184,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut trimmed_post_hook,
                     use_native_tools,
                 );
-                if builtin_search_unavailable {
-                    apply_builtin_search_fallback(
+                if let Some(section) = builtin_prompt_section.as_deref() {
+                    apply_builtin_prompt_scope(
                         &mut trimmed_post_hook,
                         tools_registry,
                         &iteration_tool_specs.known_tool_names,
+                        section,
                         use_native_tools,
                         strict_tool_parsing,
                     );
@@ -6946,10 +6979,10 @@ mod sop_step_reassembly_tests {
         let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
         scope_tool_protocol_prompts(prompts, async {
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            apply_builtin_search_fallback(&mut request, &tools, &names, false, false);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false);
             // Trim rebuilds the projected request, then refreshes the cached section.
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            apply_builtin_search_fallback(&mut request, &tools, &names, false, false);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false);
         })
         .await;
         assert_eq!(
@@ -6973,9 +7006,77 @@ mod sop_step_reassembly_tests {
         assert_eq!(request[1].content, prompt);
         assert_eq!(history[0].content, prompt);
 
+        let mut activated = crate::tools::ActivatedToolSet::new();
+        activated.set_deferred_builtin_specs(tools.iter().map(|tool| tool.spec()).collect());
+        let search_names = HashSet::from(["allowed_tool".to_string(), "tool_search".to_string()]);
+        let section =
+            activated.deferred_builtin_prompt_section_filtered(|name| search_names.contains(name));
+        let catalogue = &prompt[prompt.find("## Deferred Built-in Tools").unwrap()
+            ..prompt.find("\n\n## Context").unwrap()];
+        let incomplete = catalogue.replace("</available-deferred-builtin-tools>", "");
+        let truncated = crate::agent::system_prompt::finalize_system_prompt(
+            format!("{prompt}{}", crate::agent::prompt::TIMESTAMP_ORIENTATION),
+            prompt.find("</available-deferred-builtin-tools>").unwrap()
+                + crate::agent::prompt::TIMESTAMP_ORIENTATION.chars().count(),
+        );
+        assert!(truncated.contains(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+        assert!(!truncated.contains("</available-deferred-builtin-tools>"));
+        for (input, native) in [
+            (format!("{prompt}\n{catalogue}"), false),
+            (format!("{prompt}\n{catalogue}"), true),
+            (
+                format!("{incomplete}\n## Context\nKeep context.\n{catalogue}"),
+                false,
+            ),
+            (truncated.clone(), false),
+            (truncated.clone(), true),
+        ] {
+            let mut history = vec![ChatMessage::system(prompt)];
+            let mut request = vec![ChatMessage::system(&input), ChatMessage::user(prompt)];
+            let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
+            scope_tool_protocol_prompts(prompts, async {
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native);
+                let parent_prompt = history[0].content.clone();
+                for _ in 0..2 {
+                    refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native);
+                    apply_builtin_prompt_scope(
+                        &mut request,
+                        &tools,
+                        &search_names,
+                        &section,
+                        native,
+                        false,
+                    );
+                    assert_eq!(history[0].content, parent_prompt);
+                }
+            })
+            .await;
+            assert_eq!(
+                request[0]
+                    .content
+                    .matches("<available-deferred-builtin-tools>")
+                    .count(),
+                1
+            );
+            assert!(request[0].content.contains("allowed_tool - "));
+            assert!(!request[0].content.contains("denied_tool"));
+            if input.contains("Keep context.") {
+                assert!(request[0].content.contains("Keep context."));
+            }
+            if input.contains(crate::agent::prompt::TIMESTAMP_ORIENTATION) {
+                assert!(
+                    request[0]
+                        .content
+                        .contains(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                );
+            }
+            assert_eq!(request[1].content, prompt);
+        }
+        assert_eq!(activated.hidden_builtin_names().len(), 2);
+
         let strict_prompt = &prompt[prompt.find("## Safety").unwrap()..];
         let mut strict = vec![ChatMessage::system(strict_prompt)];
-        apply_builtin_search_fallback(&mut strict, &tools, &names, false, true);
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true);
         assert!(
             !strict[0]
                 .content
@@ -6984,6 +7085,19 @@ mod sop_step_reassembly_tests {
         assert!(!strict[0].content.contains("## Tool Use Protocol"));
         assert!(!strict[0].content.contains("**allowed_tool**"));
         assert!(strict[0].content.contains("Keep hardware guidance."));
+        let mut strict = vec![ChatMessage::system(truncated)];
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true);
+        assert!(!strict[0].content.contains("denied_tool"));
+        assert!(
+            !strict[0]
+                .content
+                .contains("available-deferred-builtin-tools")
+        );
+        assert!(
+            strict[0]
+                .content
+                .contains(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+        );
     }
 
     struct BudgetToolCallingProvider;

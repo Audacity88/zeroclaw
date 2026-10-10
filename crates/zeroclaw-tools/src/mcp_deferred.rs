@@ -245,6 +245,14 @@ impl ActivatedToolSet {
         build_deferred_builtin_tools_section(self, None)
     }
 
+    /// Render discovery for one request without narrowing shared schema metadata.
+    pub fn deferred_builtin_prompt_section_filtered(
+        &self,
+        is_allowed: impl Fn(&str) -> bool,
+    ) -> String {
+        render_deferred_builtin_tools_section(self, is_allowed)
+    }
+
     pub fn has_deferred_builtin_schemas(&self) -> bool {
         !self.deferred_builtin_specs.is_empty()
     }
@@ -368,10 +376,19 @@ pub(crate) fn build_deferred_builtin_tools_section(
     activated: &ActivatedToolSet,
     policy: Option<&ToolAccessPolicy>,
 ) -> String {
+    render_deferred_builtin_tools_section(activated, |name| {
+        policy.is_none_or(|p| p.is_tool_allowed(name))
+    })
+}
+
+fn render_deferred_builtin_tools_section(
+    activated: &ActivatedToolSet,
+    is_allowed: impl Fn(&str) -> bool,
+) -> String {
     let mut specs: Vec<_> = activated
         .deferred_builtin_specs()
         .filter(|spec| !activated.is_builtin_schema_exposed(&spec.name))
-        .filter(|spec| policy.is_none_or(|p| p.is_tool_allowed(&spec.name)))
+        .filter(|spec| is_allowed(&spec.name))
         .collect();
     if specs.is_empty() {
         return String::new();
@@ -558,6 +575,16 @@ mod tests {
         assert!(!prompt.contains("Args:"));
         assert!(!prompt.contains("private_schema_marker"));
         assert!(!prompt.contains("denied"));
+        let hidden_names = set.hidden_builtin_names();
+        assert_eq!(
+            set.deferred_builtin_prompt_section_filtered(|name| name == "calendar"),
+            prompt
+        );
+        assert!(
+            set.deferred_builtin_prompt_section_filtered(|_| false)
+                .is_empty()
+        );
+        assert_eq!(set.hidden_builtin_names(), hidden_names);
         set.select_builtin_schema("calendar").unwrap();
         assert!(build_deferred_builtin_tools_section(&set, Some(&policy)).is_empty());
     }
