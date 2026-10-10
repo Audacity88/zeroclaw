@@ -228,14 +228,16 @@ fn resident_memory_with_fallback(
     pid: Pid,
     identity: ProcessIdentity,
     rss_bytes: u64,
-    native_read: impl FnOnce(Pid, ProcessIdentity) -> Result<NativeMemory, &'static str>,
+    native_read: impl FnOnce(Pid, ProcessIdentity) -> Result<Option<NativeMemory>, &'static str>,
 ) -> Result<Option<u64>, &'static str> {
     if rss_bytes != 0 {
         return Ok(Some(rss_bytes));
     }
     // sysinfo represents both a failed memory read and a successful zero as zero.
     // The native response supplies current RSS and pins it to the observed identity.
-    let native = native_read(pid, identity)?;
+    let Some(native) = native_read(pid, identity)? else {
+        return Ok(None);
+    };
     if native.pid != pid || native.identity != identity {
         return Ok(None);
     }
@@ -246,7 +248,7 @@ fn resident_memory_with_fallback(
 fn native_resident_memory(
     pid: Pid,
     _identity: ProcessIdentity,
-) -> Result<NativeMemory, &'static str> {
+) -> Result<Option<NativeMemory>, &'static str> {
     // SAFETY: proc_taskallinfo contains only integer fields and arrays of integers.
     let mut info: libc::proc_taskallinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
@@ -260,7 +262,10 @@ fn native_resident_memory(
             size,
         )
     };
-    macos_memory_response(&info, returned)
+    if returned == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return Ok(None);
+    }
+    macos_memory_response(&info, returned).map(Some)
 }
 
 #[cfg(target_os = "macos")]
@@ -285,9 +290,12 @@ fn macos_memory_response(
 fn native_resident_memory(
     pid: Pid,
     _identity: ProcessIdentity,
-) -> Result<NativeMemory, &'static str> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.as_u32()))
-        .map_err(|_| "native resident memory read failed")?;
+) -> Result<Option<NativeMemory>, &'static str> {
+    let stat = match std::fs::read_to_string(format!("/proc/{}/stat", pid.as_u32())) {
+        Ok(stat) => stat,
+        Err(error) if linux_process_departed_error(&error) => return Ok(None),
+        Err(_) => return Err("native resident memory read failed"),
+    };
     // SAFETY: sysconf only queries these process-independent numeric system constants.
     let (page_size, clock_ticks) = unsafe {
         (
@@ -304,6 +312,13 @@ fn native_resident_memory(
         clock_ticks as u64,
         System::boot_time(),
     )
+    .map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_departed_error(error: &io::Error) -> bool {
+    // procfs can report ESRCH if the task exits between opening stat and reading it.
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(target_os = "linux")]
@@ -344,23 +359,40 @@ fn linux_memory_response(
 fn native_resident_memory(
     pid: Pid,
     identity: ProcessIdentity,
-) -> Result<NativeMemory, &'static str> {
-    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+) -> Result<Option<NativeMemory>, &'static str> {
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0,
+    };
     use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_VM_READ, WaitForSingleObject,
     };
 
     // SAFETY: open a query-only handle, then use that same process object for both reads.
-    let handle = unsafe {
+    let handle = match unsafe {
         OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SYNCHRONIZE,
             false,
             pid.as_u32(),
         )
-    }
-    .map_err(|_| "native resident memory query handle is not observable")?;
+    } {
+        Ok(handle) => handle,
+        Err(error)
+            if pid.as_u32() != 0
+                && error.code()
+                    == windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
+        {
+            return Ok(None);
+        }
+        Err(_) => return Err("native resident memory query handle is not observable"),
+    };
+    // A signaled process handle proves exit without confusing access failures with departure.
+    let departed = || unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
     let result = (|| {
+        if departed() {
+            return Ok(None);
+        }
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
@@ -381,7 +413,7 @@ fn native_resident_memory(
         let start_time = (creation_ticks / 10_000_000)
             .checked_sub(11_644_473_600)
             .ok_or("native process identity is not observable")?;
-        Ok(NativeMemory {
+        Ok(Some(NativeMemory {
             pid,
             identity: ProcessIdentity {
                 // Parent was checked in the refreshed snapshot; creation pins this handle.
@@ -389,8 +421,13 @@ fn native_resident_memory(
                 start_time,
             },
             rss_bytes: memory.WorkingSetSize as u64,
-        })
+        }))
     })();
+    let result = if result.is_err() && departed() {
+        Ok(None)
+    } else {
+        result
+    };
     // SAFETY: every successful OpenProcess above reaches this close, including failed reads.
     unsafe { CloseHandle(handle) }.map_err(|_| "native memory query handle close failed")?;
     result
@@ -400,7 +437,7 @@ fn native_resident_memory(
 fn native_resident_memory(
     _pid: Pid,
     _identity: ProcessIdentity,
-) -> Result<NativeMemory, &'static str> {
+) -> Result<Option<NativeMemory>, &'static str> {
     Err("native resident memory is not supported on this platform")
 }
 
@@ -408,6 +445,22 @@ fn sample_memory(
     root: Pid,
     root_start_time: Option<u64>,
     cancelled: &AtomicBool,
+) -> Result<(u64, u64), &'static str> {
+    sample_memory_with_reader(
+        root,
+        root_start_time,
+        cancelled,
+        |pid, identity, rss_bytes| {
+            resident_memory_with_fallback(pid, identity, rss_bytes, native_resident_memory)
+        },
+    )
+}
+
+fn sample_memory_with_reader(
+    root: Pid,
+    root_start_time: Option<u64>,
+    cancelled: &AtomicBool,
+    mut read_memory: impl FnMut(Pid, ProcessIdentity, u64) -> Result<Option<u64>, &'static str>,
 ) -> Result<(u64, u64), &'static str> {
     if cancelled.load(Ordering::Acquire) {
         return Err("memory observation cancelled");
@@ -495,14 +548,12 @@ fn sample_memory(
             }
             continue;
         }
-        let memory = if pid != root
-            && process.memory() == 0
-            && process.status() == ProcessStatus::Zombie
-        {
-            Some(0)
-        } else {
-            resident_memory_with_fallback(pid, *identity, process.memory(), native_resident_memory)?
-        };
+        let memory =
+            if pid != root && process.memory() == 0 && process.status() == ProcessStatus::Zombie {
+                Some(0)
+            } else {
+                read_memory(pid, *identity, process.memory())?
+            };
         let Some(memory) = memory else {
             if pid == root {
                 return Err("owned root identity changed");
@@ -541,11 +592,11 @@ mod tests {
                 resident_memory_with_fallback(pid, identity, 0, |queried, expected| {
                     assert_eq!(queried, pid);
                     assert!(expected == identity);
-                    Ok(NativeMemory {
+                    Ok(Some(NativeMemory {
                         pid,
                         identity,
                         rss_bytes,
-                    })
+                    }))
                 }),
                 Ok(Some(rss_bytes))
             );
@@ -597,7 +648,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                resident_memory_with_fallback(pid, identity, 0, |_, _| Ok(native)),
+                resident_memory_with_fallback(pid, identity, 0, |_, _| Ok(Some(native))),
                 Ok(None)
             );
         }
@@ -617,6 +668,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn descendant_departure_after_snapshot_is_not_a_monitor_failure() {
+        let _fixture_lock = FIXTURE_LOCK.lock().await;
+        let root = Pid::from_u32(std::process::id());
+        for depart in [true, false] {
+            let mut child = fixture_command("await-release")
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = Pid::from_u32(child.id().unwrap());
+            let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    if line.contains("MEMORY_FIXTURE_READY") {
+                        return;
+                    }
+                }
+                panic!("memory fixture did not start");
+            })
+            .await
+            .unwrap();
+            let mut observed = false;
+            let result = sample_memory_with_reader(
+                root,
+                None,
+                &AtomicBool::new(false),
+                |queried, identity, rss| {
+                    if queried != pid {
+                        return resident_memory_with_fallback(
+                            queried,
+                            identity,
+                            rss,
+                            native_resident_memory,
+                        );
+                    }
+                    observed = true;
+                    // Force the fallback after discovery, then deterministically reap this child.
+                    resident_memory_with_fallback(queried, identity, 0, |queried, identity| {
+                        if !depart {
+                            return Err("live process memory read denied");
+                        }
+                        child.start_kill().unwrap();
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while child.try_wait().unwrap().is_none() {
+                            assert!(std::time::Instant::now() < deadline, "fixture did not exit");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        native_resident_memory(queried, identity)
+                    })
+                },
+            );
+            let _ = child.start_kill();
+            child.wait().await.unwrap();
+            assert!(observed, "descendant was not discovered");
+            if depart {
+                assert!(
+                    result.is_ok(),
+                    "departed child failed the sample: {result:?}"
+                );
+            } else {
+                assert_eq!(result, Err("live process memory read denied"));
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_native_response_requires_the_complete_record() {
@@ -634,6 +750,21 @@ mod tests {
         assert_eq!(memory.identity.parent, Some(Pid::from_u32(7)));
         assert_eq!(memory.identity.start_time, 100);
         assert_eq!(memory.rss_bytes, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_departure_errors_do_not_hide_live_read_failures() {
+        for code in [libc::ENOENT, libc::ESRCH] {
+            assert!(linux_process_departed_error(&io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        for code in [libc::EACCES, libc::EPERM, libc::EIO] {
+            assert!(!linux_process_departed_error(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -877,6 +1008,14 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(300));
                 // SAFETY: unmap exactly the range successfully reserved above.
                 assert_eq!(unsafe { libc::munmap(reservation, len) }, 0);
+            }
+            "await-release" => {
+                use std::io::{Read, Write};
+                println!("MEMORY_FIXTURE_READY");
+                std::io::stdout().flush().unwrap();
+                // The parent holds stdin open until it explicitly kills and reaps this child.
+                let mut release = [0];
+                std::io::stdin().read_exact(&mut release).unwrap();
             }
             "ordinary" => {
                 println!("MEMORY_FIXTURE_READY");
