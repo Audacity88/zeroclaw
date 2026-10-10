@@ -17503,6 +17503,279 @@ mod tests {
         }
     }
 
+    /// Render the production agent sidebar (`AgentSidebar::draw`) for every
+    /// session `chat` tracks and read the status dot back from the terminal
+    /// cells: `(session_id, glyph, foreground color)` per row, in sidebar
+    /// order. The rows are the same `session_summaries()` the app hands the
+    /// sidebar each frame.
+    fn rendered_sidebar_dots(chat: &Chat) -> Vec<(String, String, ratatui::style::Color)> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let rows = chat.session_summaries();
+        let area = Rect::new(0, 0, 24, 8);
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat.pane_kind),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Session rows start inside the panel border, one per line.
+        rows.iter()
+            .enumerate()
+            .map(|(i, summary)| {
+                let x = area.x + 1;
+                let y = area.y + 1 + i as u16;
+                let text = (x..area.x + area.width - 1)
+                    .map(|col| buf[(col, y)].symbol())
+                    .collect::<String>();
+                assert!(
+                    text.contains(summary.agent_alias.as_str()),
+                    "row {i} should show {}: {text:?}",
+                    summary.agent_alias
+                );
+                (
+                    summary.session_id.clone(),
+                    buf[(x, y)].symbol().to_string(),
+                    buf[(x, y)].fg,
+                )
+            })
+            .collect()
+    }
+
+    /// Final-interface check for the reconnect transition: the real sidebar
+    /// is drawn before the rebuild and again after a fresh `Chat` re-attached
+    /// every carried session through `init()` against a fake daemon. The
+    /// failed-turn session keeps its red dot; the session-lost one (the
+    /// connection-error control, resolved by the re-attach itself) comes back
+    /// green.
+    #[tokio::test]
+    async fn reconnect_rebuild_renders_failed_turn_red_and_recovered_session_lost_green() {
+        let red = theme::status_error_style().fg.expect("error dot color");
+        let green = theme::status_ready_style().fg.expect("ready dot color");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(ref mut focused) = chat.phase else {
+            panic!("focused session must be active");
+        };
+        focused.apply_update(turn_complete(
+            "sess-a",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        chat.background[0].apply_update(turn_complete(
+            "sess-b",
+            TurnEndOutcome::Failed,
+            "prompt failed: session_not_found",
+        ));
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-a".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-b".to_string(), "\u{25cf}".to_string(), red),
+            ],
+            "both sessions are red before the socket drops"
+        );
+
+        // The daemon restarted: the app layer snapshots the pane and builds a
+        // fresh one on the new socket, exactly as `app.rs` does.
+        let entries = chat.resume_entries();
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel::<String>(16);
+        let reconnect_rpc = Arc::new(RpcOutbound::new(reconnect_tx));
+        let reconnect_client = Arc::new(RpcClient::with_rpc(Arc::clone(&reconnect_rpc)));
+        let mut rebuilt = Chat::new(reconnect_client, PaneKind::Chat);
+        rebuilt.set_resume_sessions(entries);
+        let mut init = tokio::spawn(async move {
+            let _ = rebuilt.init().await;
+            rebuilt
+        });
+
+        // Fake daemon: answer whatever the rebuild asks for, by method, until
+        // `init` returns.
+        let rebuilt = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    joined = &mut init => break joined.expect("rebuild init task"),
+                    line = reconnect_rx.recv() => {
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&line.expect("rpc channel open"))
+                                .expect("RPC request should be JSON");
+                        match frame["method"].as_str() {
+                            Some(method::AGENTS_STATUS) => respond_ok(
+                                &reconnect_rpc,
+                                &frame,
+                                serde_json::json!({
+                                    "agents": [
+                                        {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                                        {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                                    ]
+                                }),
+                            ),
+                            Some(method::SESSION_NEW) => {
+                                let sid = frame["params"]["session_id"].clone();
+                                respond_ok(
+                                    &reconnect_rpc,
+                                    &frame,
+                                    serde_json::json!({ "session_id": sid, "workspace_dir": "/w" }),
+                                );
+                            }
+                            Some(method::CONFIG_LIST) => {
+                                respond_ok(&reconnect_rpc, &frame, serde_json::json!([]));
+                            }
+                            Some(method::SESSION_MESSAGES) => respond_ok(
+                                &reconnect_rpc,
+                                &frame,
+                                serde_json::json!({
+                                    "messages": [
+                                        { "role": "user", "content": "ask" },
+                                        { "role": "assistant", "content": "durable answer" }
+                                    ],
+                                    "total": 2
+                                }),
+                            ),
+                            other => panic!("unexpected reconnect frame: {other:?}"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("reconnect rebuild should finish");
+
+        assert_eq!(
+            rendered_sidebar_dots(&rebuilt),
+            vec![
+                ("sess-a".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-b".to_string(), "\u{25cf}".to_string(), green),
+            ],
+            "after the rebuild the failed turn stays red; the re-attached lost session is green"
+        );
+        assert_eq!(
+            rebuilt.state_for_session("sess-a").unwrap().last_error,
+            Some(SessionError::TurnFailed)
+        );
+        assert_eq!(
+            rebuilt.state_for_session("sess-b").unwrap().last_error,
+            None
+        );
+    }
+
+    /// Final-interface check for the notification-lag transition: a channel
+    /// overflow reloads every tracked session from a fake daemon, then the
+    /// real sidebar is drawn. The failed-turn session keeps its red dot; the
+    /// session whose earlier reload had failed (the connection-error control)
+    /// recovers to green.
+    #[tokio::test]
+    async fn notification_lag_reload_renders_failed_turn_red_and_recovered_resync_failed_green() {
+        let red = theme::status_error_style().fg.expect("error dot color");
+        let green = theme::status_ready_style().fg.expect("ready dot color");
+
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut failed = state_for("sess-failed", "alpha");
+        failed.push_user_message(Some("ask".to_string()), Vec::new());
+        failed.apply_update(turn_complete(
+            "sess-failed",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        let mut unreconciled = state_for("sess-unreconciled", "beta");
+        unreconciled.last_error = Some(SessionError::ResyncFailed);
+        chat.phase = ChatPhase::Active(Box::new(failed));
+        chat.background.push(unreconciled);
+        chat.session_order = vec!["sess-failed".to_string(), "sess-unreconciled".to_string()];
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-failed".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-unreconciled".to_string(), "\u{25cf}".to_string(), red),
+            ],
+            "both sessions are red before the lag"
+        );
+
+        // Overflow the 64-frame notification channel so the drain reports
+        // Lagged and reloads every tracked session.
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.drain_notifications();
+        assert!(chat.session_resync_in_flight.contains_key("sess-failed"));
+        assert!(
+            chat.session_resync_in_flight
+                .contains_key("sess-unreconciled")
+        );
+
+        // Fake daemon: both sessions are idle with a readable transcript.
+        for _ in 0..4 {
+            let frame = next_rpc_request(&mut writer_rx, "lag recovery reloads each session").await;
+            let sid = frame["params"]["session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match frame["method"].as_str() {
+                Some(method::SESSION_STATE) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": sid, "state": "idle" }),
+                ),
+                Some(method::SESSION_MESSAGES) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [
+                            { "role": "user", "content": "ask" },
+                            { "role": "assistant", "content": "durable answer" }
+                        ],
+                        "total": 2
+                    }),
+                ),
+                other => panic!("unexpected recovery frame: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both sessions should finish resync");
+        chat.tick_transport_events();
+        assert!(chat.session_resync_in_flight.is_empty());
+
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-failed".to_string(), "\u{25cf}".to_string(), red),
+                (
+                    "sess-unreconciled".to_string(),
+                    "\u{25cf}".to_string(),
+                    green
+                ),
+            ],
+            "after the lag reload the failed turn stays red; the recovered reload is green"
+        );
+        assert_eq!(
+            chat.state_for_session("sess-failed").unwrap().last_error,
+            Some(SessionError::TurnFailed)
+        );
+        assert_eq!(
+            chat.state_for_session("sess-unreconciled")
+                .unwrap()
+                .last_error,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn prompt_transport_closure_preserves_interrupted_resume_recovery() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
