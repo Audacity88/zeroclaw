@@ -3724,16 +3724,6 @@ impl App {
             rows[0],
         );
 
-        // A transient status (e.g. a section preview whose RPC timed out)
-        // takes the hint row: with nothing loaded yet there is no detail
-        // screen whose own status line could show it.
-        if let Some(msg) = &self.status_msg {
-            frame.render_widget(
-                Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
-                rows[1],
-            );
-            return;
-        }
         let line = crate::i18n::t_args(
             "zc-config-section-detail-hint",
             &[
@@ -5297,6 +5287,14 @@ mod tests {
         let mut term = handler_term();
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        // Like `init`, eagerly load the first section while the daemon
+        // answers, so the timeouts below land on a loaded detail screen whose
+        // existing status row shows them.
+        mode.store(DAEMON_ANSWER, Ordering::SeqCst);
+        mgr.load_section_content(0)
+            .await
+            .expect("first section loads");
+        mode.store(DAEMON_SILENT, Ordering::SeqCst);
         render_config(&mut mgr);
         let section_pane = mgr.last_section_pane_area;
         let area = Rect::new(0, 0, 160, 40);
@@ -5334,8 +5332,8 @@ mod tests {
         );
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            ["config/list", "config/list"],
-            "both inputs must have reached the daemon"
+            ["config/list", "config/list", "config/list"],
+            "the initial load and both inputs must have reached the daemon"
         );
 
         // The daemon recovers: further key and mouse input works normally.
@@ -5366,7 +5364,7 @@ mod tests {
             Some(0),
             "scroll must load `alpha` once answered"
         );
-        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(seen.lock().unwrap().len(), 5);
     }
 
     #[tokio::test(start_paused = true)]
