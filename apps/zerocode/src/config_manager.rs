@@ -834,7 +834,11 @@ impl App {
             chunks[3],
         );
         frame.render_widget(
-            Paragraph::new(self.application_feedback.summary()).wrap(Wrap { trim: false }),
+            Paragraph::new(Span::styled(
+                self.application_feedback.summary(),
+                theme::warn_style(),
+            ))
+            .wrap(Wrap { trim: false }),
             chunks[2],
         );
         if self.application_feedback.details_open() {
@@ -4966,10 +4970,8 @@ impl App {
                             Ok(revision) => {
                                 self.application_feedback
                                     .record_saved(prop.clone(), revision);
-                                self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-field-set",
-                                    &[("prop", &prop)],
-                                ));
+                                // The application summary below names the saved field.
+                                self.status_msg = None;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
                             Err(e) => {
@@ -5012,10 +5014,8 @@ impl App {
                         Ok(revision) => {
                             self.application_feedback
                                 .record_saved(prop.clone(), revision);
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-field-set",
-                                &[("prop", &prop)],
-                            ));
+                            // The application summary below names the saved field.
+                            self.status_msg = None;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
                         Err(e) => {
@@ -5144,10 +5144,8 @@ impl App {
                 Ok(revision) => {
                     self.application_feedback
                         .record_saved(prop.clone(), revision);
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-field-set",
-                        &[("prop", &prop)],
-                    ));
+                    // The application summary below names the saved field.
+                    self.status_msg = None;
                     self.deactivate_filter();
                     self.pop_to_field_list_keep_cursor().await?;
                 }
@@ -5172,10 +5170,8 @@ impl App {
                 Ok(revision) => {
                     self.application_feedback
                         .record_saved(prop.clone(), revision);
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-field-set",
-                        &[("prop", &prop)],
-                    ));
+                    // The application summary below names the saved field.
+                    self.status_msg = None;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -10625,6 +10621,8 @@ mod tests {
                 .summary()
                 .contains("can't confirm")
         );
+        // One line, not two: the save names the field only in the summary.
+        assert_eq!(manager.status_msg, None);
         manager.tick_application_status(true);
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -10654,6 +10652,16 @@ mod tests {
             .collect::<String>();
         assert!(output.contains("a.second"));
         assert!(output.contains("Open sessions already use it"));
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.height)
+            .find(|&y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .starts_with("Saved ")
+            })
+            .expect("summary row");
+        assert_eq!(buffer[(0, row)].fg, crate::theme::warn_style().fg.unwrap());
         manager.application_feedback.toggle_details();
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
