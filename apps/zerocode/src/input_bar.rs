@@ -59,6 +59,8 @@ enum SlashCommandId {
     Effort,
     /// The local `display` command: the session's thinking display.
     Display,
+    CompactContext,
+    RestoreContext,
 }
 
 /// The argument that clears a session thinking override (`/effort reset`)
@@ -130,6 +132,16 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::ToggleThinking,
         name: "toggle-thinking",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::CompactContext,
+        name: "compact-context",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::RestoreContext,
+        name: "restore-context",
         aliases: &[],
     },
 ];
@@ -246,6 +258,8 @@ impl SlashCommandRegistry {
             (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
             (SlashCommandId::ReloadContext, None) => SlashCommand::ReloadContext,
             (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,
+            (SlashCommandId::CompactContext, None) => SlashCommand::CompactContext,
+            (SlashCommandId::RestoreContext, None) => SlashCommand::RestoreContext,
             (SlashCommandId::Browse, None) => SlashCommand::EnterBrowseMode,
             (SlashCommandId::Help, None) => SlashCommand::OpenHelp,
             (SlashCommandId::ModelProvider, None | Some("")) => SlashCommand::ModelProviderPicker,
@@ -372,6 +386,8 @@ pub(crate) enum InputBarAction {
     /// picker, applies the value through `session/configure`, or clears the
     /// session override.
     Thinking(crate::client::ThinkingControl, ThinkingAction),
+    CompactContext,
+    RestoreContext,
     /// Key was not handled by the input bar — parent should handle it.
     NotHandled,
 }
@@ -406,6 +422,8 @@ enum SlashCommand<'a> {
     ChangeDirectory,
     EnterBrowseMode,
     OpenHelp,
+    CompactContext,
+    RestoreContext,
     NotACommand,
 }
 
@@ -2324,6 +2342,8 @@ impl InputBarState {
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
                 SlashCommand::OpenHelp => InputBarAction::OpenHelp,
+                SlashCommand::CompactContext => InputBarAction::CompactContext,
+                SlashCommand::RestoreContext => InputBarAction::RestoreContext,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -4222,6 +4242,14 @@ mod tests {
             SlashCommand::ToggleThinking
         ));
         assert!(matches!(
+            parse_slash_command("/compact-context"),
+            SlashCommand::CompactContext
+        ));
+        assert!(matches!(
+            parse_slash_command("/restore-context"),
+            SlashCommand::RestoreContext
+        ));
+        assert!(matches!(
             parse_slash_command("/browse"),
             SlashCommand::EnterBrowseMode
         ));
@@ -4265,13 +4293,14 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_eighteen_entries() {
+    fn derived_slash_command_set_matches_expected_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
             "/change-directory",
             "/clear-queue",
+            "/compact-context",
             "/detach",
             "/display",
             "/effort",
@@ -4282,6 +4311,7 @@ mod tests {
             "/new-session",
             "/reload-context",
             "/restart-session",
+            "/restore-context",
             "/think",
             "/thinking",
             "/toggle-thinking",
