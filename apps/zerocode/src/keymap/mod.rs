@@ -560,6 +560,7 @@ mod tests {
         check(SopTabAction::TAG, SopTabAction::bindings());
         check(InputBarAction::TAG, InputBarAction::bindings());
         check(ModalAction::TAG, ModalAction::bindings());
+        check(ModelPickerAction::TAG, ModelPickerAction::bindings());
         check(CaptureAction::TAG, CaptureAction::bindings());
         check(FileExplorerAction::TAG, FileExplorerAction::bindings());
         check(

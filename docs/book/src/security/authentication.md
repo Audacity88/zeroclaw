@@ -134,11 +134,7 @@ or losing `admin` while a prompt is queued, does not carry that environment into
 the next turn: the request is refused before execution. Create a new session to
 continue without the forwarded environment. Sessions without forwarded values
 remain eligible for normal resume, subject to the other authorization checks.
-The retained environment is immutable for the lifetime of its session; refusing
-a later request does not rewrite it underneath an already running turn. A
-resume also requires the current connection's authorized environment to match
-the session's retained environment. If it differs, create a new session; an
-environment-free session can still be resumed after `admin` is removed.
+The retained environment is immutable for the lifetime of its session. An authorized local operator can resume a live session from another terminal even when the terminals' environments differ. The session keeps its original `PATH`, credential sockets and other forwarded values; resume does not replace them with the attaching terminal's values. An environment-free session stays environment-free and can still be resumed after `admin` is removed.
 
 #### Recovery
 

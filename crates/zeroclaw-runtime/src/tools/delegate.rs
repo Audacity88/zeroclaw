@@ -11366,7 +11366,7 @@ mod tests {
             temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let thinking = request.thinking.as_ref();
-            let thinking_budget = thinking.map(|params| params.budget_tokens);
+            let thinking_budget = thinking.and_then(|params| params.budget_tokens);
             let thinking_display = thinking.and_then(|params| params.display);
             let system_prompt = request
                 .messages
@@ -11477,7 +11477,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 
@@ -11530,7 +11531,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 
@@ -11571,7 +11573,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 
@@ -11627,7 +11630,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 

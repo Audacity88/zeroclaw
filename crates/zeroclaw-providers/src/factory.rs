@@ -1215,6 +1215,8 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
             .server_fallback_models(self.server_fallback_models.clone())
+            .thinking_display(self.thinking_display)
+            .extra_headers(&opts.extra_headers)
             .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
@@ -2228,8 +2230,8 @@ mod tests {
         collect_cache_controls(&compat_one_hour, &mut controls);
         assert_eq!(
             controls.len(),
-            2,
-            "system + rolling breakpoints expected: {compat_one_hour}"
+            3,
+            "system + prior-turn + rolling breakpoints expected: {compat_one_hour}"
         );
         for control in &controls {
             assert_eq!(
@@ -2251,8 +2253,8 @@ mod tests {
         collect_cache_controls(&native_one_hour, &mut controls);
         assert_eq!(
             controls.len(),
-            3,
-            "system + tools + rolling markers expected: {native_one_hour}"
+            4,
+            "system + tools + prior-turn + rolling markers expected: {native_one_hour}"
         );
         for control in &controls {
             assert_eq!(
@@ -2264,7 +2266,7 @@ mod tests {
         let native_default = native_request(&ModelProviderRuntimeOptions::default()).await;
         let mut controls = Vec::new();
         collect_cache_controls(&native_default, &mut controls);
-        assert_eq!(controls.len(), 3, "marker placement is unconditional");
+        assert_eq!(controls.len(), 4, "marker placement is unconditional");
         for control in &controls {
             assert_eq!(
                 serde_json::to_string(control).unwrap(),
@@ -3076,6 +3078,95 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "request waited for the server response instead of using configured 1s timeout: {elapsed:?}"
+        );
+    }
+
+    /// `extra_headers` must cross the factory boundary for the native
+    /// Anthropic family too, not only the compatible ones: a gateway that
+    /// wants its own credential header (and rejects `x-api-key`) otherwise
+    /// gets a request without it.
+    #[tokio::test]
+    async fn anthropic_factory_forwards_extra_headers() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::AnthropicModelProviderConfig;
+
+        // Serialized against the anthropic.rs test that makes the
+        // extra-header client fail to build through an invalid runtime proxy.
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+
+        async fn capture_headers(
+            State(captured): State<Arc<Mutex<Option<HeaderMap>>>>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            *captured.lock().expect("captured headers mutex") = Some(headers);
+            Json(serde_json::json!({
+                "id": "msg_headers",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-sonnet-4-5",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/messages", post(capture_headers))
+            .with_state(Arc::clone(&captured));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-gateway-key".to_string(), "gateway-secret".to_string());
+        let opts = ModelProviderRuntimeOptions {
+            extra_headers,
+            ..Default::default()
+        };
+        let provider = AnthropicModelProviderConfig::default()
+            .create_provider(
+                "anthropic",
+                Some("test-key"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("native anthropic provider constructs");
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "claude-sonnet-4-5",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("native request failed: {error}"));
+
+        let headers = captured
+            .lock()
+            .expect("captured headers mutex")
+            .take()
+            .expect("no request captured");
+        assert_eq!(
+            headers.get("x-gateway-key").and_then(|v| v.to_str().ok()),
+            Some("gateway-secret"),
+            "configured extra_headers must reach the native Anthropic wire"
+        );
+        assert_eq!(
+            headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("test-key")
         );
     }
 

@@ -17,14 +17,19 @@ pub struct ThinkingParams {
     pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
 }
 
+/// Prefixes that name a reasoning depth for one message. `/effort:` matches
+/// the shared `/effort` command; `/think:` is the older spelling and stays
+/// accepted.
+const THINKING_DIRECTIVE_PREFIXES: &[&str] = &["/effort:", "/think:"];
+
 pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)> {
     let trimmed = message.trim_start();
-    if !trimmed.starts_with("/think:") {
-        return None;
-    }
+    let prefix = THINKING_DIRECTIVE_PREFIXES
+        .iter()
+        .find(|prefix| trimmed.starts_with(*prefix))?;
 
-    // Extract the level token (everything between `/think:` and the next whitespace or end).
-    let after_prefix = &trimmed["/think:".len()..];
+    // Extract the level token (everything between the prefix and the next whitespace or end).
+    let after_prefix = &trimmed[prefix.len()..];
     let level_end = after_prefix
         .find(|c: char| c.is_whitespace())
         .unwrap_or(after_prefix.len());
@@ -78,7 +83,9 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
             system_prompt_prefix: None,
             native_thinking: None,
         },
-        ThinkingLevel::High => ThinkingParams {
+        // `xhigh` is a native depth setting; where only the prompt can carry
+        // the level it reads as `high`.
+        ThinkingLevel::High | ThinkingLevel::XHigh => ThinkingParams {
             temperature_adjustment: 0.05,
             max_tokens_adjustment: 1000,
             system_prompt_prefix: Some(
@@ -110,29 +117,39 @@ pub fn apply_thinking_level_with_config(
 ) -> ThinkingParams {
     use zeroclaw_config::scattered_types::{MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS};
     let mut params = apply_thinking_level(level);
-    if config.native_thinking
-        && let Some(budget) = config.budget_tokens_for(level)
-    {
-        let clamped = budget.clamp(MIN_BUDGET_TOKENS, MAX_BUDGET_TOKENS);
-        if clamped != budget {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({
-                        "requested": budget,
-                        "clamped": clamped,
-                        "min": MIN_BUDGET_TOKENS,
-                        "max": MAX_BUDGET_TOKENS
-                    })),
-                "budget_tokens outside accepted range; clamping"
-            );
-        }
-        params.native_thinking = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: clamped,
-            display: config.display.to_display(),
+    let budget_tokens = if config.native_thinking {
+        config.budget_tokens_for(level).map(|budget| {
+            let clamped = budget.clamp(MIN_BUDGET_TOKENS, MAX_BUDGET_TOKENS);
+            if clamped != budget {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "requested": budget,
+                            "clamped": clamped,
+                            "min": MIN_BUDGET_TOKENS,
+                            "max": MAX_BUDGET_TOKENS
+                        })),
+                    "budget_tokens outside accepted range; clamping"
+                );
+            }
+            clamped
+        })
+    } else {
+        None
+    };
+    // The budget stays opt-in because it costs tokens on every request. Depth
+    // does not: a level the operator chose should reach the families that read
+    // it, and the default level asks for nothing.
+    let effort = level.native_effort();
+    let display = config.display.to_display();
+    params.native_thinking = (budget_tokens.is_some() || effort.is_some() || display.is_some())
+        .then_some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens,
+            effort,
+            display,
         });
-    }
     params
 }
 
@@ -284,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_directive_accepts_the_effort_spelling() {
+        let (level, remaining) =
+            parse_thinking_directive("/effort:xhigh plan the migration").expect("directive");
+        assert_eq!(level, ThinkingLevel::XHigh);
+        assert_eq!(remaining, "plan the migration");
+        assert_eq!(
+            strip_thinking_directive("  /effort:low  body"),
+            "body",
+            "the older and newer spellings strip the same way"
+        );
+        assert!(parse_thinking_directive("/effort high").is_none());
+        assert!(parse_thinking_directive("/effort:turbo hi").is_none());
+    }
+
+    #[test]
     fn parse_directive_handles_directive_only() {
         let result = parse_thinking_directive("/think:off");
         assert!(result.is_some());
@@ -416,6 +448,13 @@ mod tests {
     }
 
     #[test]
+    fn apply_thinking_level_xhigh_reads_as_high_outside_native_depth() {
+        let xhigh = apply_thinking_level(ThinkingLevel::XHigh);
+        let high = apply_thinking_level(ThinkingLevel::High);
+        assert_eq!(xhigh, high);
+    }
+
+    #[test]
     fn apply_thinking_level_max_is_most_thorough() {
         let params = apply_thinking_level(ThinkingLevel::Max);
         assert!(params.temperature_adjustment > 0.0);
@@ -501,7 +540,68 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
-        assert_eq!(native.budget_tokens, MIN_BUDGET_TOKENS);
+        assert_eq!(native.budget_tokens, Some(MIN_BUDGET_TOKENS));
+    }
+
+    #[test]
+    fn levels_carry_effort_without_native_thinking() {
+        use zeroclaw_config::scattered_types::ThinkingEffort;
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::Medium,
+            native_thinking: false,
+            budget_tokens: std::collections::HashMap::new(),
+            display: ThinkingDisplayMode::Off,
+        };
+        for (level, expected) in [
+            (ThinkingLevel::Off, Some(ThinkingEffort::Low)),
+            (ThinkingLevel::Minimal, Some(ThinkingEffort::Low)),
+            (ThinkingLevel::Low, Some(ThinkingEffort::Low)),
+            (ThinkingLevel::High, Some(ThinkingEffort::High)),
+            (ThinkingLevel::XHigh, Some(ThinkingEffort::XHigh)),
+            (ThinkingLevel::Max, Some(ThinkingEffort::Max)),
+        ] {
+            let params = apply_thinking_level_with_config(level, &config);
+            let native = params
+                .native_thinking
+                .unwrap_or_else(|| panic!("{level:?} should carry effort"));
+            assert_eq!(native.effort, expected, "effort for {level:?}");
+            assert_eq!(
+                native.budget_tokens, None,
+                "budget stays opt-in for {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_level_asks_for_no_depth() {
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::Medium,
+            native_thinking: false,
+            budget_tokens: std::collections::HashMap::new(),
+            display: ThinkingDisplayMode::Off,
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::Medium, &config);
+        assert!(
+            params.native_thinking.is_none(),
+            "the default level leaves depth to the provider"
+        );
+    }
+
+    #[test]
+    fn native_thinking_carries_budget_and_effort_together() {
+        use zeroclaw_config::scattered_types::ThinkingEffort;
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: true,
+            budget_tokens: std::collections::HashMap::new(),
+            display: ThinkingDisplayMode::Off,
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("native thinking should be set");
+        assert_eq!(native.budget_tokens, Some(10_000));
+        assert_eq!(native.effort, Some(ThinkingEffort::High));
     }
 
     #[test]
@@ -519,7 +619,7 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
-        assert_eq!(native.budget_tokens, 8_000);
+        assert_eq!(native.budget_tokens, Some(8_000));
     }
 
     #[test]
@@ -568,7 +668,7 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
-        assert_eq!(native.budget_tokens, MAX_BUDGET_TOKENS);
+        assert_eq!(native.budget_tokens, Some(MAX_BUDGET_TOKENS));
     }
 
     // ── Serde round-trip ─────────────────────────────────────────
@@ -617,10 +717,11 @@ display = "updates"
 
     #[tokio::test]
     async fn native_thinking_override_round_trips_through_scope() {
-        use zeroclaw_config::scattered_types::NativeThinkingParams;
+        use zeroclaw_config::scattered_types::{NativeThinkingParams, ThinkingDisplay};
         let installed = Some(NativeThinkingParams {
-            budget_tokens: 32_000,
-            display: None,
+            budget_tokens: Some(32_000),
+            effort: None,
+            display: Some(ThinkingDisplay::Summarized),
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {
@@ -663,7 +764,7 @@ display = "updates"
         validate_thinking_config(&cfg_default);
 
         let mut cfg_all_valid = ThinkingConfig::default();
-        for level in ["off", "minimal", "low", "medium", "high", "max"] {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             cfg_all_valid
                 .budget_tokens
                 .insert(level.to_string(), 10_000);

@@ -250,6 +250,7 @@ pub(crate) async fn finish_after_max_iterations(
                 let mut trim = super::surface_oversized_dispatch_if_needed(
                     injected_memory_preamble,
                     history,
+                    &selected_model,
                     crumb_present,
                     tokens,
                     trim_budget,
@@ -279,6 +280,7 @@ pub(crate) async fn finish_after_max_iterations(
                     );
                     messages.push(summary_prompt_mirror.clone());
                     messages.extend(hook_suffix.iter().cloned());
+                    super::strip_reasoning_after_prefix_rewrite(&mut messages, &selected_model);
                     continue;
                 }
                 trim.dropped_messages = dropped_messages;

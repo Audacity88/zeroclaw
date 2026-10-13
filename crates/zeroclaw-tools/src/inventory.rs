@@ -214,6 +214,10 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         name: "sessions_send",
         tier: ToolTier::Host,
     },
+    BuiltinToolSpec {
+        name: "sessions_prompt",
+        tier: ToolTier::Host,
+    },
     // SOP.
     BuiltinToolSpec {
         name: "sop_list",
