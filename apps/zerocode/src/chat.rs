@@ -10997,13 +10997,23 @@ impl ChatState {
         let position = if self.pinned_to_bottom {
             self.entries.len().saturating_sub(1)
         } else {
-            match self.cached_screen_ranges.get(visible.start) {
+            match self
+                .transcript_layout
+                .view()
+                .cached_screen_ranges
+                .get(visible.start)
+            {
                 Some((idx, _, _, _)) => *idx,
                 // The viewport sits below the cached rows, inside a live reply.
-                None if !self.cached_screen_ranges.is_empty() => {
+                None if !self
+                    .transcript_layout
+                    .view()
+                    .cached_screen_ranges
+                    .is_empty() =>
+                {
                     self.render_window_end().saturating_sub(1)
                 }
-                None => self.cached_render_start,
+                None => self.transcript_layout.view().cached_render_start,
             }
         };
         ScrollbarState::new(self.entries.len())
@@ -11042,19 +11052,24 @@ impl ChatState {
                 .or_else(|| (0..target).rev().find(is_visible))
                 .unwrap_or(target);
             self.pinned_to_bottom = false;
-            if !(self.cached_render_start..self.render_window_end()).contains(&target) {
-                self.cached_render_start =
-                    target.min(self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES));
+            if !(self.transcript_layout.view().cached_render_start..self.render_window_end())
+                .contains(&target)
+            {
+                self.transcript_layout.set_render_start(
+                    target.min(self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES)),
+                );
                 self.mark_dirty_full();
             }
-            if self.dirty != LinesDirty::Clean {
+            if self.transcript_layout.view().dirty != LinesDirty::Clean {
                 self.clear_transcript_selection_for_render_change();
                 self.transcript_snapshot = None;
-                self.rebuild_lines(self.cached_render_width);
+                self.rebuild_lines(self.transcript_layout.view().cached_render_width);
             }
-            self.last_total_rows = self.cached_total_rows;
+            self.last_total_rows = self.transcript_layout.view().cached_total_rows;
             let max = self.last_total_rows.saturating_sub(self.last_inner_height);
             self.scroll_offset = self
+                .transcript_layout
+                .view()
                 .cached_screen_ranges
                 .iter()
                 .find(|(idx, _, _, _)| *idx >= target)
@@ -14619,7 +14634,7 @@ mod tests {
 
         state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
         state.seek_scrollbar(6);
-        assert!(state.cached_render_start < 1_200);
+        assert!(state.transcript_layout.view().cached_render_start < 1_200);
         assert_eq!(state.transcript_selection, None);
         assert_eq!(state.transcript_snapshot, None);
     }
@@ -15394,7 +15409,7 @@ mod tests {
                     render_conversation(frame, state, area);
                 })
                 .expect("draw conversation");
-            assert!(state.cached_entry_count <= MAX_RENDERED_ENTRIES);
+            assert!(state.transcript_layout.view().cached_entry_count <= MAX_RENDERED_ENTRIES);
             state.scrollbar_track_rect.expect("scrollbar track")
         };
 
@@ -15468,7 +15483,7 @@ mod tests {
                         assert!(state.entry_rects.iter().any(|(idx, _)| *idx == expected));
                     }
                     1 | 3 => {
-                        assert_eq!(state.cached_render_start, 0);
+                        assert_eq!(state.transcript_layout.view().cached_render_start, 0);
                         assert_eq!(state.scroll_offset, 0);
                         assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 0));
                     }
@@ -15488,8 +15503,8 @@ mod tests {
                     state.finish_transcript_drag();
                     let selection = state.transcript_selection;
                     let selected_text = state.current_selection_text();
-                    let cached_start = state.cached_render_start;
-                    let cached_count = state.cached_entry_count;
+                    let cached_start = state.transcript_layout.view().cached_render_start;
+                    let cached_count = state.transcript_layout.view().cached_entry_count;
                     chat.handle_mouse(
                         MouseEvent {
                             kind: MouseEventKind::Drag(MouseButton::Left),
@@ -15504,8 +15519,14 @@ mod tests {
                     let ChatPhase::Active(state) = &chat.phase else {
                         panic!("expected active chat");
                     };
-                    assert_eq!(state.cached_render_start, cached_start);
-                    assert_eq!(state.cached_entry_count, cached_count);
+                    assert_eq!(
+                        state.transcript_layout.view().cached_render_start,
+                        cached_start
+                    );
+                    assert_eq!(
+                        state.transcript_layout.view().cached_entry_count,
+                        cached_count
+                    );
                     assert_eq!(state.transcript_selection, selection);
                     assert_eq!(state.current_selection_text(), selected_text);
                 }
@@ -15579,7 +15600,7 @@ mod tests {
         draw(&mut s);
         assert!(!s.pinned_to_bottom);
         assert!(
-            s.scroll_offset >= s.cached_total_rows,
+            s.scroll_offset >= s.transcript_layout.view().cached_total_rows,
             "viewport must still be inside the live reply"
         );
         assert_eq!(s.scrollbar_state().get_position(), 2_199);
