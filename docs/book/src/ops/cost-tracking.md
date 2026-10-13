@@ -197,10 +197,13 @@ an exceeded shared limit without a restart. When a turn's next model
 call would exceed the shared daily or monthly limit and the turn's
 channel can answer approvals (ZeroCode, ACP editors, Telegram inline
 buttons), the turn pauses and asks. Approving lifts that limit for the
-rest of the UTC day or month, for every session of the daemon; denying,
-or no answer within 10 minutes, stops the turn with a budget error as
-before. The override is held in memory, so it ends at the period
-rollover or a daemon restart. Per-agent delegation ceilings are never
+rest of the UTC day or month, for every session of the daemon: a prompt
+waiting in another session closes on its own and that turn continues.
+Denying, or no answer within 10 minutes, stops only that turn with a
+budget error as before. The override is saved in
+`state/cost-overrides.json` beside the ledger, so it survives a daemon
+restart and ends at the period rollover; setting `allow_override = false`
+restores the limit at once. Per-agent delegation ceilings are never
 overridable, and channels that cannot answer approvals keep the hard
 stop. `warn_at_percent` sets the warning threshold; defaults to 80%.
 
