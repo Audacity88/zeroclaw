@@ -63,7 +63,8 @@ pub(crate) use parse_response::{
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
-    ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
+    ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
+    enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
@@ -1657,6 +1658,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Usage describes the completed request, not a prediction of the next
     // hook-selected model, schemas, or prepared messages.
     let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
+    // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
+    let mut budget_warning_sent = false;
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
@@ -2318,7 +2321,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing
         // first would claim the agent is waiting on a model that is never
-        // called.
+        // called. The warning goes first so a turn that is about to be
+        // stopped by the hard limit is never the first sign of trouble.
+        announce_budget_warning(event_tx.as_ref(), &mut budget_warning_sent).await;
         enforce_tool_loop_budget()?;
 
         if strict_tool_parsing
