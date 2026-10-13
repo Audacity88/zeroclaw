@@ -195,8 +195,10 @@ impl ApplicationFeedback {
             Some(Action::Back | Action::ApplicationStatus) => self.details_open = false,
             Some(Action::Up) => self.scroll = self.scroll.saturating_sub(1),
             Some(Action::Down) => self.scroll = self.scroll.saturating_add(1).min(max_scroll),
-            Some(Action::PageUp) => self.scroll = self.scroll.saturating_sub(page),
-            Some(Action::PageDown) => {
+            // PageUp/PageDown are the description-scroll actions in Config
+            // (#11501); inside the details view they page the details.
+            Some(Action::DescriptionUp) => self.scroll = self.scroll.saturating_sub(page),
+            Some(Action::DescriptionDown) => {
                 self.scroll = self.scroll.saturating_add(page).min(max_scroll)
             }
             Some(Action::JumpStart) => self.scroll = 0,
@@ -220,8 +222,8 @@ impl ApplicationFeedback {
                     ("down", &key_label(Action::Down)),
                     ("back", &key_label(Action::Back)),
                     ("details", &key_label(Action::ApplicationStatus)),
-                    ("pageup", &key_label(Action::PageUp)),
-                    ("pagedown", &key_label(Action::PageDown)),
+                    ("pageup", &key_label(Action::DescriptionUp)),
+                    ("pagedown", &key_label(Action::DescriptionDown)),
                 ],
             )),
         ];

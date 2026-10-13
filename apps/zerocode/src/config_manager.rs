@@ -816,7 +816,7 @@ impl App {
                     self.zerocode.bottom_hint(),
                     theme::dim_style(),
                 )),
-                chunks[2],
+                chunks[3],
             );
             return;
         }
