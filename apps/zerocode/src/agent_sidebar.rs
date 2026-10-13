@@ -345,7 +345,14 @@ impl AgentSidebar {
                 ..rows_area
             };
             let focused_here = summary.focused && ctx.active_pane == Some(summary.pane_kind);
-            let row_style = if focused_here {
+            // Rows often share an agent name and colour, so the row being
+            // dragged gets an accent underline: a line marking where it lands.
+            let dragging_this = self.drag.as_ref().is_some_and(|(pane, sid)| {
+                *pane == summary.pane_kind && *sid == summary.session_id
+            });
+            let row_style = if dragging_this {
+                drag_row_style()
+            } else if focused_here {
                 theme::selection_highlight(true, true)
             } else if summary.focused {
                 theme::selection_highlight(false, true)
@@ -412,7 +419,14 @@ impl AgentSidebar {
             };
             let mut spans = vec![
                 Span::styled(status_glyph, status_style(summary.status)),
-                Span::styled(name, theme::body_style()),
+                Span::styled(
+                    name,
+                    if dragging_this {
+                        drag_row_style()
+                    } else {
+                        theme::body_style()
+                    },
+                ),
             ];
             if let Some(label) = tag {
                 spans.push(Span::raw(" ".repeat(pad + 1)));
@@ -431,13 +445,20 @@ impl AgentSidebar {
                     width: close_w,
                     height: 1,
                 };
-                let close_style = if focused_here {
+                let close_style = if dragging_this {
+                    drag_row_style()
+                } else if focused_here {
                     theme::selection_highlight(true, true)
                 } else {
                     theme::dim_style()
                 };
+                let close_glyph = if dragging_this {
+                    "\u{2195}"
+                } else {
+                    "\u{2715}"
+                };
                 frame.render_widget(
-                    Paragraph::new(Span::styled("\u{2715}", close_style)),
+                    Paragraph::new(Span::styled(close_glyph, close_style)).style(close_style),
                     close_rect,
                 );
                 self.row_close_rects.push((
@@ -709,6 +730,11 @@ impl AgentSidebar {
     }
 }
 
+/// The row under a reorder drag: accent, bold, underlined across its width.
+fn drag_row_style() -> Style {
+    theme::accent_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
+}
+
 fn status_style(status: SidebarStatus) -> Style {
     match status {
         SidebarStatus::Ready => theme::status_ready_style(),
@@ -822,6 +848,58 @@ mod tests {
         draw_rows(&mut sidebar, &rows, 10);
         assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-c"]);
         assert!(sidebar.drag.is_none(), "removal ends the captured gesture");
+    }
+
+    #[test]
+    fn session_drag_marks_the_dragged_row_and_clears_on_release() {
+        let mut sidebar = sidebar();
+        let rows = vec![
+            summary("alpha", "a", true),
+            summary("alpha", "b", false),
+            summary("alpha", "c", false),
+        ];
+        let area = Rect::new(0, 0, 30, 8);
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let marked = |term: &ratatui::Terminal<ratatui::backend::TestBackend>, rect: Rect| {
+            let buffer = term.backend().buffer();
+            (rect.x..rect.right()).all(|x| {
+                buffer[(x, rect.y)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+        };
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let rects: Vec<_> = sidebar.row_rects.iter().map(|(_, _, r)| *r).collect();
+        assert!(rects.iter().all(|rect| !marked(&term, *rect)));
+
+        sidebar.handle_mouse(&click(rects[0].x, rects[0].y));
+        drag_to(&mut sidebar, rects[2].x, rects[2].y);
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert_eq!(visible_sessions(&sidebar), ["b", "c", "a"]);
+        assert!(
+            marked(&term, rects[2]),
+            "the dragged row shows where it lands"
+        );
+        assert!(!marked(&term, rects[0]) && !marked(&term, rects[1]));
+        let landed: String = (rects[2].x..rects[2].right())
+            .map(|x| term.backend().buffer()[(x, rects[2].y)].symbol())
+            .collect();
+        assert_eq!(landed.trim_end().chars().last(), Some('\u{2195}'));
+
+        let mut release = click(rects[2].x, rects[2].y);
+        release.kind = MouseEventKind::Up(MouseButton::Left);
+        sidebar.handle_mouse(&release);
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert!(rects.iter().all(|rect| !marked(&term, *rect)));
     }
 
     #[test]
