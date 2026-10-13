@@ -2323,7 +2323,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // first would claim the agent is waiting on a model that is never
         // called. The warning goes first so a turn that is about to be
         // stopped by the hard limit is never the first sign of trouble.
-        announce_budget_warning(event_tx.as_ref(), &mut budget_warning_sent).await;
+        announce_budget_warning(event_tx.as_ref(), &mut budget_warning_sent);
         enforce_tool_loop_budget()?;
 
         if strict_tool_parsing

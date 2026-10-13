@@ -250,7 +250,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 /// and never blocks the turn: an exceeded limit is left to
 /// [`enforce_tool_loop_budget`], and a full or closed channel drops the
 /// notice. No-op when unscoped or when the turn has no event stream.
-pub(crate) async fn announce_budget_warning(
+pub(crate) fn announce_budget_warning(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     sent: &mut bool,
 ) {
@@ -283,13 +283,13 @@ pub(crate) async fn announce_budget_warning(
             })),
         "cost warning threshold reached"
     );
-    let _ = tx
-        .send(zeroclaw_api::agent::TurnEvent::BudgetWarning {
-            current_usd,
-            limit_usd,
-            period,
-        })
-        .await;
+    // `try_send`: a slow event consumer must never hold up the next
+    // provider call for a heads-up notice.
+    let _ = tx.try_send(zeroclaw_api::agent::TurnEvent::BudgetWarning {
+        current_usd,
+        limit_usd,
+        period,
+    });
 }
 
 /// One provider call: streaming via `consume_provider_streaming_response`
@@ -3797,7 +3797,7 @@ mod tests {
             .scope(Some(ctx), async {
                 let mut sent = false;
                 for _ in 0..calls {
-                    announce_budget_warning(Some(&tx), &mut sent).await;
+                    announce_budget_warning(Some(&tx), &mut sent);
                 }
             })
             .await;
@@ -3826,6 +3826,37 @@ mod tests {
             }
             other => panic!("expected BudgetWarning, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_full_event_channel_drops_the_warning_instead_of_waiting() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker_with_spend(&tmp, 8.5),
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(zeroclaw_api::agent::TurnEvent::Chunk {
+            delta: "filler".into(),
+        })
+        .unwrap();
+        // A blocking send would never return here: nobody reads `rx` until
+        // after the call. The timeout turns a hang into a failure.
+        let mut sent = false;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                announce_budget_warning(Some(&tx), &mut sent);
+            }),
+        )
+        .await
+        .expect("announce_budget_warning must not wait on a full channel");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(zeroclaw_api::agent::TurnEvent::Chunk { .. })
+        ));
+        assert!(rx.try_recv().is_err(), "the warning is dropped, not queued");
     }
 
     #[tokio::test]
