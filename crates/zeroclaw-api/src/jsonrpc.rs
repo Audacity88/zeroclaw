@@ -392,6 +392,15 @@ impl RpcOutbound {
         }
     }
 
+    /// Queue a notification without waiting, for callers that cannot
+    /// await (a `Drop`). Dropped silently when the writer is full or gone.
+    pub fn try_notify(&self, method: &'static str, params: Value) {
+        let n = JsonRpcNotification::new(method, params);
+        if let Ok(s) = serde_json::to_string(&n) {
+            let _ = self.writer_tx.try_send(s);
+        }
+    }
+
     /// Send a JSON-RPC request and await the response.
     pub async fn request(
         &self,

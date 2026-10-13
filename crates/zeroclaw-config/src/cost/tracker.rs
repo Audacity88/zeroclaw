@@ -192,21 +192,82 @@ pub struct CostTracker {
     /// Shared limits the operator chose to override for the rest of the
     /// current reporting period (`cost.allow_override`). Shared by every
     /// tracker derived from the same base, so one decision covers every
-    /// session and delegation of the daemon. In memory only: a restart
-    /// clears it.
-    overrides: Arc<Mutex<BudgetOverrides>>,
+    /// session and delegation of the daemon. Persisted next to the ledger,
+    /// so a daemon restart keeps it until the period rolls over.
+    overrides: Arc<OverrideState>,
+}
+
+/// The granted overrides, where they persist, and a signal that fires on
+/// each grant so a turn still waiting on its own prompt can stop asking
+/// once another session's prompt was approved.
+struct OverrideState {
+    current: Mutex<BudgetOverrides>,
+    path: PathBuf,
+    granted: tokio::sync::watch::Sender<BudgetOverrides>,
+}
+
+impl OverrideState {
+    fn load(path: PathBuf) -> Self {
+        let current = BudgetOverrides::load(&path);
+        let (granted, _) = tokio::sync::watch::channel(current);
+        Self {
+            current: Mutex::new(current),
+            path,
+            granted,
+        }
+    }
+
+    fn get(&self) -> BudgetOverrides {
+        *self.current.lock()
+    }
 }
 
 /// Reporting periods whose shared limit the operator overrode. Each entry
 /// names the period it was granted for, so it stops matching on its own at
 /// the next UTC day or month rollover.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BudgetOverrides {
+    #[serde(default)]
     day: Option<NaiveDate>,
+    #[serde(default)]
     month: Option<(i32, u32)>,
 }
 
 impl BudgetOverrides {
+    /// Read the persisted overrides. A missing or unreadable file means
+    /// none: the limit stays enforced, which is the safe failure.
+    fn load(path: &Path) -> Self {
+        match fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                    "ignoring unreadable cost override file; limits stay enforced"
+                );
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Write via a temp file and rename so a crash never leaves a torn file.
+    fn save(self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec(&self)?)
+            .with_context(|| format!("Failed to write {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("Failed to replace {}", path.display()))
+    }
+
+    fn covers(self, period: UsagePeriod, at: ReportingPeriod) -> bool {
+        match period {
+            UsagePeriod::Day => self.covers_day(at),
+            UsagePeriod::Month => self.covers_month(at),
+            UsagePeriod::Session => false,
+        }
+    }
+
     fn covers_day(self, period: ReportingPeriod) -> bool {
         self.day == Some(period.day)
     }
@@ -247,7 +308,7 @@ impl CostTracker {
             session_totals: Arc::new(Mutex::new(HashMap::new())),
             budget_scope: BudgetScope::Shared,
             enforcement_mode: EnforcementMode::Live,
-            overrides: Arc::new(Mutex::new(BudgetOverrides::default())),
+            overrides: Arc::new(OverrideState::load(overrides_path(&storage_path))),
         })
     }
 
@@ -266,13 +327,44 @@ impl CostTracker {
         if !self.config.read().allow_override {
             return false;
         }
-        let mut overrides = self.overrides.lock();
+        let mut overrides = self.overrides.current.lock();
+        let mut next = *overrides;
         match period {
-            UsagePeriod::Day => overrides.day = Some(at.day),
-            UsagePeriod::Month => overrides.month = Some((at.year, at.month)),
+            UsagePeriod::Day => next.day = Some(at.day),
+            UsagePeriod::Month => next.month = Some((at.year, at.month)),
             UsagePeriod::Session => return false,
         }
+        if next == *overrides {
+            return true;
+        }
+        *overrides = next;
+        // Persisting is best effort: the grant already holds for this
+        // daemon, and a failed write only costs a re-ask after a restart.
+        if let Err(error) = next.save(&self.overrides.path) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                "cost override granted but not persisted; a restart will ask again"
+            );
+        }
+        drop(overrides);
+        self.overrides.granted.send_replace(next);
         true
+    }
+
+    /// Resolves once the shared `period` limit is overridden for the
+    /// current reporting period, immediately when it already is. A turn
+    /// waiting on its own override prompt races this so an approval in
+    /// another session releases it.
+    pub async fn wait_for_override(&self, period: UsagePeriod) {
+        let mut rx = self.overrides.granted.subscribe();
+        // The sender lives as long as the tracker, which this borrow holds,
+        // so `wait_for` cannot fail with a closed channel.
+        let _ = rx
+            .wait_for(|overrides| overrides.covers(period, ReportingPeriod::current()))
+            .await;
     }
 
     fn config_snapshot(&self) -> CostConfig {
@@ -508,7 +600,13 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs_at_period(period)?;
         let day = storage.reporting_period().day;
-        let overrides = *self.overrides.lock();
+        // A persisted override only counts while the operator still allows
+        // overrides: turning `allow_override` off restores the limit.
+        let overrides = if config.allow_override {
+            self.overrides.get()
+        } else {
+            BudgetOverrides::default()
+        };
         let day_overridden = overrides.covers_day(period);
         let month_overridden = overrides.covers_month(period);
 
@@ -1048,6 +1146,11 @@ impl CostTracker {
             }
         }
     }
+}
+
+/// The override file sits beside the ledger (`state/cost-overrides.json`).
+fn overrides_path(storage_path: &Path) -> PathBuf {
+    storage_path.with_file_name("cost-overrides.json")
 }
 
 fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
@@ -3794,5 +3897,116 @@ mod tests {
             tracker.check_budget(0.0).unwrap(),
             BudgetCheck::Exceeded { .. }
         ));
+    }
+
+    fn over_daily_limit(dir: &Path, allow_override: bool) -> CostTracker {
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 1.0,
+                monthly_limit_usd: 500.0,
+                allow_override,
+                ..Default::default()
+            },
+            dir,
+        )
+        .unwrap();
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                2.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        tracker
+    }
+
+    /// Dan restarted the app after overriding and was asked again.
+    #[test]
+    fn override_survives_a_restart_and_stops_counting_when_disallowed() {
+        let tmp = TempDir::new().unwrap();
+        let first = over_daily_limit(tmp.path(), true);
+        assert!(first.grant_override(UsagePeriod::Day));
+        drop(first);
+
+        let restarted = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 1.0,
+                monthly_limit_usd: 500.0,
+                allow_override: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            restarted.check_budget(0.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
+
+        // Turning allow_override off restores the limit even with a
+        // persisted grant on disk.
+        restarted.update_config(CostConfig {
+            enabled: true,
+            daily_limit_usd: 1.0,
+            monthly_limit_usd: 500.0,
+            allow_override: false,
+            ..Default::default()
+        });
+        assert!(matches!(
+            restarted.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unreadable_override_file_keeps_the_limit() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = over_daily_limit(tmp.path(), true);
+        drop(tracker);
+        fs::write(
+            tmp.path().join("state").join("cost-overrides.json"),
+            "not json",
+        )
+        .unwrap();
+        let tracker = over_daily_limit(tmp.path(), true);
+        assert!(matches!(
+            tracker.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_for_override_wakes_on_a_grant_from_a_derived_tracker() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = Arc::new(over_daily_limit(tmp.path(), true));
+        let waiter = Arc::clone(&tracker);
+        let waiting =
+            ::zeroclaw_spawn::spawn!(
+                async move { waiter.wait_for_override(UsagePeriod::Day).await }
+            );
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        assert!(tracker.derived_shared().grant_override(UsagePeriod::Day));
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a grant must wake the waiter")
+            .unwrap();
+        // Already granted: resolves at once.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tracker.wait_for_override(UsagePeriod::Day),
+        )
+        .await
+        .unwrap();
     }
 }
