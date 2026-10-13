@@ -1990,6 +1990,9 @@ mod tests {
         config
             .runtime_profiles
             .insert("runtime".to_string(), RuntimeProfileConfig::default());
+        config
+            .runtime_profiles
+            .insert("coder".to_string(), RuntimeProfileConfig::default());
         config.agents.insert(
             "coder".to_string(),
             AliasedAgentConfig {
@@ -2021,6 +2024,27 @@ mod tests {
                 .is_some_and(|error| error.contains("refusing to overwrite")),
             "{:?}",
             result.error
+        );
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), before);
+
+        let runtime_collision = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "agentic": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!runtime_collision.success);
+        assert!(
+            runtime_collision
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("refusing to overwrite")),
+            "{:?}",
+            runtime_collision.error
         );
         assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), before);
 
