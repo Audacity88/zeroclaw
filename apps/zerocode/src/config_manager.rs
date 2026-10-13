@@ -5169,7 +5169,9 @@ impl App {
             let prop = self.fields[*field_idx].path.clone();
             let value = serde_json::json!(selected);
             match self.rpc.config_set(&prop, value).await {
-                Ok(()) => {
+                Ok(revision) => {
+                    self.application_feedback
+                        .record_saved(prop.clone(), revision);
                     self.status_msg = Some(crate::i18n::t_args(
                         "zc-config-status-field-set",
                         &[("prop", &prop)],
