@@ -440,7 +440,6 @@ zc-chat-status-awaiting-input = esperando respuesta
 zc-chat-status-cancelling = cancelando
 zc-chat-session-close-error = No se pudo cerrar la sesión: { $error }
 zc-chat-elicitation-dropped = Se descartó una pregunta del agente antes de poder mostrarla (el cliente se retrasó). Es posible que la pregunta del agente siga esperando; inténtalo de nuevo.
-zc-chat-elicitation-asked = El agente preguntó: { $question }
 zc-chat-elicitation-answered = Respondiste: { $answer }
 zc-chat-elicitation-cancelled = Descartaste la pregunta sin responder.
 zc-chat-elicitation-withdrawn = La pregunta se cerró antes de que respondieras (la vista se recargó). Se le indicó al agente que se canceló.
