@@ -2690,6 +2690,7 @@ pub async fn run(
                     };
                     if session_shortcut_is_available(mode, in_text_input, pane_claims_shortcut) {
                         let sessions = session_summaries_in_sidebar_order(
+                            &sidebar,
                             acp_pane.session_summaries(),
                             chat_pane.session_summaries(),
                         );
@@ -3192,10 +3193,15 @@ fn session_shortcut_is_available(
     !pane_claims_shortcut && (!in_text_input || matches!(mode, Mode::Acp | Mode::Chat))
 }
 
+/// Direct session shortcuts count Code sessions, then Chat sessions, each in
+/// the order the sidebar shows them, so a dragged row keeps its number.
 fn session_summaries_in_sidebar_order(
+    sidebar: &crate::agent_sidebar::AgentSidebar,
     mut acp_sessions: Vec<chat::SidebarSessionSummary>,
-    chat_sessions: Vec<chat::SidebarSessionSummary>,
+    mut chat_sessions: Vec<chat::SidebarSessionSummary>,
 ) -> Vec<chat::SidebarSessionSummary> {
+    sidebar.sort_in_display_order(&mut acp_sessions);
+    sidebar.sort_in_display_order(&mut chat_sessions);
     acp_sessions.extend(chat_sessions);
     acp_sessions
 }
@@ -6162,7 +6168,11 @@ mod tests {
             summary(chat::PaneKind::Acp, "code-2"),
         ];
         let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
-        let sessions = session_summaries_in_sidebar_order(acp, chat);
+        let sessions = session_summaries_in_sidebar_order(
+            &crate::agent_sidebar::AgentSidebar::new(),
+            acp,
+            chat,
+        );
 
         assert_eq!(
             session_shortcut_event(
@@ -6190,6 +6200,71 @@ mod tests {
                 &sessions,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_dragged_sidebar_order() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: session_id.ends_with("-1"),
+            display_ordinal: 1,
+            last_activity: None,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+            summary(chat::PaneKind::Acp, "code-3"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let area = Rect::new(0, 0, 30, 10);
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Acp),
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &acp, &ctx))
+            .unwrap();
+        // Rows start one line inside the panel border.
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        sidebar.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 3));
+        sidebar.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 1));
+        sidebar.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 1));
+        term.draw(|frame| sidebar.draw(frame, area, &acp, &ctx))
+            .unwrap();
+
+        let sessions = session_summaries_in_sidebar_order(&sidebar, acp, chat);
+        let target = |action| {
+            session_shortcut_event(session_shortcut_ordinal(Some(action)).unwrap(), &sessions)
+        };
+        let focus = |pane, id: &str| {
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane,
+                session_id: id.to_string(),
+            })
+        };
+        assert_eq!(
+            target(GlobalAction::FocusSession1),
+            focus(chat::PaneKind::Acp, "code-3")
+        );
+        assert_eq!(
+            target(GlobalAction::FocusSession2),
+            focus(chat::PaneKind::Acp, "code-1")
+        );
+        assert_eq!(
+            target(GlobalAction::FocusSession4),
+            focus(chat::PaneKind::Chat, "chat-1")
         );
     }
 

@@ -178,6 +178,18 @@ impl AgentSidebar {
         self.cancel_drag();
     }
 
+    /// Sort `rows` into the order the user sees in the sidebar. Rows the
+    /// sidebar has not drawn yet keep their pane order after the known ones,
+    /// matching where the next draw appends them.
+    pub(crate) fn sort_in_display_order(&self, rows: &mut [SidebarSessionSummary]) {
+        rows.sort_by_key(|row| {
+            self.row_order
+                .iter()
+                .position(|(pane, sid)| *pane == row.pane_kind && *sid == row.session_id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     pub(crate) fn cancel_drag(&mut self) {
         self.drag = None;
     }
@@ -384,7 +396,14 @@ impl AgentSidebar {
                 ..rows_area
             };
             let focused_here = summary.focused && ctx.active_pane == Some(summary.pane_kind);
-            let row_style = if focused_here {
+            // Rows often share an agent name and colour, so the row being
+            // dragged gets an accent underline: a line marking where it lands.
+            let dragging_this = self.drag.as_ref().is_some_and(|(pane, sid)| {
+                *pane == summary.pane_kind && *sid == summary.session_id
+            });
+            let row_style = if dragging_this {
+                drag_row_style()
+            } else if focused_here {
                 theme::selection_highlight(true, true)
             } else if summary.focused {
                 theme::selection_highlight(false, true)
@@ -426,7 +445,14 @@ impl AgentSidebar {
             };
             let mut spans = vec![
                 Span::styled(status_glyph, status_style(summary.status)),
-                Span::styled(name, theme::body_style()),
+                Span::styled(
+                    name,
+                    if dragging_this {
+                        drag_row_style()
+                    } else {
+                        theme::body_style()
+                    },
+                ),
                 Span::styled(count_label, theme::dim_style()),
             ];
             spans.push(Span::raw(" ".repeat(pad)));
@@ -447,13 +473,20 @@ impl AgentSidebar {
                     width: close_width,
                     height: 1,
                 };
-                let close_style = if focused_here {
+                let close_style = if dragging_this {
+                    drag_row_style()
+                } else if focused_here {
                     theme::selection_highlight(true, true)
                 } else {
                     theme::dim_style()
                 };
+                let close_glyph = if dragging_this {
+                    "\u{2195}"
+                } else {
+                    "\u{2715}"
+                };
                 frame.render_widget(
-                    Paragraph::new(Span::styled("\u{2715}", close_style)),
+                    Paragraph::new(Span::styled(close_glyph, close_style)).style(close_style),
                     close_rect,
                 );
                 self.row_close_rects.push((
@@ -741,6 +774,11 @@ impl AgentSidebar {
     }
 }
 
+/// The row under a reorder drag: accent, bold, underlined across its width.
+fn drag_row_style() -> Style {
+    theme::accent_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
+}
+
 fn status_style(status: SidebarStatus) -> Style {
     match status {
         SidebarStatus::Ready => theme::status_ready_style(),
@@ -912,6 +950,101 @@ mod tests {
         assert_eq!(visible_sessions(&sidebar), ["code-b", "code-a"]);
         draw_rows(&mut sidebar, &rows, 10);
         assert_eq!(visible_sessions(&sidebar), ["chat-b", "chat-c"]);
+    }
+
+    #[test]
+    fn session_drag_marks_the_dragged_row_and_clears_on_release() {
+        let mut sidebar = sidebar();
+        let rows = vec![
+            summary("alpha", "a", true),
+            summary("alpha", "b", false),
+            summary("alpha", "c", false),
+        ];
+        let area = Rect::new(0, 0, 30, 8);
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            connected: true,
+        };
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let marked = |term: &ratatui::Terminal<ratatui::backend::TestBackend>, rect: Rect| {
+            let buffer = term.backend().buffer();
+            (rect.x..rect.right()).all(|x| {
+                buffer[(x, rect.y)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+        };
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let rects: Vec<_> = sidebar.row_rects.iter().map(|(_, _, r)| *r).collect();
+        assert!(rects.iter().all(|rect| !marked(&term, *rect)));
+
+        sidebar.handle_mouse(&click(rects[0].x, rects[0].y));
+        drag_to(&mut sidebar, rects[2].x, rects[2].y);
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert_eq!(visible_sessions(&sidebar), ["b", "c", "a"]);
+        assert!(
+            marked(&term, rects[2]),
+            "the dragged row shows where it lands"
+        );
+        assert!(!marked(&term, rects[0]) && !marked(&term, rects[1]));
+        assert_eq!(
+            rendered_row(term.backend().buffer(), rects[2])
+                .trim_end()
+                .chars()
+                .last(),
+            Some('\u{2195}')
+        );
+
+        let mut release = click(rects[2].x, rects[2].y);
+        release.kind = MouseEventKind::Up(MouseButton::Left);
+        sidebar.handle_mouse(&release);
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert!(rects.iter().all(|rect| !marked(&term, *rect)));
+    }
+
+    #[test]
+    fn display_order_sort_follows_drag_per_pane() {
+        let mut sidebar = sidebar();
+        let code_rows = vec![
+            summary_in_pane("code", "code-a", PaneKind::Acp, true),
+            summary_in_pane("code", "code-b", PaneKind::Acp, false),
+        ];
+        let chat_rows = vec![
+            summary("alpha", "chat-a", true),
+            summary("alpha", "chat-b", false),
+        ];
+        draw_rows_in_pane(&mut sidebar, &code_rows, 10, PaneKind::Acp);
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        let (_, _, last) = sidebar.row_rects[1].clone();
+        sidebar.handle_mouse(&click(first.x, first.y));
+        drag_to(&mut sidebar, last.x, last.y);
+        draw_rows_in_pane(&mut sidebar, &code_rows, 10, PaneKind::Acp);
+        draw_rows(&mut sidebar, &chat_rows, 10);
+
+        let mut code = code_rows.clone();
+        sidebar.sort_in_display_order(&mut code);
+        let ids: Vec<_> = code.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["code-b", "code-a"],
+            "the inactive pane keeps its drag order"
+        );
+        let mut chat = vec![
+            summary("alpha", "chat-new", false),
+            summary("alpha", "chat-b", false),
+            summary("alpha", "chat-a", true),
+        ];
+        sidebar.sort_in_display_order(&mut chat);
+        let ids: Vec<_> = chat.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["chat-a", "chat-b", "chat-new"],
+            "undrawn rows go last"
+        );
     }
 
     #[test]
