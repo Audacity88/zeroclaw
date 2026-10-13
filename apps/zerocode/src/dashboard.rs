@@ -2763,7 +2763,7 @@ fn format_tokens(tokens: u64) -> String {
 /// period-to-date, in UTC. UTC on purpose: the daemon's cost tracker buckets
 /// the Summary's Daily / Monthly totals and enforces `daily_limit_usd` /
 /// `monthly_limit_usd` on UTC days and months, so local-midnight windows here
-/// would show a different "today" on the same screen (#11694).
+/// would show a different "today" on the same screen.
 fn cost_period_windows() -> Vec<(String, String, String)> {
     cost_period_windows_at(chrono::Utc::now())
 }
