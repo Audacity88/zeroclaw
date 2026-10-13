@@ -313,6 +313,9 @@ keyactions! {
         Reset         [Chord::char('d')] => "reset",
         RenameAlias   [Chord::char('e')] => "rename provider alias",
         ApplyTemplate [Chord::char('t')] => "apply template",
+        ApplicationStatus [Chord::char('s')] => "application status",
+        JumpStart [Chord::key(KeyCode::Home)] => "jump to start",
+        JumpEnd [Chord::key(KeyCode::End)] => "jump to end",
     }
 }
 
