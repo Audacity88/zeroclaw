@@ -133,6 +133,55 @@ pub struct PromptContext<'a> {
     /// Resolved from `RuntimeAdapter::shell_profile` so the reported shell
     /// cannot drift from the executed one.
     pub shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// Pre-rendered `IdentitySection` text. A long-lived session renders its
+    /// personality files once and passes the same text every turn, so an edit
+    /// to `AGENTS.md`/`SOUL.md`/... mid-session does not change the system
+    /// prompt (and with it every provider prompt-cache entry hashed behind
+    /// it) for each live session on its next turn. `None` reads the files
+    /// now. See [`render_identity_section`].
+    pub identity_snapshot: Option<&'a str>,
+}
+
+/// Render the `## Project Context` block from the agent workspace's
+/// personality files (or its AIEOS identity). This reads the files from disk
+/// on every call; callers that build a prompt repeatedly for one session
+/// should render once and pass the text through
+/// [`PromptContext::identity_snapshot`].
+pub fn render_identity_section(
+    identity_config: Option<&IdentityConfig>,
+    agent_workspace_dir: &Path,
+    inject_memory: bool,
+) -> String {
+    let mut prompt = String::from("## Project Context\n\n");
+    let mut has_aieos = false;
+    if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+        && let Ok(Some(aieos)) = identity::load_aieos_identity(config, agent_workspace_dir)
+    {
+        let rendered = identity::aieos_to_system_prompt(&aieos);
+        if !rendered.is_empty() {
+            prompt.push_str(&rendered);
+            prompt.push_str("\n\n");
+            has_aieos = true;
+        }
+    }
+
+    if !has_aieos {
+        prompt.push_str(
+            "The following workspace files define your identity, behavior, and context.\n\n",
+        );
+    }
+
+    let profile = if inject_memory {
+        personality::load_personality(agent_workspace_dir)
+    } else {
+        personality::load_personality_files(
+            agent_workspace_dir,
+            &personality::personality_files_without_memory(),
+        )
+    };
+    prompt.push_str(&profile.render());
+    prompt
 }
 
 /// Model-facing Full-autonomy approval contract used by [`SafetySection`].
@@ -321,37 +370,14 @@ impl PromptSection for IdentitySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut prompt = String::from("## Project Context\n\n");
-        let mut has_aieos = false;
-        if let Some(config) = ctx.identity_config
-            && identity::is_aieos_configured(config)
-            && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.agent_workspace_dir)
-        {
-            let rendered = identity::aieos_to_system_prompt(&aieos);
-            if !rendered.is_empty() {
-                prompt.push_str(&rendered);
-                prompt.push_str("\n\n");
-                has_aieos = true;
-            }
+        if let Some(snapshot) = ctx.identity_snapshot {
+            return Ok(snapshot.to_string());
         }
-
-        if !has_aieos {
-            prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
-            );
-        }
-
-        let profile = if ctx.inject_memory {
-            personality::load_personality(ctx.agent_workspace_dir)
-        } else {
-            personality::load_personality_files(
-                ctx.agent_workspace_dir,
-                &personality::personality_files_without_memory(),
-            )
-        };
-        prompt.push_str(&profile.render());
-
-        Ok(prompt)
+        Ok(render_identity_section(
+            ctx.identity_config,
+            ctx.agent_workspace_dir,
+            ctx.inject_memory,
+        ))
     }
 }
 
@@ -764,6 +790,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = IdentitySection.build(&ctx).unwrap();
@@ -846,6 +873,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let section = IdentitySection;
@@ -882,6 +910,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -908,6 +937,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = InteractionSection.build(&ctx).unwrap();
@@ -946,6 +976,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -972,6 +1003,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -998,6 +1030,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1054,6 +1087,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1110,6 +1144,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1155,6 +1190,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1207,6 +1243,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1238,6 +1275,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         // The section is opt-in: it must still render when a builder adds it
@@ -1276,6 +1314,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         // The system prompt is the cached prefix of every long-lived session,
@@ -1340,6 +1379,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1379,6 +1419,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1419,6 +1460,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1451,6 +1493,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1500,6 +1543,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection
@@ -1538,6 +1582,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection
@@ -1572,6 +1617,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1606,6 +1652,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile,
+            identity_snapshot: None,
         }
     }
 
