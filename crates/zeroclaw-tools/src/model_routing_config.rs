@@ -1882,6 +1882,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_agent_isolates_runtime_profile_and_preserves_omitted_limits() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .providers
+            .models
+            .ensure("custom", "route")
+            .unwrap()
+            .model = Some("model".to_string());
+        let original = RuntimeProfileConfig {
+            agentic: false,
+            max_tool_iterations: 600,
+            max_delegation_depth: 8,
+            max_actions_per_hour: 42,
+            max_cost_per_day_cents: 900,
+            ..RuntimeProfileConfig::default()
+        };
+        config
+            .runtime_profiles
+            .insert("unbounded".to_string(), original.clone());
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.route".into(),
+                runtime_profile: "unbounded".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "max_iterations": 700
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let saved = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let coder = saved.agents.get("coder").unwrap();
+        assert_eq!(coder.runtime_profile.as_str(), "coder");
+        let isolated = saved.runtime_profiles.get("coder").unwrap();
+        assert_eq!(isolated.max_tool_iterations, 700);
+        assert_eq!(isolated.max_delegation_depth, 8);
+        assert_eq!(isolated.max_actions_per_hour, 42);
+        assert_eq!(isolated.max_cost_per_day_cents, 900);
+        let unchanged = saved.runtime_profiles.get("unbounded").unwrap();
+        assert_eq!(unchanged.agentic, original.agentic);
+        assert_eq!(unchanged.max_tool_iterations, original.max_tool_iterations);
+        assert_eq!(
+            unchanged.max_delegation_depth,
+            original.max_delegation_depth
+        );
+        assert_eq!(
+            unchanged.max_actions_per_hour,
+            original.max_actions_per_hour
+        );
+        assert_eq!(
+            unchanged.max_cost_per_day_cents,
+            original.max_cost_per_day_cents
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_agent_rejects_profile_collision_or_shared_mutation_without_mutation() {
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
