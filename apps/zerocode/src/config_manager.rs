@@ -10623,7 +10623,7 @@ mod tests {
             manager
                 .application_feedback
                 .summary()
-                .contains(&crate::i18n::t("zc-config-application-unavailable"))
+                .contains("can't confirm")
         );
         manager.tick_application_status(true);
         for _ in 0..16 {
@@ -10632,15 +10632,14 @@ mod tests {
             if manager
                 .application_feedback
                 .summary()
-                .contains(&crate::i18n::t("zc-config-application-applied"))
+                .contains("already been applied")
             {
                 break;
             }
         }
         let summary = manager.application_feedback.summary();
         assert!(summary.contains("a.second"));
-        assert!(summary.contains(&crate::i18n::t("zc-config-application-applied")));
-        assert!(summary.contains(&crate::i18n::t("zc-config-application-reload")));
+        assert!(summary.contains("Open sessions already use it"));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal
@@ -10654,7 +10653,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(output.contains("a.second"));
-        assert!(output.contains(&crate::i18n::t("zc-config-application-applied")));
+        assert!(output.contains("Open sessions already use it"));
         manager.application_feedback.toggle_details();
         terminal
             .draw(|frame| manager.draw_into(frame, frame.area()))
@@ -10677,7 +10676,7 @@ mod tests {
             manager
                 .application_feedback
                 .summary()
-                .contains(&crate::i18n::t("zc-config-application-unavailable"))
+                .contains("can't confirm")
         );
     }
 
