@@ -138,36 +138,53 @@ impl ApplicationFeedback {
     }
 
     pub(crate) fn summary(&self) -> String {
-        let Some((label, _)) = self.saved.as_ref() else {
-            return t_args(
-                "zc-config-application-no-save",
-                &[("key", &key_label(Action::ApplicationStatus))],
-            );
-        };
-        let mut parts = vec![t_args(
-            "zc-config-application-saved",
-            &[("label", &quoted(label))],
-        )];
-        let records = self.visible_records();
-        if records.is_empty() {
-            parts.push(t("zc-config-application-unavailable"));
-        } else {
-            let mut counts = [0usize; 5];
-            for record in &records {
-                counts[outcome_index(record)] += 1;
-            }
-            counts[4] += Self::missing_daemon_paths(&records).len();
-            for (index, count) in counts.into_iter().enumerate() {
-                if count > 0 {
-                    parts.push(format!("{}: {count}", outcome_label(index)));
-                }
-            }
-        }
-        parts.push(t_args(
+        let details = t_args(
             "zc-config-application-details-hint",
             &[("key", &key_label(Action::ApplicationStatus))],
-        ));
-        parts.join("; ")
+        );
+        let Some((label, _)) = self.saved.as_ref() else {
+            return details;
+        };
+        let records = self.visible_records();
+        let mut counts = [0usize; 5];
+        for record in &records {
+            counts[outcome_index(record)] += 1;
+        }
+        counts[4] += Self::missing_daemon_paths(&records).len();
+        // One plain sentence, worst news first. The per-target counts stay in
+        // the details view.
+        let [applied, pending, rejected, reload, unavailable] = counts;
+        let state = if records.is_empty() {
+            t("zc-config-application-state-unknown")
+        } else if rejected > 0 {
+            t("zc-config-application-state-rejected")
+        } else if reload > 0 {
+            let reload_key =
+                crate::keymap::action_key_labels(crate::keymap::GlobalAction::ReloadDaemon)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+            t_args(
+                if applied > 0 {
+                    "zc-config-application-state-reload-partial"
+                } else {
+                    "zc-config-application-state-reload"
+                },
+                &[("key", &reload_key)],
+            )
+        } else if pending > 0 {
+            t("zc-config-application-state-pending")
+        } else if unavailable > 0 && applied > 0 {
+            t("zc-config-application-state-sessions-only")
+        } else if unavailable > 0 {
+            t("zc-config-application-state-unknown")
+        } else {
+            t("zc-config-application-state-applied")
+        };
+        format!(
+            "{} {state} {details}",
+            t_args("zc-config-application-saved", &[("label", &quoted(label))])
+        )
     }
 
     pub(crate) fn toggle_details(&mut self) {
@@ -465,6 +482,33 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn summary_is_one_sentence_with_the_action_and_the_details_key() {
+        let mut feedback = ApplicationFeedback::new();
+        assert_eq!(feedback.summary(), "Press s to view details.");
+        let revision = PublishedConfigRevision {
+            epoch: "epoch".into(),
+            sequence: 7,
+        };
+        feedback.saved = Some(("heartbeat.enabled".into(), Some(revision.clone())));
+        let result: crate::wire::ConfigStatusResult = serde_json::from_value(snapshot(
+            7,
+            vec![record(7, json!({"kind": "daemon"}), "queued_for_reload")],
+        ))
+        .unwrap();
+        feedback.status = result.application;
+        let summary = feedback.summary();
+        assert!(
+            summary.starts_with("Saved \"heartbeat.enabled\". Please reload the daemon ("),
+            "{summary}"
+        );
+        assert!(
+            summary.ends_with(") to apply this change. Press s to view details."),
+            "{summary}"
+        );
+        assert!(!summary.contains(": 1"), "{summary}");
+    }
+
     #[tokio::test]
     async fn exact_save_rejects_later_writer_but_retains_unrelated_revision() {
         let mut peer = Peer::new();
@@ -476,8 +520,8 @@ mod tests {
         )
         .await;
         assert!(feedback.summary().contains("Saved"));
-        assert!(feedback.summary().contains("unavailable"));
-        assert!(!feedback.summary().contains("Applied live"));
+        assert!(feedback.summary().contains("can't confirm"));
+        assert!(!feedback.summary().contains("already been applied"));
         peer.status(
             &mut feedback,
             snapshot(
@@ -489,8 +533,8 @@ mod tests {
             ),
         )
         .await;
-        assert!(feedback.summary().contains("Applied live: 1"));
-        assert!(feedback.summary().contains("Reload required: 1"));
+        assert!(feedback.summary().contains("Open sessions already use it"));
+        assert!(feedback.summary().contains("please reload the daemon"));
     }
 
     #[tokio::test]
@@ -509,9 +553,8 @@ mod tests {
             ),
         )
         .await;
-        assert!(feedback.summary().contains("Applied live: 1"));
-        assert!(feedback.summary().contains("unavailable: 1"));
-        assert!(!feedback.summary().contains("Reload required"));
+        assert!(feedback.summary().contains("can't confirm"));
+        assert!(!feedback.summary().contains("reload"));
         let text = details(&feedback);
         assert!(text.contains("[\"agents\",\"a.b\",\"model\"]"));
         assert!(text.contains("\"s\\n1\""));
@@ -546,13 +589,14 @@ mod tests {
             snapshot(7, vec![record(7, session(1), "pending")]),
         )
         .await;
-        assert!(feedback.summary().contains("Pending: 1"));
+        assert!(feedback.summary().contains("Applying the change"));
         peer.status(
             &mut feedback,
             snapshot(7, vec![record(7, session(1), "applied_live")]),
         )
         .await;
-        assert!(feedback.summary().contains("Applied live: 1"));
+        assert!(feedback.summary().contains("Open sessions already use it"));
+        assert!(!feedback.summary().contains("already been applied"));
         feedback.last_poll = None;
         feedback.tick(&peer.client);
         let id = peer.request("config/status").await;
@@ -574,20 +618,20 @@ mod tests {
             json!({"application": "unsupported"}),
         ] {
             peer.status(&mut feedback, value).await;
-            assert!(!feedback.summary().contains("Applied live"));
+            assert!(!feedback.summary().contains("already been applied"));
         }
         let mut replacement = snapshot(7, vec![record(7, session(1), "applied_live")]);
         replacement["application"]["published_revision"]["epoch"] = json!("replacement");
         peer.status(&mut feedback, replacement).await;
-        assert!(!feedback.summary().contains("Applied live"));
+        assert!(!feedback.summary().contains("already been applied"));
         peer.save(&mut feedback, None).await;
         peer.status(
             &mut feedback,
             snapshot(7, vec![record(7, session(1), "applied_live")]),
         )
         .await;
-        assert!(feedback.summary().contains("unavailable"));
-        assert!(!feedback.summary().contains("Applied live"));
+        assert!(feedback.summary().contains("can't confirm"));
+        assert!(!feedback.summary().contains("already been applied"));
     }
 
     #[tokio::test]
@@ -606,16 +650,16 @@ mod tests {
             None,
         );
         assert!(feedback.status.is_none());
-        assert!(!feedback.summary().contains("Applied live"));
+        assert!(!feedback.summary().contains("already been applied"));
         peer.status(
             &mut feedback,
             snapshot(8, vec![record(8, session(1), "pending")]),
         )
         .await;
-        assert!(feedback.summary().contains("Pending: 1"));
+        assert!(feedback.summary().contains("Applying the change"));
         feedback.deactivate();
         assert!(feedback.summary().contains("Saved"));
-        assert!(feedback.summary().contains("unavailable"));
+        assert!(feedback.summary().contains("can't confirm"));
         assert!(feedback.receiver.is_none());
     }
 
@@ -632,8 +676,8 @@ mod tests {
                 json!("future_private_detail")
             };
             peer.status(&mut feedback, snapshot(7, vec![row])).await;
-            assert!(feedback.summary().contains("unavailable"));
-            assert!(!feedback.summary().contains("Applied live"));
+            assert!(feedback.summary().contains("can't confirm"));
+            assert!(!feedback.summary().contains("already been applied"));
             assert!(!details(&feedback).contains("future_private_detail"));
         }
         let mut whole_config = record(7, json!({"kind": "daemon"}), "queued_for_reload");
@@ -641,8 +685,8 @@ mod tests {
         whole_config["reason"] = json!("change_scope_unavailable");
         peer.status(&mut feedback, snapshot(7, vec![whole_config]))
             .await;
-        assert!(feedback.summary().contains("Reload required: 1"));
-        assert!(!feedback.summary().contains("Applied live"));
+        assert!(feedback.summary().contains("Please reload the daemon"));
+        assert!(!feedback.summary().contains("already been applied"));
         assert!(details(&feedback).contains("Whole configuration"));
     }
 
@@ -658,7 +702,7 @@ mod tests {
         );
         value["application"]["truncated"] = json!(true);
         peer.status(&mut feedback, value).await;
-        assert!(!feedback.summary().contains("Applied live"));
+        assert!(!feedback.summary().contains("already been applied"));
         assert!(details(&feedback).contains("Observed application status"));
         assert!(details(&feedback).contains("Record limit: 512"));
         assert!(details(&feedback).contains("evicted records"));
