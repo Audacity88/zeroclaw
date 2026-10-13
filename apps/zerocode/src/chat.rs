@@ -4934,6 +4934,11 @@ impl Chat {
                     self.note_session_replaced(&old_sid);
                     return false;
                 }
+                InputBarAction::ReloadContext => {
+                    let rpc = self.rpc.clone();
+                    Self::reload_session_context(&rpc, state).await;
+                    return false;
+                }
                 InputBarAction::ChangeDirectory => {
                     self.begin_change_directory();
                     return false;
@@ -5580,6 +5585,26 @@ impl Chat {
             ThinkingControl::Display => ModelPickerOverlay::ThinkingDisplay(picker),
         };
         state.info_message = None;
+        state.mark_dirty_full();
+    }
+
+    /// `/reload-context`: the daemon re-reads this session's personality
+    /// files. A change costs one uncached request, so say which happened.
+    async fn reload_session_context(rpc: &RpcClient, state: &mut ChatState) {
+        let message = match rpc.session_reload_context(&state.session_id).await {
+            Ok(result) if result.changed => {
+                crate::widgets::InfoMessage::note(crate::i18n::t("zc-reload-context-changed"))
+            }
+            Ok(result) if result.live => {
+                crate::widgets::InfoMessage::note(crate::i18n::t("zc-reload-context-unchanged"))
+            }
+            Ok(_) => crate::widgets::InfoMessage::note(crate::i18n::t("zc-reload-context-idle")),
+            Err(e) => crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                "zc-reload-context-failed",
+                &[("error", &e.to_string())],
+            )),
+        };
+        state.info_message = Some(message);
         state.mark_dirty_full();
     }
 
