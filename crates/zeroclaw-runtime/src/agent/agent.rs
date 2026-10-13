@@ -1639,15 +1639,21 @@ impl Agent {
         messages: &[ConversationMessage],
         breadcrumb: bool,
     ) -> bool {
-        let max_turns = self
-            .structured_history_turn_limit_resolver
+        let (max_turns, low_water) = self
+            .structured_history_trim_policy_resolver
             .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
+            .map_or(
+                (
+                    self.config.resolved.max_history_messages,
+                    self.config.resolved.history_trim_low_water,
+                ),
+                |resolve| resolve(),
+            );
+        let target_turns = crate::agent::history_trim::history_trim_target(max_turns, low_water);
         !crate::agent::history_trim::trim_conversation_to_recent_turns(
             messages.to_vec(),
             max_turns,
+            target_turns,
             breadcrumb,
         )
         .trimmed
