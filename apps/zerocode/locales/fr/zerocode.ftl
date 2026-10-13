@@ -430,7 +430,6 @@ zc-chat-status-awaiting-input = en attente d’une réponse
 zc-chat-status-cancelling = annulation
 zc-chat-session-close-error = Échec de la fermeture de la session : { $error }
 zc-chat-elicitation-dropped = Une question de l'agent a été abandonnée avant de pouvoir être affichée (le client a pris du retard). La question de l'agent est peut-être toujours en attente ; réessayez.
-zc-chat-elicitation-asked = L'agent a demandé : { $question }
 zc-chat-elicitation-answered = Vous avez répondu : { $answer }
 zc-chat-elicitation-cancelled = Vous avez fermé la question sans répondre.
 zc-chat-elicitation-withdrawn = La question s'est fermée avant votre réponse (la vue a été rechargée). L'agent a été informé qu'elle était annulée.
