@@ -8838,9 +8838,20 @@ impl RpcDispatcher {
     /// cached prefix is never swapped out from under it.
     async fn handle_session_reload_context(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
-        self.authorize_session_owner(&req.session_id, Method::SessionReloadContext)
+        let authorized = self
+            .authorize_session_owner(&req.session_id, Method::SessionReloadContext)
             .await?;
         let expected_generation = self.capture_session_access(&req.session_id).await?;
+        // Fence on the incarnation that was authorized, as `session/configure`
+        // does: a same-ID replacement installed between the ownership check
+        // and the capture above must not be reloaded on this caller's behalf.
+        if authorized
+            .as_ref()
+            .and_then(|record| record.live_generation)
+            .is_some_and(|generation| Some(generation) != expected_generation)
+        {
+            return Err(self.stale_session_incarnation_error());
+        }
         let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await else {
             return to_result(SessionReloadContextResult {
                 session_id: req.session_id,
@@ -8849,6 +8860,8 @@ impl RpcDispatcher {
             });
         };
         self.ensure_session_incarnation(&req.session_id, expected_generation)
+            .await?;
+        self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
             .await?;
         let changed = {
             let mut agent = agent.try_lock().map_err(|_| {
