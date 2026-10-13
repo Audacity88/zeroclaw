@@ -131,6 +131,18 @@ impl AgentSidebar {
         self.cancel_drag();
     }
 
+    /// Sort `rows` into the order the user sees in the sidebar. Rows the
+    /// sidebar has not drawn yet keep their pane order after the known ones,
+    /// matching where the next draw appends them.
+    pub(crate) fn sort_in_display_order(&self, rows: &mut [SidebarSessionSummary]) {
+        rows.sort_by_key(|row| {
+            self.row_order
+                .iter()
+                .position(|(pane, sid)| *pane == row.pane_kind && *sid == row.session_id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     pub(crate) fn cancel_drag(&mut self) {
         self.drag = None;
     }
@@ -900,6 +912,27 @@ mod tests {
         term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
             .unwrap();
         assert!(rects.iter().all(|rect| !marked(&term, *rect)));
+    }
+
+    #[test]
+    fn display_order_sort_follows_drag_and_puts_undrawn_rows_last() {
+        let mut sidebar = sidebar();
+        let rows = vec![summary("alpha", "a", true), summary("alpha", "b", false)];
+        draw_rows(&mut sidebar, &rows, 10);
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        let (_, _, last) = sidebar.row_rects[1].clone();
+        sidebar.handle_mouse(&click(first.x, first.y));
+        drag_to(&mut sidebar, last.x, last.y);
+        draw_rows(&mut sidebar, &rows, 10);
+
+        let mut sorted = vec![
+            summary("alpha", "new", false),
+            summary("alpha", "a", true),
+            summary("alpha", "b", false),
+        ];
+        sidebar.sort_in_display_order(&mut sorted);
+        let ids: Vec<_> = sorted.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(ids, ["b", "a", "new"]);
     }
 
     #[test]
