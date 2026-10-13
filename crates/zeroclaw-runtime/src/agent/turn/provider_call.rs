@@ -362,6 +362,53 @@ async fn ask_budget_override(
     })
 }
 
+/// Surface a `cost.warn_at_percent` crossing to the turn's event stream.
+/// Sends at most one [`TurnEvent::BudgetWarning`] per turn (`*sent` latches)
+/// and never blocks the turn: an exceeded limit is left to
+/// [`enforce_tool_loop_budget`], and a full or closed channel drops the
+/// notice. No-op when unscoped or when the turn has no event stream.
+pub(crate) async fn announce_budget_warning(
+    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    sent: &mut bool,
+) {
+    if *sent {
+        return;
+    }
+    let Some(tx) = event_tx else { return };
+    let Some(BudgetCheck::Warning {
+        current_usd,
+        limit_usd,
+        period,
+    }) = check_tool_loop_budget()
+    else {
+        return;
+    };
+    let period = match period {
+        UsagePeriod::Day => zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        UsagePeriod::Month => zeroclaw_api::agent::BudgetWarningPeriod::Month,
+        UsagePeriod::Session => return,
+    };
+    *sent = true;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_attrs(::serde_json::json!({
+                "current_usd": current_usd,
+                "limit_usd": limit_usd,
+                "period": format!("{period:?}"),
+            })),
+        "cost warning threshold reached"
+    );
+    let _ = tx
+        .send(zeroclaw_api::agent::TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        })
+        .await;
+}
+
 /// One provider call: streaming via `consume_provider_streaming_response`
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
@@ -3842,6 +3889,103 @@ mod tests {
                 .expect("stop must survive the anyhow hop")
                 .code,
             TurnStopCode::StepTimeout
+        );
+    }
+
+    /// A tracker with `spent_usd` already recorded against a $10 daily limit
+    /// and the default 80% warning threshold.
+    fn tracker_with_spend(
+        tmp: &tempfile::TempDir,
+        spent_usd: f64,
+    ) -> std::sync::Arc<crate::cost::CostTracker> {
+        let tracker = crate::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: true,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 1_000.0,
+                warn_at_percent: 80,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        // 1M input tokens at `spent_usd` per million = `spent_usd`.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                spent_usd,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        std::sync::Arc::new(tracker)
+    }
+
+    /// Run `announce_budget_warning` `calls` times inside a cost scope for
+    /// `tracker` and return every event it sent.
+    async fn budget_warnings_for(
+        tracker: std::sync::Arc<crate::cost::CostTracker>,
+        calls: usize,
+    ) -> Vec<zeroclaw_api::agent::TurnEvent> {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker,
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                let mut sent = false;
+                for _ in 0..calls {
+                    announce_budget_warning(Some(&tx), &mut sent).await;
+                }
+            })
+            .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn spend_past_the_warning_threshold_announces_once_per_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = budget_warnings_for(tracker_with_spend(&tmp, 8.5), 3).await;
+        assert_eq!(events.len(), 1, "one warning per turn, got {events:?}");
+        match &events[0] {
+            zeroclaw_api::agent::TurnEvent::BudgetWarning {
+                current_usd,
+                limit_usd,
+                period,
+            } => {
+                assert!((current_usd - 8.5).abs() < 1e-9, "{current_usd}");
+                assert!((limit_usd - 10.0).abs() < 1e-9, "{limit_usd}");
+                assert_eq!(*period, zeroclaw_api::agent::BudgetWarningPeriod::Day);
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spend_below_the_threshold_or_past_the_limit_announces_nothing() {
+        let below = tempfile::tempdir().unwrap();
+        assert!(
+            budget_warnings_for(tracker_with_spend(&below, 7.5), 1)
+                .await
+                .is_empty()
+        );
+        // Past the hard limit the stop belongs to `enforce_tool_loop_budget`;
+        // a warning there would be noise next to the failed turn.
+        let over = tempfile::tempdir().unwrap();
+        assert!(
+            budget_warnings_for(tracker_with_spend(&over, 10.5), 1)
+                .await
+                .is_empty()
         );
     }
 
