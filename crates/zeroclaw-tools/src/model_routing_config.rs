@@ -1041,21 +1041,24 @@ impl ModelRoutingConfigTool {
             let current = stored_current.trim();
             if risk_update_requested {
                 let mut profile = cfg.risk_profiles.get(current).cloned().ok_or_else(|| {
-                    anyhow::Error::msg(format!(
-                        "agent `{name}` references missing risk profile `{current}`"
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-missing-risk-profile",
+                        &[("agent", &name), ("profile", current)],
                     ))
                 })?;
 
                 if current == name {
                     if Self::risk_profile_is_shared(&cfg, current, &name) {
-                        anyhow::bail!(
-                            "risk profile `{current}` is shared by another agent; refusing an agent-scoped mutation"
-                        );
+                        anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-error-shared-risk-profile",
+                            &[("profile", current)],
+                        ));
                     }
                 } else if cfg.risk_profiles.contains_key(&name) {
-                    anyhow::bail!(
-                        "risk profile `{name}` already exists; refusing to overwrite it while isolating agent `{name}`"
-                    );
+                    anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-risk-profile-collision",
+                        &[("agent", &name), ("profile", &name)],
+                    ));
                 } else {
                     risk_profile_is_new = true;
                 }
@@ -1085,9 +1088,10 @@ impl ModelRoutingConfigTool {
         } else {
             let profile_exists = cfg.risk_profiles.contains_key(&name);
             if risk_update_requested && Self::risk_profile_is_shared(&cfg, &name, &name) {
-                anyhow::bail!(
-                    "risk profile `{name}` is shared by another agent; refusing an agent-scoped mutation"
-                );
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-shared-risk-profile",
+                    &[("profile", &name)],
+                ));
             }
 
             if risk_update_requested || !profile_exists {
@@ -1122,21 +1126,24 @@ impl ModelRoutingConfigTool {
             let current = stored_current.trim();
             if runtime_update_requested {
                 let mut profile = cfg.runtime_profiles.get(current).cloned().ok_or_else(|| {
-                    anyhow::Error::msg(format!(
-                        "agent `{name}` references missing runtime profile `{current}`"
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-missing-runtime-profile",
+                        &[("agent", &name), ("profile", current)],
                     ))
                 })?;
 
                 if current == name {
                     if Self::runtime_profile_is_shared(&cfg, current, &name) {
-                        anyhow::bail!(
-                            "runtime profile `{current}` is shared by another agent; refusing an agent-scoped mutation"
-                        );
+                        anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-error-shared-runtime-profile",
+                            &[("profile", current)],
+                        ));
                     }
                 } else if cfg.runtime_profiles.contains_key(&name) {
-                    anyhow::bail!(
-                        "runtime profile `{name}` already exists; refusing to overwrite it while isolating agent `{name}`"
-                    );
+                    anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-runtime-profile-collision",
+                        &[("agent", &name), ("profile", &name)],
+                    ));
                 } else {
                     runtime_profile_is_new = true;
                 }
@@ -1162,9 +1169,10 @@ impl ModelRoutingConfigTool {
         } else {
             let profile_exists = cfg.runtime_profiles.contains_key(&name);
             if runtime_update_requested && Self::runtime_profile_is_shared(&cfg, &name, &name) {
-                anyhow::bail!(
-                    "runtime profile `{name}` is shared by another agent; refusing an agent-scoped mutation"
-                );
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-shared-runtime-profile",
+                    &[("profile", &name)],
+                ));
             }
 
             if runtime_update_requested || !profile_exists {
