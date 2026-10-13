@@ -10997,9 +10997,14 @@ impl ChatState {
         let position = if self.pinned_to_bottom {
             self.entries.len().saturating_sub(1)
         } else {
-            self.cached_screen_ranges
-                .get(visible.start)
-                .map_or(self.cached_render_start, |(idx, _, _, _)| *idx)
+            match self.cached_screen_ranges.get(visible.start) {
+                Some((idx, _, _, _)) => *idx,
+                // The viewport sits below the cached rows, inside a live reply.
+                None if !self.cached_screen_ranges.is_empty() => {
+                    self.render_window_end().saturating_sub(1)
+                }
+                None => self.cached_render_start,
+            }
         };
         ScrollbarState::new(self.entries.len())
             .position(position)
@@ -15543,6 +15548,41 @@ mod tests {
         };
         assert_eq!(state.scrollbar_state().get_position(), 0);
         assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 0));
+    }
+
+    #[test]
+    fn scrollbar_stays_at_the_newest_entry_when_scrolled_inside_a_live_reply() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        s.entries = (0..2_200)
+            .map(|idx| ChatEntry::AgentMessage(Arc::<str>::from(format!("entry {idx}"))))
+            .collect();
+        s.streaming_text = "overlay row ".repeat(500);
+        s.pinned_to_bottom = true;
+        s.mark_dirty_full();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        let mut draw = |s: &mut ChatState| {
+            terminal
+                .draw(|frame| {
+                    render_conversation(frame, s, area);
+                })
+                .expect("draw conversation");
+        };
+        draw(&mut s);
+        assert_eq!(s.render_window_end(), 2_200);
+        assert_eq!(s.scrollbar_state().get_position(), 2_199);
+
+        s.scroll_up(1);
+        draw(&mut s);
+        assert!(!s.pinned_to_bottom);
+        assert!(
+            s.scroll_offset >= s.cached_total_rows,
+            "viewport must still be inside the live reply"
+        );
+        assert_eq!(s.scrollbar_state().get_position(), 2_199);
     }
 
     #[test]
