@@ -1698,7 +1698,14 @@ mod tests {
             output["agents"]["coder"]["model_provider"],
             json!("openai.coder")
         );
+        assert_eq!(output["agents"]["coder"]["risk_profile"], json!("coder"));
+        assert_eq!(output["agents"]["coder"]["runtime_profile"], json!("coder"));
         assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
+        assert_eq!(output["agents"]["coder"]["max_tool_iterations"], json!(6));
+        assert_eq!(
+            output["agents"]["coder"]["allowed_tools"],
+            json!(["file_read", "file_write", "shell"])
+        );
 
         let remove = tool
             .execute(json!({
