@@ -1286,17 +1286,15 @@ impl Tool for ModelRoutingConfigTool {
                 "delegates": delegates_schema
             },
             "additionalProperties": false,
-            "allOf": [{
-                // The selector is required so omitted action keeps the read-only get default.
-                "if": {
-                    "required": ["action"],
-                    "properties": {"action": {"enum": ["upsert_scenario"]}}
-                },
-                "then": {
-                    "required": SCENARIO_REQUIRED_STRING_FIELDS,
-                    "properties": scenario_string_properties
-                }
-            }]
+            // The selector is required so omitted action keeps the read-only get default.
+            "if": {
+                "required": ["action"],
+                "properties": {"action": {"enum": ["upsert_scenario"]}}
+            },
+            "then": {
+                "required": SCENARIO_REQUIRED_STRING_FIELDS,
+                "properties": scenario_string_properties
+            }
         })
     }
 
@@ -1390,25 +1388,29 @@ mod tests {
     fn scenario_requirements_reach_cleaned_schema_and_tool_prompt() {
         let tool = ModelRoutingConfigTool::new(Arc::new(Config::default()), test_security());
         let spec = tool.spec();
-        let cleaned =
+        let openai =
             zeroclaw_api::schema::SchemaCleanr::clean_for_openai((*spec.parameters).clone());
+        let anthropic =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic((*spec.parameters).clone());
 
-        for schema in [spec.parameters.as_ref(), &cleaned] {
+        for schema in [spec.parameters.as_ref(), &openai, &anthropic] {
             assert_eq!(schema["type"], "object");
             assert!(schema.get("required").is_none());
-            let condition = &schema["allOf"][0];
-            assert_eq!(condition["if"]["required"], json!(["action"]));
+            for composition in ["allOf", "anyOf", "oneOf"] {
+                assert!(schema.get(composition).is_none());
+            }
+            assert_eq!(schema["if"]["required"], json!(["action"]));
             assert_eq!(
-                condition["if"]["properties"]["action"]["enum"],
+                schema["if"]["properties"]["action"]["enum"],
                 json!(["upsert_scenario"])
             );
             assert_eq!(
-                condition["then"]["required"],
+                schema["then"]["required"],
                 json!(["hint", "model_provider", "model"])
             );
             for field in ["hint", "model_provider", "model"] {
                 assert_eq!(
-                    condition["then"]["properties"][field],
+                    schema["then"]["properties"][field],
                     json!({"type": "string", "minLength": 1, "pattern": "\\S"})
                 );
             }
