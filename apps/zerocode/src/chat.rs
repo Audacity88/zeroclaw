@@ -11468,6 +11468,7 @@ impl ChatState {
             | SessionUpdate::ToolCall { session_id, .. }
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
+            | SessionUpdate::ApprovalWithdrawn { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
@@ -11573,6 +11574,20 @@ impl ChatState {
                 });
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::WaitingForApproval;
+                }
+            }
+            SessionUpdate::ApprovalWithdrawn { request_id, .. } => {
+                // Only the prompt it names: a newer prompt stays up.
+                if self
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|pa| pa.request_id == request_id)
+                {
+                    self.pending_approval = None;
+                    if self.turn_status == TurnStatus::WaitingForApproval {
+                        self.turn_status = TurnStatus::Working;
+                    }
+                    self.mark_dirty_full();
                 }
             }
             SessionUpdate::ContextUsage {
@@ -26549,6 +26564,22 @@ mod tests {
         let pa = s.pending_approval().unwrap();
         assert_eq!(pa.request_id, "req-1");
         assert_eq!(pa.tool_name, "shell");
+    }
+
+    #[test]
+    fn approval_withdrawn_clears_only_the_named_prompt() {
+        let mut s = state();
+        s.apply_update(cost_limit_request());
+        s.apply_update(SessionUpdate::ApprovalWithdrawn {
+            session_id: "sess-1".to_string(),
+            request_id: "req-other".to_string(),
+        });
+        assert!(s.pending_approval().is_some(), "a different id is ignored");
+        s.apply_update(SessionUpdate::ApprovalWithdrawn {
+            session_id: "sess-1".to_string(),
+            request_id: "req-cost".to_string(),
+        });
+        assert!(s.pending_approval().is_none());
     }
 
     #[test]

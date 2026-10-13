@@ -14,6 +14,7 @@ use super::stream_consume::{
 };
 use crate::agent::cost::{
     check_tool_loop_budget, grant_tool_loop_budget_override, tool_loop_budget_override_allowed,
+    tool_loop_budget_tracker,
 };
 use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
@@ -331,14 +332,22 @@ async fn ask_budget_override(
     super::approval_gate::flush_narration_before_prompt(ctx, channel).await;
     let ask =
         channel.request_approval_attributed_with_timeout(recipient, &request, BUDGET_OVERRIDE_WAIT);
-    let answer = if let Some(cancel) = ctx.cancellation_token {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(ToolLoopCancelled.into()),
-            answer = ask => answer,
+    // Another session's prompt for the same limit may be approved first.
+    // The grant is daemon-wide, so stop waiting on this prompt then:
+    // dropping `ask` withdraws it from this session's client.
+    let granted_elsewhere = async {
+        match tool_loop_budget_tracker() {
+            Some(tracker) => tracker.wait_for_override(period).await,
+            None => std::future::pending().await,
         }
-    } else {
-        ask.await
+    };
+    let never_cancelled = tokio_util::sync::CancellationToken::new();
+    let cancel = ctx.cancellation_token.unwrap_or(&never_cancelled);
+    let answer = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(ToolLoopCancelled.into()),
+        () = granted_elsewhere => return Ok(true),
+        answer = ask => answer,
     };
     Ok(match answer {
         Ok(Some(attributed)) => {
@@ -4349,6 +4358,92 @@ mod budget_override_tests {
             assert!(is_budget_stop(&result), "{result:?}");
             assert_eq!(channel.asked.lock().len(), 1);
         }
+    }
+
+    /// A channel whose prompt never gets an answer, recording whether its
+    /// request future was dropped (the prompt withdrawn).
+    struct UnansweredChannel {
+        asked: std::sync::atomic::AtomicBool,
+        withdrawn: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Attributable for UnansweredChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "unanswered"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for UnansweredChannel {
+        fn name(&self) -> &str {
+            "unanswered"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval_attributed_with_timeout(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+            _timeout: Duration,
+        ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+            let _guard = SetOnDrop(Arc::clone(&self.withdrawn));
+            self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    /// Dan saw the prompt in two sessions; approving one left the other
+    /// waiting. A grant from anywhere must release every waiting turn.
+    #[tokio::test]
+    async fn approval_in_another_session_releases_a_waiting_prompt() {
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tracker = over_limit_tracker(&tmp, true);
+        let channel = UnansweredChannel {
+            asked: std::sync::atomic::AtomicBool::new(false),
+            withdrawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (observer, pacing) = (NoopObserver, PacingConfig::default());
+        let turn_ctx = ctx(&observer, &pacing, Some(&channel));
+        let waiting = gate(&tracker, &turn_ctx);
+        tokio::pin!(waiting);
+
+        // Drive the gate until its prompt is up and blocked.
+        tokio::select! {
+            biased;
+            result = &mut waiting => panic!("gate finished without an answer: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(channel.asked.load(Ordering::SeqCst));
+
+        // The other session's operator approves.
+        assert!(tracker.grant_override(UsagePeriod::Day));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiting turn must be released by the other grant");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            channel.withdrawn.load(Ordering::SeqCst),
+            "the released prompt's request must be dropped so the client withdraws it"
+        );
     }
 
     #[tokio::test]

@@ -25,6 +25,30 @@ use super::context::ApprovalPendingMap;
 
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Sends `approval_withdrawn` for a prompt the client is still showing
+/// when its request ends without an operator answer.
+struct WithdrawOnDrop {
+    rpc: Arc<RpcOutbound>,
+    session_id: String,
+    request_id: String,
+    armed: bool,
+}
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.rpc.try_notify(
+                "session/update",
+                json!({
+                    "type": "approval_withdrawn",
+                    "session_id": self.session_id,
+                    "request_id": self.request_id,
+                }),
+            );
+        }
+    }
+}
+
 pub struct RpcApprovalChannel {
     name: String,
     session_id: String,
@@ -209,11 +233,22 @@ impl RpcApprovalChannel {
             )
             .await;
 
+        // Until the operator answers, leaving this function for any reason
+        // (timeout, or the caller dropping the future because the decision
+        // came from elsewhere) tells the client to take the prompt down.
+        let mut withdraw = WithdrawOnDrop {
+            rpc: Arc::clone(&self.rpc),
+            session_id: self.session_id.clone(),
+            request_id: request_id.clone(),
+            armed: true,
+        };
+
         // Only the answered arm is an operator decision. The other two deny
         // because the client went away or never answered, and say so.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
                 pending_request.disarm();
+                withdraw.armed = false;
                 Ok(Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
                 ))
@@ -481,6 +516,37 @@ mod tests {
         assert!(
             !pending.contains(&request_id),
             "dropping the approval future must remove the pending request"
+        );
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["type"], "approval_withdrawn");
+        assert_eq!(v["params"]["request_id"], request_id.as_str());
+        assert_eq!(v["params"]["session_id"], "sess-1");
+    }
+
+    #[tokio::test]
+    async fn answered_request_is_not_withdrawn() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))
+                .await
+        });
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        assert!(pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve));
+        task.await.unwrap().unwrap();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "an answered prompt must not be withdrawn"
         );
     }
 

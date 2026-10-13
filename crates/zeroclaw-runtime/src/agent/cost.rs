@@ -658,6 +658,12 @@ fn scoped_tool_loop_tracker() -> Option<Arc<CostTracker>> {
         .and_then(|ctx| ctx.tracker)
 }
 
+/// The scoped tracker, for a turn that waits on an override granted by
+/// another session's prompt.
+pub fn tool_loop_budget_tracker() -> Option<Arc<CostTracker>> {
+    scoped_tool_loop_tracker()
+}
+
 /// Whether the operator may override an exceeded shared limit for this turn
 /// (`cost.allow_override` in the live config). `false` when unscoped.
 pub fn tool_loop_budget_override_allowed() -> bool {
