@@ -29733,7 +29733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agents_status_runtime_profile_tracks_config_and_omits_unresolved_profiles() {
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
         use zeroclaw_config::schema::RuntimeProfileConfig;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -29742,7 +29742,7 @@ mod tests {
             .runtime_profiles
             .insert("coding".into(), RuntimeProfileConfig::default());
         config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
-        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
 
         let response = dispatcher.handle_agents_status().await.unwrap();
         let agent = response["agents"]
@@ -29753,15 +29753,8 @@ mod tests {
             .unwrap();
         assert_eq!(agent["runtime_profile"], "coding");
 
-        // The projection follows the daemon's current config, not the last poll.
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .unwrap()
-            .runtime_profile = "missing".into();
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
         let response = dispatcher.handle_agents_status().await.unwrap();
         let agent = response["agents"]
             .as_array()
