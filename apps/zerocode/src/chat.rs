@@ -474,6 +474,31 @@ pub(crate) struct ResumeEntry {
     turn_failed: bool,
 }
 
+impl ResumeEntry {
+    /// An entry read back from the saved open-session list at launch. Only
+    /// identity, order and focus survive a zerocode restart; the queue and
+    /// draft were never written, and no turn of this process was in flight.
+    pub(crate) fn saved(
+        session_id: String,
+        agent_alias: String,
+        was_focused: bool,
+        display_ordinal: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            agent_alias,
+            message_count: 0,
+            was_focused,
+            display_ordinal,
+            last_activity: None,
+            queue: ReconnectQueueState::default(),
+            interrupted: false,
+            recovery_required: false,
+            turn_failed: false,
+        }
+    }
+}
+
 /// The queue owns both its pause and the explanation shown to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuePauseReason {
@@ -27458,6 +27483,45 @@ mod tests {
         // it to wherever this zerocode process was launched.
         assert!(request["params"]["cwd"].is_null());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn saved_open_sessions_reattach_by_id_at_launch() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || panic!("a restored session must not read the launch directory");
+        chat.set_resume_sessions(vec![
+            ResumeEntry::saved("sess-a".into(), "alpha".into(), false, 1),
+            ResumeEntry::saved("sess-b".into(), "alpha".into(), true, 2),
+        ]);
+        let task = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/list").await;
+        assert_eq!(request["method"], method::AGENTS_LIST);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "agents": [
+                {"alias": "alpha", "enabled": true},
+                {"alias": "beta", "enabled": true}
+            ]}),
+        );
+        // The focused saved session reattaches first, by id, with no cwd and
+        // no session picker in between.
+        let request = next_rpc_request(&mut rx, "the focused saved session reattaches").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-b");
+        assert!(request["params"]["cwd"].is_null());
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

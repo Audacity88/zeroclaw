@@ -867,6 +867,25 @@ pub struct CrossReconnectState {
 
 pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 
+/// Whether this launch reopens the saved sidebar list and keeps it current.
+/// `save` is the `[sidebar] restore_sessions` setting; `restore` is that and
+/// not `--fresh`. A `--fresh` launch still saves, so the next ordinary launch
+/// reopens what this one had open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenSessionsLaunch {
+    pub save: bool,
+    pub restore: bool,
+}
+
+impl OpenSessionsLaunch {
+    pub fn new(setting: bool, fresh: bool) -> Self {
+        Self {
+            save: setting,
+            restore: setting && !fresh,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuickstartChatDrain {
     Immediate,
@@ -1772,6 +1791,7 @@ pub async fn run(
     target: &crate::ConnectTarget,
     mut owned_daemon_pid: Option<u32>,
     initial_leg: crate::ActiveLeg,
+    open_sessions: OpenSessionsLaunch,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     let timing = crate::ui_timing::TimingTrace::from_env()?;
@@ -1866,6 +1886,31 @@ pub async fn run(
     // daemon turn, so an elicitation may arrive while the panes are still
     // reattaching and must already have one app-level receiver waiting.
     let mut inbound_router = InboundRequestRouter::new(rpc.clone())?;
+
+    // The sidebar list saved by the last launch against this daemon. Pruned
+    // against the daemon first, then fed to the same resume path a reconnect
+    // rebuild uses.
+    let mut open_sessions_store = open_sessions
+        .save
+        .then(|| crate::open_sessions::Store::new(config_dir, connect_label));
+    let mut restored = None;
+    if open_sessions.restore
+        && let Some(store) = open_sessions_store.as_mut()
+        && let Some(saved) = store.load()
+    {
+        let (saved, dropped) = crate::open_sessions::prune_missing(&rpc, saved).await;
+        if dropped > 0 {
+            reload_status = Some(crate::i18n::t_args(
+                "zc-app-restore-sessions-dropped",
+                &[("count", &dropped.to_string())],
+            ));
+        }
+        restored = Some(saved);
+    }
+    let (resume_chat, resume_acp) = restored
+        .as_ref()
+        .map(crate::open_sessions::Snapshot::resume_entries)
+        .unwrap_or_default();
     let (
         mut dashboard_pane,
         mut config_app,
@@ -1875,8 +1920,29 @@ pub async fn run(
         mut logs_pane,
         mut quickstart,
         mut sop_pane,
-    ) = build_panes!(Vec::new(), Vec::new())?;
+    ) = build_panes!(resume_chat, resume_acp)?;
     config_app.set_dock_summary(dock.side, dock.width);
+    // Open on the pane the user left, unless a Quickstart handoff already
+    // picked Chat.
+    if mode == Mode::Dashboard {
+        match restored
+            .as_ref()
+            .and_then(crate::open_sessions::Snapshot::start_pane)
+        {
+            Some(chat::PaneKind::Acp) => mode = Mode::Acp,
+            Some(chat::PaneKind::Chat) => mode = Mode::Chat,
+            None => {}
+        }
+    }
+    // The last chat-like pane on screen, saved so the next launch opens there
+    // even if the user quits from another pane.
+    let mut last_session_pane = match mode {
+        Mode::Acp => Some(chat::PaneKind::Acp),
+        Mode::Chat => Some(chat::PaneKind::Chat),
+        _ => restored
+            .as_ref()
+            .and_then(crate::open_sessions::Snapshot::start_pane),
+    };
 
     // Route one sidebar event: switch to the owning pane's mode and call
     // into it. A macro (like `build_panes!`) because the routing needs the
@@ -2097,6 +2163,27 @@ pub async fn run(
         };
         if !matches!(mode, Mode::Acp | Mode::Chat) {
             sidebar.close_picker();
+        }
+        match mode {
+            Mode::Acp => last_session_pane = Some(chat::PaneKind::Acp),
+            Mode::Chat => last_session_pane = Some(chat::PaneKind::Chat),
+            _ => {}
+        }
+        // Save only while connected: a dropped socket is not the user closing
+        // sessions, and the rebuild that follows carries the same list. Both
+        // panes are saved, not just the rows on screen.
+        if let Some(store) = open_sessions_store.as_mut()
+            && !matches!(conn_state, ConnectionState::Disconnected { .. })
+        {
+            let mut all_rows = acp_pane.session_summaries();
+            all_rows.extend(chat_pane.session_summaries());
+            let snapshot = crate::open_sessions::Snapshot::from_rows(&all_rows, last_session_pane);
+            if let Err(error) = store.save_if_changed(&snapshot) {
+                reload_status = Some(crate::i18n::t_args(
+                    "zc-app-restore-sessions-save-failed",
+                    &[("error", &format!("{error:#}"))],
+                ));
+            }
         }
         let plan_visible = match mode {
             Mode::Acp => acp_pane.plan_visible(),
@@ -6519,6 +6606,31 @@ mod tests {
             polls
                 .iter()
                 .all(|slice| *slice <= Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn fresh_skips_restore_but_keeps_saving() {
+        assert_eq!(
+            OpenSessionsLaunch::new(true, false),
+            OpenSessionsLaunch {
+                save: true,
+                restore: true
+            }
+        );
+        assert_eq!(
+            OpenSessionsLaunch::new(true, true),
+            OpenSessionsLaunch {
+                save: true,
+                restore: false
+            }
+        );
+        assert_eq!(
+            OpenSessionsLaunch::new(false, false),
+            OpenSessionsLaunch {
+                save: false,
+                restore: false
+            }
         );
     }
 
