@@ -459,7 +459,22 @@ def prove(runtime, host_zip, guest_zip):
     fixture_root.mkdir()
     (runtime.private / "proof-public").mkdir()
     (runtime.private / "proof-public/identity.json").write_text("{}")
-    runtime.command(["python3", str(HERE / "prepare_synapse.py"), "prepare", str(fixture_root)], timeout=180)
+    try:
+        runtime.command(["python3", str(HERE / "prepare_synapse.py"), "prepare", str(fixture_root)], timeout=180)
+    except Exception:
+        try:
+            detail = json.loads((runtime.private / "proof-public/identity.json").read_text())["synapse_setup"]
+            stages = {"admission", "private-config", "image-inspection", "network-create", "container-start", "isolation-inspection", "server-readiness", "user-registration", "user-login", "room-create", "room-join", "fixture-write", "complete"}
+            kinds = {"CalledProcessError", "TimeoutExpired", "HTTPError", "URLError", "TimeoutError", "TypeError", "KeyError", "ValueError", "OSError", "RuntimeError", "other"}
+            require(detail["stage"] in stages and detail["success"] is False and detail["error_kind"] in kinds)
+            print("matrix fixture failure: " + detail["stage"] + " / " + detail["error_kind"], flush=True)
+            for key, lower, upper in (("http_status", 100, 599), ("command_exit_code", -128, 255)):
+                if key in detail:
+                    require(type(detail[key]) is int and lower <= detail[key] <= upper)
+                    print("matrix fixture " + key + ": " + str(detail[key]), flush=True)
+        except Exception:
+            print("matrix fixture diagnostics unavailable", flush=True)
+        raise
     runtime.fixture = json.loads((fixture_root / "fixture.json").read_text())
     owned = json.loads((fixture_root / "owned.json").read_text())
     runtime.command(["docker", "update", "--memory", "2g", "--cpus", "2", "--pids-limit", "256", owned["container"]])
