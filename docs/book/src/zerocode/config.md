@@ -84,6 +84,9 @@ per daemon under `<config-dir>/open-sessions/`, and holds only session ids and
 agent aliases; transcripts stay with the daemon. Sessions the daemon no longer
 has are skipped with a notice. Queued messages and unsent drafts are not
 saved, and a turn that was running when zerocode quit is not resumed or rerun.
+One window owns a daemon's list at a time. A second zerocode window on the same
+daemon starts with an empty sidebar and leaves the list alone, so it never
+reattaches sessions that are live in the first.
 
 ```toml
 [sidebar]
