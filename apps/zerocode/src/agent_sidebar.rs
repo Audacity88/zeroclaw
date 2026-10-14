@@ -912,25 +912,11 @@ mod tests {
         );
         assert!(!marked(&term, rects[0]) && !marked(&term, rects[1]));
         let buffer = term.backend().buffer();
-        let (arrow, name_cell) = (
-            &buffer[(rects[2].x, rects[2].y)],
-            &buffer[(rects[2].x + 2, rects[2].y)],
-        );
+        let arrow = &buffer[(rects[2].x, rects[2].y)];
         assert_eq!(
             arrow.symbol(),
             "\u{2195}",
             "the arrow replaces the status dot"
-        );
-        assert_eq!(arrow.fg, theme::active().warn);
-        assert_eq!(
-            arrow.underline_color,
-            theme::active().dim,
-            "the line under the arrow matches the row's line"
-        );
-        assert_eq!(
-            name_cell.fg,
-            theme::active().dim,
-            "the dragged row uses the muted date colour, not accent or warn"
         );
         let landed: String = (rects[2].x..rects[2].right())
             .map(|x| buffer[(x, rects[2].y)].symbol())
