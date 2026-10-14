@@ -25,7 +25,7 @@ pub struct LoopKnobs {
     /// The caller judges steering itself (memory write, sender authority,
     /// tool ceiling) and lends the receiver only so the loop can see that a
     /// message is waiting. After each tool round the loop then stops with
-    /// [`super::SteeringPending`] instead of draining, so the message reaches
+    /// `SteeringPending` instead of draining, so the message reaches
     /// the model at the next step rather than after the final answer.
     pub yield_to_steering: bool,
 }
