@@ -781,9 +781,12 @@ fn drag_row_style() -> Style {
     theme::dim_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
 }
 
-/// The arrow that replaces the status dot while a row is being dragged.
+/// The arrow that replaces the status dot while a row is being dragged. Its
+/// underline keeps the row's muted colour so the line reads as one stroke.
 fn drag_arrow_style() -> Style {
-    theme::warn_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
+    theme::warn_style()
+        .add_modifier(ratatui::style::Modifier::UNDERLINED)
+        .underline_color(theme::active().dim)
 }
 
 fn status_style(status: SidebarStatus) -> Style {
@@ -1006,6 +1009,11 @@ mod tests {
             "the arrow replaces the status dot"
         );
         assert_eq!(arrow.fg, theme::active().warn);
+        assert_eq!(
+            arrow.underline_color,
+            theme::active().dim,
+            "the line under the arrow matches the row's line"
+        );
         assert_eq!(
             name_cell.fg,
             theme::active().dim,
