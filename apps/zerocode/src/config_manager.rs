@@ -1120,6 +1120,7 @@ impl App {
 
     fn can_view_application_status(&self) -> bool {
         self.section == ConfigSection::Zeroclaw
+            && self.application_feedback.has_content()
             && !matches!(
                 self.screen,
                 Screen::FieldEdit { .. } | Screen::AliasCreate { .. }
