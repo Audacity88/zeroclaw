@@ -53,7 +53,7 @@ A review condition does not end anything by itself. It obliges the Core Team to 
 
 ### How it is granted
 
-The record is created before the feature merges. A feature pull request may include a directly related exception proposal or scope amendment, so the Core Team can assess the implementation and its placement together. The exception decision remains distinct: the Core Team must explicitly approve its named scope, and the entry must record that authority before merge. Implementation approval alone does not grant an exception.
+The record is created before the feature merges, and separately from it. A feature pull request cannot grant itself an exception, because the contract it would be waiving is the one constraining it.
 
 An exception requires a concrete supported use case. Code with no receiving caller does not qualify; retirement or an explicit ownership decision is the correct answer there.
 

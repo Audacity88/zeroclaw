@@ -10,19 +10,11 @@ Extraction is the default. The Core Team may grant a bounded exception when imme
 
 An exception must name its permitted scope, intended destination, approving authority, and either an expiry or a review condition, and must be recorded before the feature it covers merges. An expiry ends the permission, so further additions need Core Team renewal; it does not require removing code that already landed. A review condition only obliges reconsideration.
 
-An exception is granted by adding its row to the table below through normal review, approved by the Core Team. The row is the record: a decision that lives only in a review thread has not been made. A feature pull request may include a directly related exception proposal or scope amendment, but cannot grant itself one. Record the Core Team's approval of the exception explicitly before merge; implementation approval alone is not exception approval.
+An exception is granted by adding its row to the table below through normal review, approved by the Core Team. The row is the record: a decision that lives only in a review thread has not been made. A feature pull request cannot grant itself one: the contract it would be waiving is the one constraining it.
 
 An exception requires a concrete supported use case. Code with no receiving caller does not qualify; retirement or an explicit ownership decision is the right answer there.
 
 An exception permits continued work on a subsystem already held here. It never permits introducing a new subsystem, and it does not generalise from one subsystem to another.
-
-### Pending scope amendments
-
-These proposals do not extend an active exception until the Core Team approves the named scope and the entry records that authority.
-
-| Scope | Destination | Approval status | Expires or reviewed |
-| --- | --- | --- | --- |
-| Proposed amendment in #11720 to the #11371/#11479 tool-argument recovery exception, limited to `src/agent/turn/parse_response.rs`: decode a JSON-stringified object or array when a conditional schema explicitly declares that unambiguous outer type, then stop before traversing conditional children. Includes focused native/fallback interpretation and routing-persistence regressions. Preserves string fields and the reference, composition, ambiguous-type, tuple-array, invalid-JSON, type-match, and nesting safeguards; no conditional evaluation, new subsystem, retained state, or execution authority | Agent-loop owner in the planned `zeroclaw-kernel` extraction | Pending explicit Core Team approval in #11720. The existing @tidux approval in #11436 covers only the original #11371/#11479 scope | Review at the agent-loop extraction design review, or before further expanding recovery eligibility or schema interpretation |
 
 ### Active exceptions
 
