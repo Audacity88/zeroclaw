@@ -51,8 +51,8 @@ use context_menu::{
     ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
 };
 
-mod message_queue;
 mod entry_time;
+mod message_queue;
 mod transcript_layout;
 use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
 pub(crate) use message_queue::{QueueItemStatus, QueuedMessage};
