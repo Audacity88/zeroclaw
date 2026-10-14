@@ -1924,10 +1924,22 @@ fn rows_from<A: crate::keymap::RebindableActions>(out: &mut Vec<BindingRow>) {
     for v in A::all() {
         out.push(BindingRow {
             action_key: v.key(),
-            label: v.human_label().to_string(),
+            label: localized_action_label(&v.key(), v.human_label()),
             chords: v.resolved(),
         });
     }
+}
+
+/// Keybindings-page label for an action. Actions with a Fluent label use it;
+/// the rest keep their built-in English label.
+fn localized_action_label(action_key: &str, fallback: &str) -> String {
+    if let Some(n) = action_key
+        .strip_prefix("global.focus_session")
+        .filter(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+    {
+        return crate::i18n::t_args("zc-keybinding-focus-session", &[("n", n)]);
+    }
+    fallback.to_string()
 }
 
 /// Resolve the compile-time default chords for a single `"tag.variant"`
