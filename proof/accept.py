@@ -156,6 +156,12 @@ def matrix(fixture, path, token, body=None, method=None):
         return json.load(response)
 
 
+def reply_marker(nonce):
+    suffix = nonce.removeprefix("MATRIX_ACCEPT_")
+    require(re.fullmatch(r"[0-9a-f]{32}", suffix) is not None)
+    return "Matrix reply: " + ".".join(suffix[index:index + 8] for index in range(0, 32, 8))
+
+
 def request_body(headers, stream):
     lengths = headers.get_all("Content-Length", [])
     encodings = headers.get_all("Transfer-Encoding", [])
@@ -264,7 +270,7 @@ class Observer:
                         require(matches and matches[-1] in owner.known)
                         nonce = matches[-1]
                         owner.calls[nonce] = owner.calls.get(nonce, 0) + 1
-                        marker = "MATRIX_REPLY_" + nonce
+                        marker = reply_marker(nonce)
                         common = {"id": "fixture", "model": "matrix-fixture", "created": 1}
                         if payload.get("stream"):
                             records = [dict(common, object="chat.completion.chunk", choices=[{"index": 0, "delta": {"role": "assistant", "content": marker}, "finish_reason": None}]), dict(common, object="chat.completion.chunk", choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])]
@@ -479,7 +485,7 @@ class Runtime:
         return [event for event in events if event.get("sender") == self.fixture["bot"]["id"] and event.get("type") == "m.room.message"]
 
     def reply(self, room, nonce):
-        marker = "MATRIX_REPLY_" + nonce
+        marker = reply_marker(nonce)
         return next((event for event in self.bot_messages(room) if marker in event.get("content", {}).get("body", "")), None)
 
     def await_roundtrip(self, room, nonce, event, seconds):
