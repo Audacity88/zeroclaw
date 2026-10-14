@@ -149,14 +149,27 @@ impl ApplicationFeedback {
     }
 
     pub(crate) fn summary(&self) -> String {
-        let details = t_args(
-            "zc-config-application-details-hint",
-            &[("key", &key_label(Action::ApplicationStatus))],
-        );
+        self.summary_line(!self.details_open)
+    }
+
+    /// `with_hint` adds "Press s to view the log." It is left off while the
+    /// log is open, and inside the log itself.
+    fn summary_line(&self, with_hint: bool) -> String {
+        let hint = if with_hint {
+            format!(
+                " {}",
+                t_args(
+                    "zc-config-application-details-hint",
+                    &[("key", &key_label(Action::ApplicationStatus))],
+                )
+            )
+        } else {
+            String::new()
+        };
         let Some((label, _)) = self.saved.as_ref() else {
-            // Nothing saved from this view: only point at the details when
-            // the daemon has recent changes to show.
-            return if self.has_observed_records() {
+            // Nothing saved from this view: only point at the log when the
+            // daemon has recent changes to show.
+            return if self.has_observed_records() && with_hint {
                 t_args(
                     "zc-config-application-observed-hint",
                     &[("key", &key_label(Action::ApplicationStatus))],
@@ -202,7 +215,7 @@ impl ApplicationFeedback {
             t("zc-config-application-state-applied")
         };
         format!(
-            "{} {state} {details}",
+            "{} {state}{hint}",
             t_args("zc-config-application-saved", &[("label", &quoted(label))])
         )
     }
@@ -248,7 +261,7 @@ impl ApplicationFeedback {
     fn detail_lines(&self) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::from(if self.saved.is_some() {
-                self.summary()
+                self.summary_line(false)
             } else {
                 t("zc-config-application-observed")
             }),
@@ -537,10 +550,27 @@ mod tests {
             "{summary}"
         );
         assert!(
-            summary.ends_with(") to apply this change. Press s to view details."),
+            summary.ends_with(") to apply this change. Press s to view the log."),
             "{summary}"
         );
         assert!(!summary.contains(": 1"), "{summary}");
+        // While the log is open, neither the summary nor the log repeats the hint.
+        feedback.toggle_details();
+        assert!(
+            !feedback.summary().contains("Press s"),
+            "{}",
+            feedback.summary()
+        );
+        assert!(feedback.summary().contains("Please reload the daemon"));
+        let lines: Vec<String> = feedback
+            .detail_lines()
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(
+            !lines.iter().any(|line| line.contains("Press s")),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -755,7 +785,10 @@ mod tests {
         peer.status(&mut feedback, value).await;
         assert!(!feedback.summary().contains("already been applied"));
         assert!(details(&feedback).contains("Recent config changes on this daemon"));
-        assert_eq!(feedback.summary(), "Press s to see recent config changes.");
+        assert_eq!(
+            feedback.summary(),
+            "Press s to view the log of recent config changes."
+        );
         assert!(details(&feedback).contains("Record limit: 512"));
         assert!(details(&feedback).contains("evicted records"));
         feedback.toggle_details();
