@@ -1688,8 +1688,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         if knobs.yield_to_steering {
             // The caller judges steering; this loop only hands control back
-            // once a tool round has finished and a message is waiting.
-            if iteration > 0 && steering.as_deref().is_some_and(|rx| !rx.is_empty()) {
+            // once a tool round has finished and a message is waiting. A
+            // model switch queued by that round goes first: the switch check
+            // below returns it, the caller applies it, and the steering is
+            // taken at the top of the caller's next round on the new model.
+            let switch_pending = model_switch_callback.as_ref().is_some_and(|callback| {
+                callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|(p, m)| p != provider_name || m != model)
+            });
+            if iteration > 0
+                && !switch_pending
+                && steering.as_deref().is_some_and(|rx| !rx.is_empty())
+            {
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 return Err(SteeringPending {
                     display_text: accumulated_display_text,

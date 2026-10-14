@@ -18170,6 +18170,123 @@ model_provider = "custom.only"
         }
     }
 
+    /// A tool that queues a model switch and, in the same call, a steering
+    /// message. The switch must still apply: steering waits for the switched
+    /// provider instead of resuming on the old one.
+    struct SwitchAndSteerTool {
+        steer: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+    }
+
+    #[async_trait]
+    impl Tool for SwitchAndSteerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a model switch and a steering message"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() = Some(("ollama".to_string(), "llama3".to_string()));
+            let steer = self.steer.lock().take();
+            if let Some(steer) = steer {
+                steer
+                    .send("steer-during-switch".into())
+                    .await
+                    .expect("the running turn must accept steering");
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+    zeroclaw_api::mock_tool_attribution!(SwitchAndSteerTool);
+
+    #[test]
+    fn steering_in_the_same_batch_as_a_model_switch_keeps_the_switch() {
+        let initial_calls = Arc::new(Mutex::new(0usize));
+        let provider = Box::new(StreamSwitchTriggerProvider {
+            call_count: Arc::clone(&initial_calls),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
+                reliability: zeroclaw_config::schema::ReliabilityConfig {
+                    provider_retries: 0,
+                    provider_backoff_ms: 0,
+                    ..zeroclaw_config::schema::ReliabilityConfig::default()
+                },
+                ..zeroclaw_config::schema::Config::default()
+            })),
+            live_config: None,
+            live: None,
+        };
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SwitchAndSteerTool {
+                    steer: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+            // The switched provider has no live server, so the turn errors
+            // after the switch; the timeout only guards against a hang.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.turn_streamed_with_steering_state(
+                    "please switch the model",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            (
+                agent.model_provider_name.as_str(),
+                agent.model_name.as_str()
+            ),
+            ("ollama", "llama3"),
+            "steering in the same batch must not drop the requested model switch"
+        );
+        assert_eq!(
+            *initial_calls.lock(),
+            1,
+            "the steered round must not go back to the original provider"
+        );
+    }
+
     #[test]
     fn turn_streamed_applies_pending_model_switch_for_next_call() {
         let initial_calls = Arc::new(Mutex::new(0usize));
