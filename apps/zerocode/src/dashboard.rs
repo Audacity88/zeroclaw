@@ -301,8 +301,9 @@ impl Dashboard {
                         }
                     }
                 }
-                if let Ok(a) = self.rpc.agents_status().await {
-                    self.agents = a.agents;
+                match self.rpc.agents_status().await {
+                    Ok(a) => self.agents = a.agents,
+                    Err(_) => self.invalidate_agent_profiles(),
                 }
                 if let Ok(t) = self.rpc.tui_list().await {
                     self.tuis = t.tuis;
@@ -320,11 +321,10 @@ impl Dashboard {
                     self.sessions_loaded = true;
                 }
             }
-            Tab::Agents => {
-                if let Ok(a) = self.rpc.agents_status().await {
-                    self.agents = a.agents;
-                }
-            }
+            Tab::Agents => match self.rpc.agents_status().await {
+                Ok(a) => self.agents = a.agents,
+                Err(_) => self.invalidate_agent_profiles(),
+            },
             Tab::Memories => {
                 // Use search endpoint when a query is active, list otherwise.
                 let result = if !self.search_query.is_empty() {
@@ -401,6 +401,12 @@ impl Dashboard {
         }
     }
 
+    fn invalidate_agent_profiles(&mut self) {
+        for agent in &mut self.agents {
+            agent.runtime_profile = None;
+        }
+    }
+
     /// Fetch session messages for the currently selected session.
     async fn load_session_messages(&mut self) {
         let Some(idx) = self.selected_session_index() else {
@@ -449,6 +455,7 @@ impl Dashboard {
             crate::client::ConnectionState::Disconnected { .. }
         ) {
             self.tuis.clear();
+            self.invalidate_agent_profiles();
         }
 
         let chunks = Layout::default()
@@ -605,10 +612,20 @@ impl Dashboard {
         code_context: Option<FocusedRuntimeContext<'_>>,
         chat_context: Option<FocusedRuntimeContext<'_>>,
     ) {
-        let workspace_lines = workspace_lines(code_cwd, chat_cwd, overview_status_label_width());
-        let context_lines =
-            runtime_context_lines(code_context, chat_context, overview_status_label_width());
-        let status_height = 12 + workspace_lines.len() as u16 + context_lines.len() as u16;
+        let status_lines = status.map(|s| {
+            overview_status_lines(
+                &self.connect_label,
+                self.insecure_tls,
+                s,
+                health,
+                code_cwd,
+                chat_cwd,
+                code_context,
+                chat_context,
+                &self.agents,
+            )
+        });
+        let status_height = status_lines.as_ref().map_or(1, Vec::len).saturating_add(2) as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -626,17 +643,7 @@ impl Dashboard {
         let inner = status_block.inner(chunks[0]);
         frame.render_widget(status_block, chunks[0]);
 
-        if let Some(s) = status {
-            let lines = overview_status_lines(
-                &self.connect_label,
-                self.insecure_tls,
-                s,
-                health,
-                code_cwd,
-                chat_cwd,
-                code_context,
-                chat_context,
-            );
+        if let Some(lines) = status_lines {
             frame.render_widget(Paragraph::new(lines), inner);
         } else {
             frame.render_widget(
@@ -2949,6 +2956,7 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-socket",
     "zc-dashboard-label-endpoint",
     "zc-dashboard-label-server",
+    "zc-dashboard-label-client",
     "zc-dashboard-label-protocol",
     "zc-dashboard-label-config",
     "zc-dashboard-label-workspace",
@@ -2959,6 +2967,7 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-chat-context",
     "zc-dashboard-label-daemon-memory",
     "zc-dashboard-label-daemon-cpu",
+    "zc-dashboard-label-health",
 ];
 
 const HEALTH_STATUS_LABEL_KEYS: &[&str] = &["zc-dashboard-label-uptime", "zc-dashboard-label-pid"];
@@ -3038,6 +3047,7 @@ fn overview_status_lines(
     chat_cwd: Option<&str>,
     code_context: Option<FocusedRuntimeContext<'_>>,
     chat_context: Option<FocusedRuntimeContext<'_>>,
+    agents: &[AgentStatusEntry],
 ) -> Vec<Line<'static>> {
     let label_width = overview_status_label_width();
     let mut lines = vec![Line::from(vec![
@@ -3092,6 +3102,16 @@ fn overview_status_lines(
         ]),
         Line::from(vec![
             Span::styled(
+                status_label("zc-dashboard-label-client", label_width),
+                theme::dim_style(),
+            ),
+            Span::styled(
+                format!("v{}", env!("CARGO_PKG_VERSION")),
+                theme::body_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 status_label("zc-dashboard-label-protocol", label_width),
                 theme::dim_style(),
             ),
@@ -3128,8 +3148,11 @@ fn overview_status_lines(
     lines.extend(runtime_context_lines(
         code_context,
         chat_context,
+        agents,
         label_width,
     ));
+
+    lines.extend(health_rollup_lines(health, label_width));
 
     if let Some(h) = health
         && let Some(process) = h.get("process")
@@ -3308,28 +3331,36 @@ fn workspace_lines(
 fn runtime_context_lines(
     code: Option<FocusedRuntimeContext<'_>>,
     chat: Option<FocusedRuntimeContext<'_>>,
+    agents: &[AgentStatusEntry],
     label_width: usize,
 ) -> Vec<Line<'static>> {
     match (code, chat) {
         (Some(code), Some(chat)) if code == chat => {
-            runtime_context_block("zc-dashboard-label-context", code, label_width)
+            runtime_context_block("zc-dashboard-label-context", code, agents, label_width)
         }
         (Some(code), Some(chat)) => {
             let mut lines =
-                runtime_context_block("zc-dashboard-label-code-context", code, label_width);
+                runtime_context_block("zc-dashboard-label-code-context", code, agents, label_width);
             lines.extend(runtime_context_block(
                 "zc-dashboard-label-chat-context",
                 chat,
+                agents,
                 label_width,
             ));
             lines
         }
-        (Some(context), None) => {
-            runtime_context_block("zc-dashboard-label-code-context", context, label_width)
-        }
-        (None, Some(context)) => {
-            runtime_context_block("zc-dashboard-label-chat-context", context, label_width)
-        }
+        (Some(context), None) => runtime_context_block(
+            "zc-dashboard-label-code-context",
+            context,
+            agents,
+            label_width,
+        ),
+        (None, Some(context)) => runtime_context_block(
+            "zc-dashboard-label-chat-context",
+            context,
+            agents,
+            label_width,
+        ),
         _ => Vec::new(),
     }
 }
@@ -3337,6 +3368,7 @@ fn runtime_context_lines(
 fn runtime_context_block(
     label_key: &str,
     context: FocusedRuntimeContext<'_>,
+    agents: &[AgentStatusEntry],
     label_width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![status_row(
@@ -3351,7 +3383,101 @@ fn runtime_context_block(
             Span::styled(queue, theme::body_style()),
         ]));
     }
+    let profile = configured_profile(agents, context.agent_alias)
+        .unwrap_or_else(|| crate::i18n::t("zc-dashboard-profile-unavailable"));
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(label_width + 2)),
+        Span::styled(
+            crate::i18n::t_args("zc-dashboard-runtime-profile", &[("profile", &profile)]),
+            theme::dim_style(),
+        ),
+    ]));
     lines
+}
+
+fn configured_profile(agents: &[AgentStatusEntry], alias: &str) -> Option<String> {
+    agents
+        .iter()
+        .find(|agent| agent.alias == alias)
+        .and_then(|agent| agent.runtime_profile.as_deref())
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(str::to_string)
+}
+
+fn health_rollup_lines(
+    health: Option<&serde_json::Value>,
+    label_width: usize,
+) -> Vec<Line<'static>> {
+    let Some(object) = health.and_then(serde_json::Value::as_object) else {
+        return vec![status_row(
+            "zc-dashboard-label-health",
+            &crate::i18n::t("zc-dashboard-health-unavailable"),
+            theme::dim_style(),
+            label_width,
+        )];
+    };
+
+    if let Some(error) = object.get("error").and_then(serde_json::Value::as_str) {
+        return vec![status_row(
+            "zc-dashboard-label-health",
+            &crate::i18n::t_args("zc-dashboard-health-error", &[("error", error)]),
+            theme::warn_style(),
+            label_width,
+        )];
+    }
+
+    let Some(components) = object
+        .get("components")
+        .and_then(serde_json::Value::as_object)
+        .filter(|components| !components.is_empty())
+    else {
+        return vec![status_row(
+            "zc-dashboard-label-health",
+            &crate::i18n::t("zc-dashboard-health-unavailable"),
+            theme::dim_style(),
+            label_width,
+        )];
+    };
+
+    let (mut healthy, mut unhealthy, mut unconfirmed) = (0, 0, 0);
+    for component in components.values() {
+        match component
+            .as_object()
+            .and_then(|object| object.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("ok" | "healthy") => healthy += 1,
+            Some("error" | "degraded" | "unhealthy") => unhealthy += 1,
+            _ => unconfirmed += 1,
+        }
+    }
+
+    vec![
+        status_row(
+            "zc-dashboard-label-health",
+            &crate::i18n::t_args(
+                "zc-dashboard-health-summary",
+                &[
+                    ("healthy", &healthy.to_string()),
+                    ("unhealthy", &unhealthy.to_string()),
+                    ("unconfirmed", &unconfirmed.to_string()),
+                ],
+            ),
+            theme::body_style(),
+            label_width,
+        ),
+        Line::from(vec![
+            Span::raw(" ".repeat(label_width + 2)),
+            Span::styled(
+                crate::i18n::t("zc-dashboard-health-details"),
+                theme::dim_style(),
+            ),
+        ]),
+    ]
 }
 
 fn runtime_context_queue_value(context: FocusedRuntimeContext<'_>) -> Option<String> {
@@ -3443,6 +3569,7 @@ mod tests {
             live_sessions: 1,
             persisted_sessions: 1,
             channels: Vec::new(),
+            runtime_profile: None,
         });
         dashboard.sessions_loaded = true;
         dashboard.detail_open = true;
@@ -3488,6 +3615,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         ));
 
         assert!(
@@ -3497,6 +3625,10 @@ mod tests {
         assert!(
             text.contains("/tmp/zc-profile/data/daemon.sock"),
             "local socket: {text}"
+        );
+        assert!(
+            text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "client version: {text}"
         );
         assert!(
             !text.contains("/fallback.sock"),
@@ -3520,6 +3652,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         ));
 
         assert!(
@@ -3552,6 +3685,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         ));
 
         assert!(
@@ -3577,6 +3711,7 @@ mod tests {
             Some("/work/shared"),
             None,
             None,
+            &[],
         ));
 
         assert!(
@@ -3600,6 +3735,7 @@ mod tests {
             Some("/work/chat"),
             None,
             None,
+            &[],
         ));
 
         assert!(
@@ -3624,8 +3760,12 @@ mod tests {
             queued_messages: 1,
             queue_paused: false,
         };
-        let lines =
-            runtime_context_lines(Some(context), Some(context), overview_status_label_width());
+        let lines = runtime_context_lines(
+            Some(context),
+            Some(context),
+            &[],
+            overview_status_label_width(),
+        );
         let text = lines_text(&lines);
 
         assert_eq!(
@@ -3658,7 +3798,7 @@ mod tests {
             queued_messages: 0,
             queue_paused: false,
         };
-        let lines = runtime_context_lines(Some(context), None, overview_status_label_width());
+        let lines = runtime_context_lines(Some(context), None, &[], overview_status_label_width());
         let text = lines_text(&lines);
 
         assert_eq!(
@@ -3686,7 +3826,8 @@ mod tests {
             queued_messages: 2,
             queue_paused: true,
         };
-        let lines = runtime_context_lines(Some(code), Some(chat), overview_status_label_width());
+        let lines =
+            runtime_context_lines(Some(code), Some(chat), &[], overview_status_label_width());
         let text = lines_text(&lines);
 
         assert!(text.contains(&crate::i18n::t("zc-dashboard-label-code-context")));
@@ -3711,6 +3852,110 @@ mod tests {
     }
 
     #[test]
+    fn runtime_context_profiles_follow_aliases_and_unmatched_contexts_are_unavailable() {
+        let code = FocusedRuntimeContext {
+            agent_alias: "coder",
+            model_provider_ref: None,
+            model: None,
+            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Idle,
+            queued_messages: 0,
+            queue_paused: false,
+        };
+        let chat = FocusedRuntimeContext {
+            agent_alias: "missing",
+            ..code
+        };
+        let agents = vec![AgentStatusEntry {
+            alias: "coder".to_string(),
+            enabled: true,
+            runtime_profile: Some("  fast  ".to_string()),
+            live_sessions: 0,
+            persisted_sessions: 0,
+            channels: Vec::new(),
+        }];
+
+        let lines = runtime_context_lines(
+            Some(code),
+            Some(chat),
+            &agents,
+            overview_status_label_width(),
+        );
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-runtime-profile",
+                &[("profile", "fast")],
+            )),
+            "matched alias profile: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-runtime-profile",
+                &[(
+                    "profile",
+                    &crate::i18n::t("zc-dashboard-profile-unavailable")
+                )],
+            )),
+            "unmatched alias profile: {text}"
+        );
+        let blank_profile = AgentStatusEntry {
+            alias: "coder".to_string(),
+            enabled: true,
+            runtime_profile: Some("  ".to_string()),
+            live_sessions: 0,
+            persisted_sessions: 0,
+            channels: Vec::new(),
+        };
+        assert_eq!(configured_profile(&[blank_profile], "coder"), None);
+    }
+
+    #[test]
+    fn health_rollup_keeps_unknown_and_missing_component_states_unconfirmed() {
+        let health = serde_json::json!({
+            "components": {
+                "healthy": {"status": "ok"},
+                "failed": {"status": "error"},
+                "starting": {"status": "starting"},
+                "unknown": {"status": "other"},
+                "missing": {}
+            }
+        });
+        let lines = health_rollup_lines(Some(&health), overview_status_label_width());
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-health-summary",
+                &[("healthy", "1"), ("unhealthy", "1"), ("unconfirmed", "3")],
+            )),
+            "health counts: {text}"
+        );
+        assert!(text.contains(&crate::i18n::t("zc-dashboard-health-details")));
+
+        let empty = serde_json::json!({"components": {}});
+        assert!(
+            lines_text(&health_rollup_lines(
+                Some(&empty),
+                overview_status_label_width()
+            ))
+            .contains(&crate::i18n::t("zc-dashboard-health-unavailable"))
+        );
+
+        let error = serde_json::json!({"error": "snapshot failed"});
+        assert!(
+            lines_text(&health_rollup_lines(
+                Some(&error),
+                overview_status_label_width()
+            ))
+            .contains(&crate::i18n::t_args(
+                "zc-dashboard-health-error",
+                &[("error", "snapshot failed")],
+            ))
+        );
+    }
+
+    #[test]
     fn overview_status_lines_render_cpu_loading_before_sample() {
         let status = status_fixture();
         let health = serde_json::json!({
@@ -3729,6 +3974,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         ));
 
         let daemon_memory = crate::i18n::t("zc-dashboard-label-daemon-memory");
@@ -3768,6 +4014,7 @@ mod tests {
             Some("/work/chat"),
             None,
             None,
+            &[],
         );
         let value_columns = lines
             .iter()
@@ -3864,6 +4111,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         ));
 
         assert!(
