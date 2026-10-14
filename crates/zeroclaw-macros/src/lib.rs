@@ -400,6 +400,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         description: #description_lit,
                         derived_from_secret: false,
                         credential_class: #credential_class_expr,
+                        application: crate::config::ApplicationCapability::ReloadRequired,
                         tab: #tab_token,
                         alias_source: None,
                         multiline: false,
