@@ -41,12 +41,12 @@ impl ModelProvider for RecordingProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        let first_request = {
+        let steer_now = {
             let mut requests = self.requests.lock();
             requests.push(request.messages.to_vec());
-            requests.len() == 1
+            requests.len() == STEER_ON_REQUEST
         };
-        if first_request && let Some(steering) = &self.steering {
+        if steer_now && let Some(steering) = &self.steering {
             steering
                 .send("continue working".into())
                 .await
@@ -55,6 +55,13 @@ impl ModelProvider for RecordingProvider {
         self.scripted.chat(request, model, temperature).await
     }
 }
+
+/// Steering reaches the model at the step after it arrives, so the tests
+/// queue it during the fourth request: the one that returns the fourth tool
+/// call in the exhaustion script, and the first round's final text in the
+/// reentry script. Earlier, a steer would start its round before recovery
+/// has anything to exhaust.
+const STEER_ON_REQUEST: usize = 4;
 
 struct OutcomeTool {
     name: &'static str,
