@@ -177,7 +177,11 @@ class Observer:
                     size = int(self.headers.get("Content-Length", "0"))
                     require(0 <= size <= 2 * 1024**2)
                     body = self.rfile.read(size) if size else None
-                    if self.path == "/v1/chat/completions" and self.command == "POST":
+                    if self.path == "/v1/models" and self.command == "GET":
+                        require(size == 0 and self.headers.get("Authorization") == "Bearer synthetic-provider-acceptance-key")
+                        data = json.dumps({"object": "list", "data": [{"id": "matrix-fixture", "object": "model", "owned_by": "fixture"}]}).encode()
+                        status, content_type = 200, "application/json"
+                    elif self.path == "/v1/chat/completions" and self.command == "POST":
                         require(self.headers.get("Authorization") == "Bearer synthetic-provider-acceptance-key")
                         payload = json.loads(body)
                         require(not any(nonce in json.dumps(payload) for nonce in owner.forbidden))
@@ -507,7 +511,7 @@ def prove(runtime, host_zip, guest_zip):
         runtime.cli(first, "config", "init", section, "--json")
     settings = {
         "plugins.enabled": "true", "plugins.auto_discover": "false",
-        "providers.models.custom.fixture.uri": runtime.observer.base + "/v1/chat/completions",
+        "providers.models.custom.fixture.uri": runtime.observer.base + "/v1",
         "providers.models.custom.fixture.api_key": "synthetic-provider-acceptance-key",
         "providers.models.custom.fixture.model": "matrix-fixture", "providers.models.custom.fixture.wire_api": "chat_completions",
         "providers.models.custom.fixture.live_pricing": "false", "providers.models.custom.fixture.timeout_secs": "20",
