@@ -31,6 +31,10 @@ impl Acp {
         self.inner.set_resume_sessions(entries);
     }
 
+    pub(crate) fn set_max_tracked_sessions(&mut self, max_tracked_sessions: usize) {
+        self.inner.set_max_tracked_sessions(max_tracked_sessions);
+    }
+
     pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
         self.inner.resume_entries()
     }

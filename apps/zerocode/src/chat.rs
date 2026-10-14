@@ -482,10 +482,6 @@ fn classify_turn_failure(content: &str) -> SessionError {
     }
 }
 
-/// Upper bound on sessions one chat-like pane tracks (focused + background).
-/// Two panes keep the TUI comfortably under the daemon's 64-session cap.
-const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
-
 pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
@@ -520,6 +516,13 @@ pub(crate) struct Chat {
     pane_kind: PaneKind,
     /// Where a fresh session reads the directory zerocode was launched from.
     launch_dir: LaunchDirSource,
+    /// Upper bound on sessions this pane tracks (focused + background), from
+    /// `[chat].max_sessions_per_pane` (clamped to 1..=32 by the config
+    /// accessor; two panes at 32 still fit the daemon's 64-session store).
+    /// Read once when the app builds the pane, so later config edits apply at
+    /// the next build — a lowered cap never drops already-tracked sessions,
+    /// it only refuses new ones.
+    max_tracked_sessions: usize,
     /// Live but unfocused sessions of this pane. Each keeps its full
     /// transcript, caches, queue, and pending prompts warm; notifications
     /// route to them by session id so switching back is instant.
@@ -861,11 +864,19 @@ impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
-        let (session_reattach_tx, session_reattach_rx) =
-            mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
-        let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
-        let (prompt_completion_tx, prompt_completion_rx) =
-            mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        // Session-result channel bound. Every sender is a spawned task using
+        // `send().await`, and the draw loop drains each channel with
+        // `try_recv` every poll, so a full channel never drops a result — it
+        // only parks the sender until the next drain. The in-flight guards
+        // (`session_reattach_in_flight`, `session_resync_in_flight`, one
+        // dispatchable prompt per session) bound outstanding messages to one
+        // per tracked session, so the configured cap's 32-session maximum
+        // covers every legal configuration even though the cap itself is read
+        // by the app after construction.
+        let session_channel_bound = crate::config::MAX_SESSIONS_PER_PANE_MAX;
+        let (session_reattach_tx, session_reattach_rx) = mpsc::channel(session_channel_bound);
+        let (session_resync_tx, session_resync_rx) = mpsc::channel(session_channel_bound);
+        let (prompt_completion_tx, prompt_completion_rx) = mpsc::channel(session_channel_bound);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -890,6 +901,7 @@ impl Chat {
             },
             pane_kind,
             launch_dir: std::env::current_dir,
+            max_tracked_sessions: crate::config::default_chat_max_sessions_per_pane(),
             background: Vec::new(),
             session_order: Vec::new(),
             last_focused_sid: None,
@@ -940,6 +952,14 @@ impl Chat {
             let entry = self.resume_backgrounds.remove(0);
             self.resume_focused = Some(entry);
         }
+    }
+
+    /// Set the configured per-pane session cap (the config accessor's
+    /// already-clamped effective value). Called once when the app builds the
+    /// pane; a lowered cap never drops already-tracked sessions, it only
+    /// refuses new ones.
+    pub(crate) fn set_max_tracked_sessions(&mut self, max_tracked_sessions: usize) {
+        self.max_tracked_sessions = max_tracked_sessions;
     }
 
     /// Every session this pane tracks, in sidebar order, for the app layer to
@@ -1846,13 +1866,13 @@ impl Chat {
         // A confirmed directory starts an *additional* session, so the pane cap
         // applies here exactly as it does to the sidebar "+". Refusing before
         // the stash keeps the live session focused instead of parking it
-        // behind a picker that cannot add the ninth tracked session it would
+        // behind a picker that cannot add one more tracked session it would
         // need to honor the selection.
-        if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
+        if self.tracked_session_count() >= self.max_tracked_sessions {
             if let ChatPhase::Active(ref mut state) = self.phase {
                 state.set_info_notice(crate::i18n::t_args(
                     "zc-chat-session-cap",
-                    &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())],
+                    &[("max", &self.max_tracked_sessions.to_string())],
                 ));
             }
             return;
@@ -1993,11 +2013,11 @@ impl Chat {
 
     /// Sidebar "+" always creates a new session, preserving existing siblings.
     pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {
-        if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
+        if self.tracked_session_count() >= self.max_tracked_sessions {
             if let ChatPhase::Active(ref mut state) = self.phase {
                 state.set_info_notice(crate::i18n::t_args(
                     "zc-chat-session-cap",
-                    &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())],
+                    &[("max", &self.max_tracked_sessions.to_string())],
                 ));
             }
             return;
@@ -2045,11 +2065,16 @@ impl Chat {
         let worker_cancelled = Arc::clone(&cancelled);
         let phase = Arc::new(AtomicU8::new(ENTRY_RETRY_PRE_SESSION));
         let worker_phase = Arc::clone(&phase);
+        let max_tracked_sessions = self.max_tracked_sessions;
         let (result_tx, result_rx) = oneshot::channel();
         self.entry_retry_attempt = Some(EntryRetryAttempt {
             result_rx,
             worker: tokio::spawn(async move {
                 let mut retry = Chat::new(rpc, PaneKind::Chat);
+                // The rebuilt pane replaces this one wholesale on adoption, so
+                // it must keep the configured cap rather than reset to the
+                // default.
+                retry.set_max_tracked_sessions(max_tracked_sessions);
                 retry.entry_retry_preparing = true;
                 if !resume_entries.is_empty() {
                     retry.set_resume_sessions(resume_entries);
@@ -2421,7 +2446,7 @@ impl Chat {
                     retained.push(entry);
                     continue;
                 }
-                if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
+                if self.tracked_session_count() >= self.max_tracked_sessions {
                     retained.push(entry);
                     continue;
                 }
@@ -4786,11 +4811,11 @@ impl Chat {
             return;
         }
 
-        if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
+        if self.tracked_session_count() >= self.max_tracked_sessions {
             if let ChatPhase::Active(ref mut state) = self.phase {
                 state.set_info_notice(crate::i18n::t_args(
                     "zc-chat-session-cap",
-                    &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())],
+                    &[("max", &self.max_tracked_sessions.to_string())],
                 ));
             }
             return;
@@ -20543,16 +20568,107 @@ mod tests {
 
     #[tokio::test]
     async fn retained_resume_entries_count_toward_the_session_cap() {
+        // Parameterised on a configured cap (not the default) so the count
+        // follows whatever the operator set, not a compile-time constant.
+        let configured_cap = 4;
         let mut chat = active_chat();
+        chat.set_max_tracked_sessions(configured_cap);
         chat.session_order = vec!["sess-1".to_string()];
-        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+        for idx in 2..=configured_cap {
             let session_id = format!("sess-{idx}");
             chat.session_order.push(session_id.clone());
             chat.resume_backgrounds
                 .push(resume_entry(&session_id, "agent", false));
         }
 
-        assert_eq!(chat.tracked_session_count(), MAX_TRACKED_SESSIONS_PER_PANE);
+        assert_eq!(chat.tracked_session_count(), configured_cap);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_chat_pane_defaults_to_eight_tracked_sessions() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let chat = Chat::new(client, PaneKind::Chat);
+        assert_eq!(
+            chat.max_tracked_sessions,
+            crate::config::default_chat_max_sessions_per_pane(),
+            "a pane the app never re-configured keeps the documented default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_cap_of_three_refuses_the_fourth_session_from_the_sidebar() {
+        // Sidebar "+" refuses before stashing the focused session, so the
+        // notice carries the configured cap and nothing is parked or lost.
+        let configured_cap = 3;
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.set_max_tracked_sessions(configured_cap);
+        for idx in 2..=configured_cap {
+            let session_id = format!("sess-{idx}");
+            chat.session_order.push(session_id.clone());
+            chat.background.push(state_for(&session_id, "alpha"));
+        }
+        assert_eq!(chat.tracked_session_count(), configured_cap);
+
+        chat.add_agent_session("alpha").await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args(
+                "zc-chat-session-cap",
+                &[("max", &configured_cap.to_string())]
+            )
+        );
+        assert_eq!(
+            chat.background.len(),
+            configured_cap - 1,
+            "a refused sidebar start must not stash the focused session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_session_limit_refusal_restores_the_focused_session_with_the_error() {
+        // The pane cap can pass while the daemon's own 64-session store is
+        // full (other clients hold slots). `session/new` then fails with
+        // code -32001 "Session limit reached", and the sidebar start must
+        // show that error and keep the focused session as it was.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.set_max_tracked_sessions(4);
+
+        let task = tokio::spawn(async move {
+            chat.add_agent_session("alpha").await;
+            chat
+        });
+        let request = next_rpc_request(
+            &mut rx,
+            "a sidebar start should ask the daemon for a session",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        respond_err(&rpc, &request, -32001, "Session limit reached");
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a refused start should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert!(
+            chat.background.is_empty(),
+            "the stashed focused session must be restored, not left parked"
+        );
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args(
+                "zc-chat-error-create-session",
+                &[("error", "RPC session/new: Session limit reached (-32001)")]
+            )
+        );
     }
 
     #[tokio::test]
@@ -21186,16 +21302,20 @@ mod tests {
         // A confirmed directory starts an *additional* session, so the picker
         // must refuse at the cap exactly like the sidebar "+": opening it
         // would stash the live session behind a picker that cannot add the
-        // ninth tracked session it would need to honor the selection.
+        // next tracked session it would need to honor the selection.
+        // Parameterised on a configured cap so the refusal follows whatever
+        // the operator set, not a compile-time constant.
+        let configured_cap = 4;
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
-        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+        chat.set_max_tracked_sessions(configured_cap);
+        for idx in 2..=configured_cap {
             let session_id = format!("sess-{idx}");
             chat.session_order.push(session_id.clone());
             chat.background.push(state_for(&session_id, "alpha"));
         }
-        assert_eq!(chat.tracked_session_count(), MAX_TRACKED_SESSIONS_PER_PANE);
+        assert_eq!(chat.tracked_session_count(), configured_cap);
 
         chat.begin_change_directory();
 
@@ -21204,12 +21324,12 @@ mod tests {
             active_info_notice(&chat),
             crate::i18n::t_args(
                 "zc-chat-session-cap",
-                &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+                &[("max", &configured_cap.to_string())]
             )
         );
         assert_eq!(
             chat.background.len(),
-            MAX_TRACKED_SESSIONS_PER_PANE - 1,
+            configured_cap - 1,
             "a refused picker must not stash the focused session"
         );
     }

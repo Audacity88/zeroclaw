@@ -518,6 +518,35 @@ fn default_todotracker_max_height() -> u16 {
     5
 }
 
+/// Shared chat-pane session-cap bounds.
+pub(crate) const MAX_SESSIONS_PER_PANE_MIN: usize = 1;
+pub(crate) const MAX_SESSIONS_PER_PANE_MAX: usize = 32;
+
+/// The `[chat]` section: chat-pane behavior (not dock layout, which is
+/// `[sidebar]`, and not daemon connection, which is `[connection]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChatSection {
+    /// Upper bound on sessions one chat-like pane tracks (focused +
+    /// background). Clamped at the shell boundary: two panes at the
+    /// 32-session maximum still fit the daemon's 64-session store.
+    #[serde(default = "default_chat_max_sessions_per_pane")]
+    pub max_sessions_per_pane: usize,
+}
+
+impl Default for ChatSection {
+    fn default() -> Self {
+        Self {
+            max_sessions_per_pane: default_chat_max_sessions_per_pane(),
+        }
+    }
+}
+
+/// Default per-pane session cap. Two panes keep the TUI comfortably under
+/// the daemon's 64-session cap.
+pub(crate) fn default_chat_max_sessions_per_pane() -> usize {
+    8
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ZerocodeConfig {
     #[serde(default = "default_locale")]
@@ -534,6 +563,8 @@ pub(crate) struct ZerocodeConfig {
     keybindings: HashMap<String, ChordSpec>,
     #[serde(default)]
     pub todotracker: TodoTrackerSection,
+    #[serde(default)]
+    pub chat: ChatSection,
 }
 
 impl Default for ZerocodeConfig {
@@ -545,6 +576,7 @@ impl Default for ZerocodeConfig {
             sidebar: SidebarSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
+            chat: ChatSection::default(),
         }
     }
 }
@@ -646,6 +678,14 @@ impl ZerocodeConfig {
         self.sidebar
             .queue_percent
             .clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX)
+    }
+
+    /// Configured per-pane session cap, clamped to `1..=32` so two panes
+    /// stay within the daemon's 64-session store.
+    pub(crate) fn effective_chat_max_sessions_per_pane(&self) -> usize {
+        self.chat
+            .max_sessions_per_pane
+            .clamp(MAX_SESSIONS_PER_PANE_MIN, MAX_SESSIONS_PER_PANE_MAX)
     }
 
     /// Convert the `[todotracker]` section into the runtime settings type
@@ -861,6 +901,15 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
             Ok(section) => config.todotracker = section,
             Err(e) => eprintln!(
                 "zerocode: ignoring [todotracker] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("chat") {
+        match v.clone().try_into::<ChatSection>() {
+            Ok(section) => config.chat = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [chat] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -2217,6 +2266,86 @@ mod tests {
             config.effective_sidebar_queue_percent(),
             SIDEBAR_QUEUE_PERCENT_MIN
         );
+    }
+
+    #[test]
+    fn chat_section_defaults_when_the_section_is_absent_or_malformed() {
+        // A config file written before the `[chat]` section existed must load
+        // unchanged at the default cap.
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\n");
+        let config = load_persisted(dir.path()).unwrap();
+        assert_eq!(
+            config.chat.max_sessions_per_pane,
+            default_chat_max_sessions_per_pane()
+        );
+        assert!(!config.sidebar.visible, "neighbor section intact");
+
+        // A malformed section drops to the default, like every other section.
+        seed(dir.path(), "[chat]\nmax_sessions_per_pane = \"many\"\n");
+        let config = load_persisted(dir.path()).unwrap();
+        assert_eq!(
+            config.chat.max_sessions_per_pane,
+            default_chat_max_sessions_per_pane(),
+            "bad [chat] drops to default"
+        );
+    }
+
+    #[test]
+    fn chat_section_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[sidebar]\nvisible = false\n\n[chat]\nmax_sessions_per_pane = 12\n",
+        );
+
+        let config = load_persisted(dir.path()).unwrap();
+        assert_eq!(config.chat.max_sessions_per_pane, 12);
+        assert!(!config.sidebar.visible, "neighbor section intact");
+
+        let body = toml::to_string_pretty(&config).unwrap();
+        let reparsed: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(reparsed.chat.max_sessions_per_pane, 12);
+    }
+
+    #[test]
+    fn chat_effective_cap_clamps_to_shell_bounds() {
+        let mut config = ZerocodeConfig::default();
+        assert_eq!(
+            config.effective_chat_max_sessions_per_pane(),
+            default_chat_max_sessions_per_pane(),
+            "the default sits inside the bounds"
+        );
+        config.chat.max_sessions_per_pane = 0;
+        assert_eq!(
+            config.effective_chat_max_sessions_per_pane(),
+            MAX_SESSIONS_PER_PANE_MIN
+        );
+        config.chat.max_sessions_per_pane = 100;
+        assert_eq!(
+            config.effective_chat_max_sessions_per_pane(),
+            MAX_SESSIONS_PER_PANE_MAX
+        );
+    }
+
+    #[test]
+    fn default_config_serializes_chat_for_env_overrides() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            body.contains("[chat]") && body.contains("max_sessions_per_pane"),
+            "the default document must materialize [chat] so schema-mirror env overrides resolve; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn chat_env_override_sets_the_cap() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "");
+        let _cap = EnvVarGuard::set("ZEROCODE_chat__max_sessions_per_pane", "3");
+        let config = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(config.chat.max_sessions_per_pane, 3);
+        assert_eq!(config.effective_chat_max_sessions_per_pane(), 3);
     }
 
     #[test]

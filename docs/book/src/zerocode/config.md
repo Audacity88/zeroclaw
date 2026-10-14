@@ -58,6 +58,22 @@ visible = true # show the agent/session sidebar at launch
 width = 24     # target width in terminal columns
 ```
 
+The per-pane session cap is a chat-pane setting, so it lives in `[chat]`:
+
+```toml
+[chat]
+max_sessions_per_pane = 8 # sessions one pane tracks (focused + background), 1..=32
+```
+
+One pane tracks up to `max_sessions_per_pane` sessions: the focused one plus
+the background ones listed in the sidebar. When the pane is full, the sidebar
+"+", Change directory, resume, and opening a session from the picker show the
+limit instead of starting a session; closing one from the sidebar frees a
+slot. The value is clamped to `1..=32`, so two panes at the maximum still fit
+the daemon's 64-session store. The cap is read when the pane is built: edit
+it and the next zerocode start (or reconnect) uses the new value; a lowered
+cap never closes sessions the pane already tracks.
+
 Press `Ctrl+B` to show or hide the sidebar. Quickstart remains reachable from
 the keyboard mode bar and also appears as a sidebar launcher, including at
 narrow terminal widths. Selecting an existing agent from the sidebar starts a

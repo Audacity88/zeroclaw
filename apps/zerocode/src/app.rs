@@ -1690,7 +1690,15 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
+                // Read the effective session cap once per build so both panes
+                // agree with each other and with the dock's config read. A
+                // reload can never drop already-tracked sessions: the cap only
+                // gates new ones.
+                let max_tracked_sessions = config::ensure_and_load(config_dir)
+                    .map(|cfg| cfg.effective_chat_max_sessions_per_pane())
+                    .unwrap_or_else(|_| config::default_chat_max_sessions_per_pane());
                 let mut acp_pane = acp::Acp::new(rpc.clone());
+                acp_pane.set_max_tracked_sessions(max_tracked_sessions);
                 // Carry the pre-disconnect sessions across a reconnect rebuild
                 // so the rebuilt pane reattaches every daemon-retained session
                 // (focused + sidebar backgrounds) instead of minting a fresh
@@ -1698,6 +1706,7 @@ pub async fn run(
                 acp_pane.set_resume_sessions($resume_acp);
                 acp_pane.init().await?;
                 let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                chat_pane.set_max_tracked_sessions(max_tracked_sessions);
                 chat_pane.set_resume_sessions($resume_chat);
                 chat_pane.init().await?;
                 let pending_start_chat = take_pending_quickstart_chat(
