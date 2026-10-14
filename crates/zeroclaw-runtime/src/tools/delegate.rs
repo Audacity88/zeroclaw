@@ -311,6 +311,14 @@ pub struct DelegateTool {
     workspace_dir: PathBuf,
     /// Cancellation token for cascade control of background tasks.
     cancellation_token: CancellationToken,
+    /// The running turn's cancellation lineage, handed to an instance built
+    /// inside a spawned task. A parallel worker's own delegate tool runs with
+    /// no turn scope, so this is the only way the turn reaches what it
+    /// delegates; the bounded child's own tool is dispatched inside its
+    /// sub-loop's scope and keeps this as a fallback. `None` on the root tool
+    /// and on background workers, whose foreground children bind to their
+    /// own token instead.
+    turn_token: Option<CancellationToken>,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
     /// nested model provider map for brain resolution.
@@ -334,7 +342,7 @@ pub struct DelegateTool {
     /// config reloads and credential rotation instead of the startup snapshot.
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// Authority capability used to admit every independent target execution.
     execution_capability: Option<AgentExecutionCapability>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
@@ -370,6 +378,12 @@ pub struct DelegateTool {
     /// background/parallel re-executor wrappers carry it verbatim, like
     /// depth, because they re-run the SAME hop.
     inherited_cost_tracker: Option<Arc<crate::cost::CostTracker>>,
+    /// Live-progress sink for the one background delegation this tool was
+    /// rebuilt to run: the delegated loop reports its observer events here
+    /// and a flusher writes them to the task row. `None` everywhere else
+    /// (root tools, synchronous and parallel delegates, nested hops), whose
+    /// loops keep the inert observer.
+    progress: Option<Arc<super::delegate_progress::DelegateProgressSink>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +496,7 @@ impl DelegateTool {
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
+            turn_token: None,
             memory: None,
             providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
@@ -495,6 +510,7 @@ impl DelegateTool {
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
             prebuilt_cost_ctx: None,
             inherited_cost_tracker: None,
+            progress: None,
         }
     }
 
@@ -538,6 +554,7 @@ impl DelegateTool {
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
+            turn_token: None,
             memory: None,
             providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
@@ -551,6 +568,7 @@ impl DelegateTool {
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
             prebuilt_cost_ctx: None,
             inherited_cost_tracker: None,
+            progress: None,
         }
     }
 
@@ -615,16 +633,21 @@ impl DelegateTool {
     /// A child token for work that belongs to the running turn. It hangs off
     /// the turn's cancellation when a turn is executing this tool, so an abort
     /// of the turn reaches the parallel and agentic children the turn started
-    /// (their tasks outlive the dropped tool future), and off this tool's own
-    /// token otherwise. Background tasks keep this tool's token on purpose:
-    /// they outlive the turn by design and are cancelled through `cancel_task`.
+    /// (their tasks outlive the dropped tool future); off the turn lineage
+    /// this instance was handed when it was built inside a spawned task that
+    /// runs without a turn scope; and off this tool's own token otherwise. Background tasks never take this
+    /// token: they derive from `cancellation_token`, outlive the turn by
+    /// design, and are cancelled through `cancel_task`.
     fn turn_bound_child_token(&self) -> CancellationToken {
-        zeroclaw_api::tool::ToolExecutionContext::current()
+        if let Some(turn) = zeroclaw_api::tool::ToolExecutionContext::current()
             .and_then(|context| context.cancellation_token().cloned())
-            .map_or_else(
-                || self.cancellation_token.child_token(),
-                |turn| turn.child_token(),
-            )
+        {
+            return turn.child_token();
+        }
+        self.turn_token
+            .as_ref()
+            .unwrap_or(&self.cancellation_token)
+            .child_token()
     }
 
     /// Attach memory for namespace isolation on delegate agents.
@@ -687,7 +710,10 @@ impl DelegateTool {
     /// one-shot behavior and keeps the snapshot fallback; dropping the handle
     /// when the caller has one silently pins delegated plugin tools to startup
     /// config for the parent's whole lifetime.
-    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+    pub fn with_live_config(
+        mut self,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    ) -> Self {
         self.live_config = live_config;
         self
     }
@@ -2090,6 +2116,27 @@ impl DelegateTool {
         won
     }
 
+    async fn supervise_background_worker(
+        worker: tokio::task::JoinHandle<()>,
+        store: Arc<dyn crate::control_plane::TaskRegistry>,
+        task_id: String,
+        owner_pid: u32,
+        owner_boot_id: String,
+    ) {
+        if worker.await.is_err() {
+            Self::supervise_terminal_transition(&task_id, || {
+                crate::control_plane::reaper::recover_exited_delegate_worker(
+                    store.as_ref(),
+                    &task_id,
+                    owner_pid,
+                    &owner_boot_id,
+                )
+            })
+            .await;
+            Self::background_task_cancels().lock().remove(&task_id);
+        }
+    }
+
     async fn supervise_settlement_intent(
         store: &dyn crate::control_plane::TaskRegistry,
         task_id: &str,
@@ -2315,7 +2362,9 @@ impl Tool for DelegateTool {
             (
                 DelegateAction::schema_values(),
                 "Action to perform. Default: 'delegate'. Use 'check_result' to \
-                 retrieve a background task result, 'await_sessions' to wait for \
+                 retrieve a background task result (a running task reports a \
+                 bounded 'progress' object: last activity, model calls, last and \
+                 recent tools, elapsed time and budget), 'await_sessions' to wait for \
                  multiple background results, 'list_results' to list all background \
                  tasks, 'cancel_task' to cancel a running background task."
                     .to_string(),
@@ -2896,11 +2945,20 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        // A single-call background delegate has no tool loop to observe, so
+        // its one model request and the reply are recorded here.
+        if let Some(sink) = self.progress.as_deref() {
+            sink.set_timeout_budget(timeout_secs);
+            sink.note_model_request();
+        }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
         )
         .await;
+        if let Some(sink) = self.progress.as_deref() {
+            sink.note_activity();
+        }
 
         let result = match result {
             Ok(inner) => inner,
@@ -3258,6 +3316,8 @@ impl DelegateTool {
         let terminal_store = Arc::clone(&task_control_plane.store);
         let terminal_owner_pid = std::process::id();
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
+        let supervisor_store = Arc::clone(&terminal_store);
+        let supervisor_boot_id = terminal_owner_boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         // Receipt continuity for detached work: capture the launching turn's
@@ -3289,7 +3349,28 @@ impl DelegateTool {
         let cost_ctx = self.delegate_cost_context(&agent_name_owned, target_policy_ceiling_cents);
         let prebuilt_cost_ctx = cost_ctx.map(|ctx| (agent_name_owned.clone(), ctx));
 
-        zeroclaw_spawn::spawn!(
+        // Live progress: the delegated loop reports into this sink, and one
+        // flusher per task writes it to the task row (owner-boot checked,
+        // running rows only) until the outcome is known. The sink reads its
+        // receipt tail from the detached scope's own collector.
+        let detached_receipt_scope =
+            crate::agent::tool_receipts::detached_scope(parent_receipt_generator);
+        let progress_sink = super::delegate_progress::DelegateProgressSink::new(
+            detached_receipt_scope
+                .as_ref()
+                .map(|scope| Arc::clone(&scope.collector)),
+        );
+        let progress_stop = CancellationToken::new();
+        let progress_flusher = super::delegate_progress::run_progress_flusher(
+            Arc::clone(&progress_sink),
+            Arc::clone(&terminal_store),
+            task_id.clone(),
+            terminal_owner_boot_id.clone(),
+            progress_stop.clone(),
+        );
+        let progress_flusher = zeroclaw_spawn::spawn!(progress_flusher);
+
+        let worker = zeroclaw_spawn::spawn!(
             TOOL_LOOP_THREAD_ID.scope(
                 parent_thread_id,
                 scope_delegate_session_key(
@@ -3298,11 +3379,13 @@ impl DelegateTool {
                         parent_step_scope,
                         // Detached receipt scope: the launching turn's generator with a
                         // fresh per-task collector; nothing appends to the launching
-                        // turn's receipts block (consumer: check_result progress,
-                        // tracked separately).
+                        // turn's receipts block. The progress sink reads its tail.
                         crate::agent::tool_receipts::scope_receipts(
-                            crate::agent::tool_receipts::detached_scope(parent_receipt_generator),
+                            detached_receipt_scope,
                             async move {
+                // Stops the progress flusher however this task ends, including
+                // an unwind; the normal path drops it explicitly below.
+                let progress_stop_guard = progress_stop.drop_guard();
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -3318,6 +3401,7 @@ impl DelegateTool {
                     delegate_config,
                     workspace_dir: workspace_dir.clone(),
                     cancellation_token: child_token.clone(),
+                    turn_token: None,
                     memory,
                     providers_models,
                     risk_profiles,
@@ -3331,6 +3415,7 @@ impl DelegateTool {
                     task_control_plane: nested_task_control_plane,
                     prebuilt_cost_ctx,
                     inherited_cost_tracker,
+                    progress: Some(progress_sink),
                 };
 
                 let args_inner = json!({
@@ -3370,6 +3455,11 @@ impl DelegateTool {
                 drop(inner);
                 drop(args_inner);
                 drop(agent_name_owned);
+                // Final progress write, then no more: the terminal transition
+                // below must not race a late flush (the store also refuses
+                // progress on non-running rows).
+                drop(progress_stop_guard);
+                let _ = progress_flusher.await;
                 drop(full_prompt);
                 drop(workspace_dir);
                 drop(child_token);
@@ -3424,6 +3514,15 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
         );
+
+        let supervisor_task_id = task_id.clone();
+        zeroclaw_spawn::spawn!(Self::supervise_background_worker(
+            worker,
+            supervisor_store,
+            supervisor_task_id,
+            terminal_owner_pid,
+            supervisor_boot_id,
+        ));
 
         Ok(ToolResult {
             success: true,
@@ -3605,7 +3704,12 @@ impl DelegateTool {
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
-            let cancellation_token = self.turn_bound_child_token();
+            // The worker's own delegate tool keeps the two lineages apart,
+            // as the bounded child's does: background tasks it launches
+            // descend from this tool's token, its foreground children
+            // follow the turn.
+            let cancellation_token = self.cancellation_token.child_token();
+            let turn_token = self.turn_bound_child_token();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -3669,6 +3773,7 @@ impl DelegateTool {
                         delegate_config,
                         workspace_dir,
                         cancellation_token,
+                        turn_token: Some(turn_token),
                         memory,
                         providers_models,
                         risk_profiles,
@@ -3682,6 +3787,9 @@ impl DelegateTool {
                         task_control_plane,
                         prebuilt_cost_ctx,
                         inherited_cost_tracker,
+                        // Parallel delegates are awaited by the caller's own
+                        // turn; only detached (background) work reports progress.
+                        progress: None,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = ExecutionTreeBudget::scope_optional(
@@ -3876,6 +3984,11 @@ impl DelegateTool {
                 .then_some(
                     "the owning daemon exited or the task exceeded its max runtime; reconciled by the supervision reaper",
                 );
+            let progress = Self::progress_view(
+                snapshot.progress.as_ref(),
+                &snapshot.task.started_at,
+                snapshot.task.finished_at.as_deref(),
+            );
             return Ok(Some((
                 state,
                 json!({
@@ -3886,6 +3999,7 @@ impl DelegateTool {
                     "error": task_error.clone(),
                     "started_at": snapshot.task.started_at,
                     "finished_at": snapshot.task.finished_at,
+                    "progress": progress,
                     "note": note,
                 }),
                 task_error,
@@ -3910,9 +4024,37 @@ impl DelegateTool {
                 "error": stored.legacy_error,
                 "started_at": stored.legacy_started_at,
                 "finished_at": stored.legacy_finished_at,
+                "progress": serde_json::Value::Null,
             }),
             stored.legacy_error,
         )))
+    }
+
+    /// The `progress` object of a background view: the stored record plus
+    /// `elapsed_secs`, measured from the row's start to its finish or to now.
+    /// `Null` when the task never recorded progress.
+    fn progress_view(
+        progress: Option<&crate::control_plane::TaskProgress>,
+        started_at: &str,
+        finished_at: Option<&str>,
+    ) -> serde_json::Value {
+        let Some(progress) = progress else {
+            return serde_json::Value::Null;
+        };
+        let mut view = serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
+        let started = chrono::DateTime::parse_from_rfc3339(started_at).ok();
+        let ended = finished_at
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map_or_else(chrono::Utc::now, |value| value.with_timezone(&chrono::Utc));
+        let elapsed_secs = started.map(|started| {
+            (ended - started.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0)
+        });
+        if let Some(object) = view.as_object_mut() {
+            object.insert("elapsed_secs".into(), json!(elapsed_secs));
+        }
+        view
     }
 
     fn task_ids_from_args(args: &serde_json::Value) -> anyhow::Result<Vec<String>> {
@@ -4752,10 +4894,16 @@ impl DelegateTool {
                         multimodal_config: self.multimodal_config.clone(),
                         delegate_config: self.delegate_config.clone(),
                         workspace_dir: self.workspace_dir.clone(),
-                        // The child's own delegate tool: its children must
-                        // stay bound to this turn even from a spawned task,
-                        // where the turn token is not visible.
-                        cancellation_token: self.turn_bound_child_token(),
+                        // The child's own delegate tool keeps the two
+                        // lineages apart. Its background tasks descend from
+                        // this tool's own token, as they would from the root,
+                        // so stopping the turn does not stop work launched to
+                        // outlive it. Its foreground children follow the turn:
+                        // the sub-loop scopes its token around each tool call,
+                        // and `turn_token` carries the same lineage as a
+                        // fallback outside that scope.
+                        cancellation_token: self.cancellation_token.child_token(),
+                        turn_token: Some(self.turn_bound_child_token()),
                         memory: self.memory.clone(),
                         providers_models: Arc::clone(&self.providers_models),
                         risk_profiles: Arc::clone(&self.risk_profiles),
@@ -4771,6 +4919,7 @@ impl DelegateTool {
                         // resolves its own cost context for its own target.
                         prebuilt_cost_ctx: None,
                         inherited_cost_tracker,
+                        progress: None,
                     }) as Box<dyn Tool>
                 });
 
@@ -4918,6 +5067,15 @@ impl DelegateTool {
                     config.delegate.agentic_timeout_secs
                 })
             });
+        // Background delegations report the loop's events to their progress
+        // sink; every other delegation keeps the inert observer.
+        let loop_observer: &dyn Observer = match self.progress.as_deref() {
+            Some(sink) => {
+                sink.set_timeout_budget(agentic_timeout_secs);
+                sink
+            }
+            None => &noop_observer,
+        };
         let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -4947,7 +5105,7 @@ impl DelegateTool {
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
-                        observer: &noop_observer,
+                        observer: loop_observer,
                         silent: true,
                         approval: approval_manager.as_ref(),
                         multimodal_config: target_config
@@ -5185,7 +5343,13 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, CountingEchoTool);
+    zeroclaw_api::mock_tool_attribution!(
+        EchoTool,
+        FakeMcpTool,
+        CountingEchoTool,
+        GateTool,
+        PanickingTool
+    );
 
     fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
         TaskRecord {
@@ -5693,6 +5857,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exited_worker_recovers_settlement_with_live_parent_and_preserves_winners() {
+        for scenario in [
+            "published",
+            "missing",
+            "no-intent",
+            "cancelled",
+            "transferred",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let owner_pid = std::process::id();
+            let owner_boot_id = "test-boot";
+            let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+            let mut task = task_record(&task_id, TaskStatus::Running);
+            task.owner_pid = owner_pid;
+            store.create(task).await.unwrap();
+            let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+                .with_workspace_dir(temp.path().into())
+                .with_caller_alias("caller")
+                .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+            tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+            let path = tool.results_dir().join(format!("{task_id}.json"));
+            let bytes = DelegateTool::serialize_result(&BackgroundDelegateOutput {
+                task_id: task_id.clone(),
+                output: Some("recovered worker output".into()),
+            })
+            .unwrap();
+            let worker_store = Arc::clone(&store);
+            let worker_task_id = task_id.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let worker = zeroclaw_spawn::spawn!(async move {
+                if scenario != "no-intent" {
+                    assert!(
+                        worker_store
+                            .persist_terminal_settlement_intent(
+                                crate::control_plane::task_registry::TerminalSettlementIntent {
+                                    task_id: worker_task_id.clone(),
+                                    owner_pid,
+                                    owner_boot_id: owner_boot_id.into(),
+                                    desired_status: TaskStatus::Completed,
+                                    artifact_path: path.display().to_string(),
+                                    artifact_ref: Some(format!("artifact:{worker_task_id}.json")),
+                                    artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+                                    terminal_error: None,
+                                },
+                            )
+                            .await
+                            .unwrap()
+                    );
+                    if scenario != "missing" {
+                        DelegateTool::write_bytes_atomic(&path, &bytes)
+                            .await
+                            .unwrap();
+                    }
+                }
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let abort = worker.abort_handle();
+            let supervisor_store = Arc::clone(&store);
+            let supervisor_task_id = task_id.clone();
+            let supervisor = zeroclaw_spawn::spawn!(DelegateTool::supervise_background_worker(
+                worker,
+                supervisor_store,
+                supervisor_task_id,
+                owner_pid,
+                owner_boot_id.into(),
+            ));
+            ready_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                !supervisor.is_finished(),
+                "live worker must not be reclaimed"
+            );
+            assert_eq!(
+                crate::control_plane::reaper::recovery_pass(store.as_ref(), owner_boot_id)
+                    .await
+                    .unwrap(),
+                0,
+                "a live parent still suppresses process-based recovery",
+            );
+            let before = tool
+                .handle_await_sessions(&json!({
+                    "task_ids": [task_id], "timeout_ms": 0,
+                }))
+                .await
+                .unwrap();
+            let before: serde_json::Value = serde_json::from_str(&before.output).unwrap();
+            assert_eq!(before["pending"], json!([task_id]));
+            if scenario == "cancelled" {
+                assert!(
+                    store
+                        .transition_terminal(
+                            &task_id,
+                            TaskStatus::Cancelled,
+                            None,
+                            Some("cancelled".into()),
+                        )
+                        .await
+                        .unwrap()
+                );
+            } else if scenario == "transferred" {
+                store
+                    .claim_owner(&task_id, owner_pid, "next-boot")
+                    .await
+                    .unwrap();
+            }
+            abort.abort();
+            tokio::time::timeout(Duration::from_secs(5), supervisor)
+                .await
+                .unwrap()
+                .unwrap();
+            let snapshot = store.get_snapshot(&task_id).await.unwrap().unwrap();
+            let expected = match scenario {
+                "published" => TaskStatus::Completed,
+                "cancelled" => TaskStatus::Cancelled,
+                "transferred" => TaskStatus::Running,
+                _ => TaskStatus::Failed,
+            };
+            assert_eq!(snapshot.task.status, expected, "{scenario}");
+            let checked = tool
+                .handle_check_result(&json!({"task_id": task_id}))
+                .await
+                .unwrap();
+            let checked: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+            assert_eq!(checked["status"], json!(expected), "{scenario}");
+            let awaited = tool
+                .handle_await_sessions(&json!({
+                    "task_ids": [task_id], "timeout_ms": 0,
+                }))
+                .await
+                .unwrap();
+            let awaited: serde_json::Value = serde_json::from_str(&awaited.output).unwrap();
+            assert_eq!(
+                awaited["results"][0]["status"],
+                json!(expected),
+                "{scenario}"
+            );
+            if scenario == "published" {
+                assert_eq!(checked["output"], "recovered worker output");
+                assert_eq!(awaited["completed"], 1);
+            } else if scenario == "transferred" {
+                assert_eq!(snapshot.task.owner_boot_id, "next-boot");
+                assert!(snapshot.error.is_none());
+            } else {
+                assert!(snapshot.error.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn successful_in_process_settlement_removes_its_intent() {
         let store = SqliteTaskStore::new_in_memory().unwrap();
         let task_id = "settlement-success";
@@ -6146,6 +6461,21 @@ mod tests {
         task.originator_route = Some("leaf".into());
         task.originator_chain = vec!["root".into(), "middle".into(), "leaf".into()];
         store.create(task).await.unwrap();
+        // Live progress on the chain row: gated by the same door as output.
+        let progress = crate::control_plane::TaskProgress {
+            iterations: 7,
+            last_tool: Some(crate::control_plane::TaskProgressTool {
+                name: "probe_tool_10531".into(),
+                ..crate::control_plane::TaskProgressTool::default()
+            }),
+            ..crate::control_plane::TaskProgress::default()
+        };
+        assert!(
+            store
+                .record_progress(chain_row, "test-boot", &progress)
+                .await
+                .unwrap()
+        );
         // A foreign row: created by "other", chain contains only "other".
         let other_row = "92929292-9292-9292-9292-929292929292";
         let mut task = task_record(other_row, TaskStatus::Running);
@@ -6201,6 +6531,15 @@ mod tests {
             assert!(
                 check.output.contains(chain_row),
                 "{alias} must read the chain row via check_result: {check:?}"
+            );
+            let check_view: serde_json::Value = serde_json::from_str(&check.output).unwrap();
+            assert_eq!(
+                check_view["progress"]["iterations"], 7,
+                "{alias} must see the chain row's live progress: {check:?}"
+            );
+            assert_eq!(
+                check_view["progress"]["last_tool"]["name"], "probe_tool_10531",
+                "{alias} must see the running tool: {check:?}"
             );
             let awaited = tool
                 .handle_await_sessions(&json!({
@@ -6293,6 +6632,10 @@ mod tests {
                     .unwrap_or_default()
                     .contains("No result found"),
                 "a stranger must not read {task_id}: {check:?}"
+            );
+            assert!(
+                !format!("{check:?}").contains("probe_tool_10531"),
+                "a refused read must not leak progress: {check:?}"
             );
         }
         let check = tool
@@ -6648,26 +6991,31 @@ mod tests {
         loop {
             if let Ok(Some((state, view, error))) = tool.read_background_view(task_id, true).await {
                 if !state.is_pending() {
-                    if state == BackgroundResultState::Completed {
+                    if matches!(
+                        state,
+                        BackgroundResultState::Completed | BackgroundResultState::Failed
+                    ) {
                         let artifact_path = tool.results_dir().join(format!("{task_id}.json"));
                         let artifact = std::fs::read_to_string(&artifact_path)
                             .unwrap_or_else(|read_error| {
                                 panic!(
-                                    "completed background task {task_id} has no readable output artifact at {artifact_path:?}: {read_error}"
+                                    "terminal background task {task_id} has no readable output artifact at {artifact_path:?}: {read_error}"
                                 )
                             });
                         let artifact: BackgroundDelegateOutput = serde_json::from_str(&artifact)
                             .unwrap_or_else(|parse_error| {
                                 panic!(
-                                    "completed background task {task_id} has an invalid output artifact: {parse_error}"
+                                    "terminal background task {task_id} has an invalid output artifact: {parse_error}"
                                 )
                             });
                         assert_eq!(artifact.task_id, task_id);
                         assert_eq!(artifact.output.as_deref(), view["output"].as_str());
-                        assert!(
-                            error.is_none(),
-                            "completed task has retrieval error: {error:?}"
-                        );
+                        if state == BackgroundResultState::Completed {
+                            assert!(
+                                error.is_none(),
+                                "completed task has retrieval error: {error:?}"
+                            );
+                        }
                     }
                     let status = match state {
                         BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
@@ -6776,6 +7124,30 @@ mod tests {
                 output: format!("echo:{value}").into(),
                 error: None,
             })
+        }
+    }
+
+    struct PanickingTool {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn name(&self) -> &str {
+            "panic_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Panics to exercise background worker exit recovery."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            panic!("background worker panic fixture");
         }
     }
 
@@ -7534,7 +7906,23 @@ mod tests {
 
     struct LocalChatServer {
         uri: String,
+        /// Connections whose client hung up while their reply was held on
+        /// the gate: a caller that dropped its request mid-flight, which is
+        /// what a cancelled tool loop does. Always zero for an ungated server.
+        hung_up_before_release: Arc<std::sync::atomic::AtomicUsize>,
         _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl LocalChatServer {
+        /// A server with no gate, so nothing is ever held and nothing can
+        /// hang up while held.
+        fn ungated(uri: String, task: tokio::task::JoinHandle<()>) -> Self {
+            Self {
+                uri,
+                hung_up_before_release: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                _task: task,
+            }
+        }
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -7618,7 +8006,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_primary_failure_then_final_chat_server()
@@ -7652,7 +8040,7 @@ mod tests {
             .await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
@@ -7676,7 +8064,7 @@ mod tests {
             .await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_text_tool_then_final_chat_server() -> (
@@ -7709,7 +8097,7 @@ mod tests {
         });
 
         (
-            LocalChatServer { uri, _task: task },
+            LocalChatServer::ungated(uri, task),
             requests,
             request_bodies,
         )
@@ -7729,7 +8117,7 @@ mod tests {
             tokio::time::sleep(delay).await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -7770,7 +8158,7 @@ mod tests {
             }
         });
 
-        LocalChatServer { uri, _task: task }
+        LocalChatServer::ungated(uri, task)
     }
 
     async fn start_final_chat_server(contents: Vec<&'static str>) -> LocalChatServer {
@@ -7800,7 +8188,7 @@ mod tests {
             }
         });
 
-        LocalChatServer { uri, _task: task }
+        LocalChatServer::ungated(uri, task)
     }
 
     async fn assert_stored_for_target_only(fixture: &DelegateMemoryFixture, key: &str) {
@@ -10024,6 +10412,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_background_recovers_panicking_worker_through_check_result() {
+        let (server, _captured) = start_scripted_chat_server(&[chat_completion_tool_call(
+            "panic_tool",
+            "call_panic_bg",
+            json!({}),
+        )])
+        .await;
+        let temp = TempDir::new().unwrap();
+        let mut config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["target"], "bounded"),
+                ("target", &[], "bounded"),
+            ],
+            &[("bounded", 2, 20)],
+        );
+        Arc::get_mut(&mut config)
+            .unwrap()
+            .risk_profiles
+            .get_mut("target")
+            .unwrap()
+            .auto_approve
+            .push("panic_tool".into());
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let tool = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(temp.path().join("workspace"))
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(PanickingTool {
+                entered: Arc::clone(&entered),
+            })])));
+
+        // Exercise production spawning, not the supervisor helper directly.
+        let started = tool
+            .execute(json!({"agent": "target", "prompt": "panic", "background": true}))
+            .await
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the real background worker must invoke the panicking tool");
+
+        let checked = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let checked = tool
+                    .execute(json!({"action": "check_result", "task_id": task_id}))
+                    .await
+                    .unwrap();
+                let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+                if view["status"] != json!(TaskStatus::Running) {
+                    assert_eq!(view["status"], json!(TaskStatus::Failed), "{view}");
+                    break checked;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("production supervisor must settle the exited worker while its parent is alive");
+        assert!(!checked.success, "{checked:?}");
+        assert!(checked.error.is_some(), "{checked:?}");
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert_eq!(snapshot.task.owner_pid, std::process::id());
+    }
+
+    #[tokio::test]
     async fn execute_background_signs_sub_loop_tool_results_with_the_parent_generator() {
         use crate::agent::tool_receipts::{
             ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
@@ -10174,6 +10634,21 @@ mod tests {
                 .contains("background done"),
             "{bg_result:?}"
         );
+        // The detached collector feeds the task's progress receipt tail.
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        let tail = view["progress"]["receipt_tail"]
+            .as_array()
+            .unwrap_or_else(|| panic!("completed view carries a receipt tail: {view}"));
+        assert_eq!(tail.len(), 1, "one signed tool result: {view}");
+        let entry = tail[0].as_str().unwrap_or_default();
+        assert!(
+            entry.starts_with("echo_tool: ") && entry.contains("zc-receipt-"),
+            "the tail carries the collector's `<tool>: <token>` entries: {view}"
+        );
 
         let bodies = captured.lock().unwrap();
         assert_eq!(
@@ -10219,6 +10694,335 @@ mod tests {
         assert!(
             receipts.is_empty(),
             "detached receipts must not append to the launching turn's collector: {receipts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_call_background_delegate_counts_its_model_request() {
+        let (server, _captured) = start_scripted_chat_server(&[
+            serde_json::json!({"choices": [{"message": {"content": "single done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("single-test-model".to_string()),
+            api_key: Some("single-test-key".to_string()),
+            timeout_secs: Some(5),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                    mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(tmp.path().join("workspace"))
+            .with_providers_models(providers_models);
+
+        let started = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "one call in background",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.success, "background delegate failed: {started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let done = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_eq!(done.status, BackgroundTaskStatus::Completed, "{done:?}");
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        let progress = &view["progress"];
+        assert_eq!(
+            progress["iterations"], 1,
+            "the one request is counted: {view}"
+        );
+        assert!(progress["last_activity_at"].is_string(), "{view}");
+        assert!(progress["timeout_budget_secs"].as_u64().is_some(), "{view}");
+        assert_eq!(progress["tools_completed"], 0, "{view}");
+    }
+
+    /// Blocks inside `execute` until released, so a test can read a
+    /// background delegate's view while a tool call is in flight.
+    struct GateTool {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for GateTool {
+        fn name(&self) -> &str {
+            "gate_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Waits until the test releases it."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ToolResult {
+                success: true,
+                output: "gate:open".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn background_delegate_reports_live_progress_while_a_tool_runs() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let (server, _captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call("gate_tool", "call_gate", serde_json::json!({})),
+            serde_json::json!({"choices": [{"message": {"content": "gate done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("progress-test-model".to_string()),
+            api_key: Some("progress-test-key".to_string()),
+            timeout_secs: Some(5),
+            native_tools: Some(true),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                auto_approve: vec!["gate_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(tmp.path().join("workspace"))
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(GateTool {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })])));
+        assert!(
+            tool.progress.is_none(),
+            "a root tool carries no progress sink; only the rebuilt background tool does"
+        );
+
+        let started = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "run the gate in background",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.success, "background delegate failed: {started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the gate tool must be entered");
+        // The flusher writes on the next wake after the start event; poll the
+        // view with a deadline rather than sleeping for correctness.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let running = loop {
+            let checked = tool
+                .handle_check_result(&json!({"task_id": task_id}))
+                .await
+                .unwrap();
+            let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+            if view["progress"]["last_tool"]["name"] == "gate_tool" {
+                break view;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "running view never showed the gate tool: {view}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(running["status"], "running", "{running}");
+        assert!(running["output"].is_null(), "{running}");
+        let progress = &running["progress"];
+        assert!(
+            progress["iterations"].as_u64().unwrap_or_default() >= 1,
+            "{running}"
+        );
+        assert!(progress["last_tool"]["started_at"].is_string(), "{running}");
+        assert!(progress["last_tool"]["finished_at"].is_null(), "{running}");
+        assert_eq!(progress["tools_completed"], 0, "{running}");
+        assert!(progress["elapsed_secs"].is_i64(), "{running}");
+        assert!(
+            progress["timeout_budget_secs"].as_u64().is_some(),
+            "{running}"
+        );
+        assert_eq!(
+            progress["receipt_tail"],
+            json!([]),
+            "receipts off: {running}"
+        );
+        let control_plane = tool.background_control_plane().await.unwrap();
+        let row = control_plane.store.get(&task_id).await.unwrap().unwrap();
+        assert!(
+            row.heartbeat_at.is_some(),
+            "recording progress refreshes the running row's heartbeat: {row:?}"
+        );
+
+        release.notify_one();
+        let done = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_eq!(done.status, BackgroundTaskStatus::Completed, "{done:?}");
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        assert!(
+            view["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("gate done")),
+            "{view}"
+        );
+        assert_eq!(view["progress"]["tools_completed"], 1, "{view}");
+        assert_eq!(view["progress"]["last_tool"]["success"], true, "{view}");
+        assert_eq!(
+            view["progress"]["recent_tools"][0]["name"], "gate_tool",
+            "{view}"
         );
     }
 
@@ -12212,6 +13016,41 @@ mod tests {
         );
     }
 
+    /// The bounded child's own delegate tool is built inside a spawned task,
+    /// where the turn's task-local token is not visible, so it is handed the
+    /// turn lineage separately. Its foreground children follow that lineage;
+    /// its own token, which its background tasks derive from, stays apart
+    /// from the turn in both directions.
+    #[tokio::test]
+    async fn handed_turn_lineage_binds_foreground_children_without_touching_background_lineage() {
+        let turn = CancellationToken::new();
+        let mut tool = DelegateTool::new(sample_agents(), None, test_security());
+        tool.turn_token = Some(turn.child_token());
+
+        let foreground = tool.turn_bound_child_token();
+        assert!(!foreground.is_cancelled());
+        turn.cancel();
+        assert!(
+            foreground.is_cancelled(),
+            "outside a turn scope the handed lineage still reaches foreground children"
+        );
+        assert!(
+            !tool.cancellation_token().is_cancelled(),
+            "the turn does not reach the token background tasks descend from"
+        );
+
+        let turn = CancellationToken::new();
+        let mut tool = DelegateTool::new(sample_agents(), None, test_security());
+        tool.turn_token = Some(turn.child_token());
+        let foreground = tool.turn_bound_child_token();
+        tool.cancel_all_background_tasks();
+        assert!(
+            !foreground.is_cancelled(),
+            "cancelling background work does not reach the turn's foreground children"
+        );
+        assert!(!turn.is_cancelled());
+    }
+
     #[test]
     fn with_cancellation_token_replaces_default() {
         let custom_token = CancellationToken::new();
@@ -12223,6 +13062,163 @@ mod tests {
         assert!(tool.cancellation_token().is_cancelled());
     }
 
+    async fn background_persistence_failure_fixture(
+        workspace: &Path,
+    ) -> (DelegateTool, wiremock::MockServer) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "background persistence fixture provider failure"}
+            })))
+            .mount(&server)
+            .await;
+        let options = zeroclaw_providers::ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let tool = with_in_memory_task_store(
+            DelegateTool::new_with_options(sample_agents(), None, test_security(), options)
+                .with_workspace_dir(workspace.to_path_buf()),
+        );
+        (tool, server)
+    }
+
+    async fn assert_background_persistence_fixture_error(
+        tool: &DelegateTool,
+        task_id: &str,
+        server: &wiremock::MockServer,
+        result: &BackgroundDelegateResult,
+    ) {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("owned provider requests");
+        assert_eq!(requests.len(), 1, "the real typed provider dispatched once");
+        assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("typed provider JSON request");
+        assert_eq!(body["model"], "");
+        assert_eq!(result.task_id, task_id);
+        assert_eq!(result.agent, "researcher");
+        assert_eq!(result.status, BackgroundTaskStatus::Failed);
+        assert_eq!(result.output, None);
+        assert!(result.finished_at.is_some());
+        let error = result
+            .error
+            .as_deref()
+            .expect("fixture provider failure retained");
+        assert!(error.contains("Ollama API error (400 Bad Request)"));
+        assert!(error.contains("background persistence fixture provider failure"));
+        let snapshot = tool
+            .background_control_plane()
+            .await
+            .unwrap()
+            .store
+            .get_snapshot(task_id)
+            .await
+            .unwrap()
+            .expect("the current background task has a persisted row");
+        assert_eq!(snapshot.task.id, task_id);
+        assert_eq!(snapshot.task.kind, TaskKind::Delegate);
+        assert_eq!(snapshot.task.agent, result.agent);
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert_eq!(snapshot.error, result.error);
+        assert_eq!(snapshot.task.started_at, result.started_at);
+        assert_eq!(snapshot.task.finished_at, result.finished_at);
+    }
+
+    enum FailedArtifactCorruption {
+        Missing,
+        InvalidJson,
+        WrongTask,
+        StaleOutput,
+    }
+
+    async fn assert_failed_background_artifact_rejected(corruption: FailedArtifactCorruption) {
+        let workspace = TempDir::new().unwrap();
+        let (tool, provider_fixture) =
+            background_persistence_failure_fixture(workspace.path()).await;
+        let tool = Arc::new(tool);
+        let launch = tool
+            .execute(json!({
+                "agent": "researcher",
+                "prompt": "terminal artifact control",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(launch.success);
+        let task_id = launch
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let terminal = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&tool, &task_id, &provider_fixture, &terminal)
+            .await;
+        let artifact_path = tool.results_dir().join(format!("{task_id}.json"));
+        let original = std::fs::read(&artifact_path).unwrap();
+        let artifact: BackgroundDelegateOutput = serde_json::from_slice(&original).unwrap();
+        assert_eq!(artifact.task_id, task_id);
+        assert_eq!(artifact.output, None);
+
+        match corruption {
+            FailedArtifactCorruption::Missing => std::fs::remove_file(&artifact_path).unwrap(),
+            FailedArtifactCorruption::InvalidJson => {
+                std::fs::write(&artifact_path, b"{").unwrap();
+            }
+            FailedArtifactCorruption::WrongTask => {
+                let mut stale = artifact;
+                stale.task_id = uuid::Uuid::new_v4().to_string();
+                std::fs::write(&artifact_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            }
+            FailedArtifactCorruption::StaleOutput => {
+                let mut stale = artifact;
+                stale.output = Some("output from a different task".to_string());
+                std::fs::write(&artifact_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            }
+        }
+        let reader = Arc::clone(&tool);
+        let read_task_id = task_id.clone();
+        let observed = zeroclaw_spawn::spawn!(async move {
+            wait_for_terminal_background_result(&reader, &read_task_id).await
+        })
+        .await;
+        std::fs::write(&artifact_path, original).unwrap();
+        assert!(
+            observed.is_err_and(|error| error.is_panic()),
+            "the terminal wait accepted a missing, corrupt, or stale Failed artifact"
+        );
+        let restored = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&tool, &task_id, &provider_fixture, &restored)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_missing_artifact() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::Missing).await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_corrupt_artifact() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::InvalidJson).await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_another_tasks_artifact() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::WrongTask).await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_stale_output() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::StaleOutput).await;
+    }
+
     #[tokio::test]
     async fn background_task_result_persisted_to_disk() {
         let workspace = std::env::temp_dir().join(format!(
@@ -12231,10 +13227,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         let result = tool
             .execute(json!({
@@ -12267,13 +13260,12 @@ mod tests {
 
         // Read and parse the result
         let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_background_persistence_fixture_error(&tool, task_id, &provider_fixture, &bg_result)
+            .await;
         assert_eq!(bg_result.task_id, task_id);
         assert_eq!(bg_result.agent, "researcher");
-        // The task will have failed because ollama isn't running, but it should be persisted
-        assert!(
-            bg_result.status == BackgroundTaskStatus::Completed
-                || bg_result.status == BackgroundTaskStatus::Failed
-        );
+        // The owned provider fixture fails; terminal state must still be persisted.
+        assert_eq!(bg_result.status, BackgroundTaskStatus::Failed);
         assert!(bg_result.finished_at.is_some());
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -12287,10 +13279,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         // Start background task
         let result = tool
@@ -12312,7 +13301,9 @@ mod tests {
             .to_string();
 
         // Wait for background task
-        let _ = wait_for_terminal_background_result(&tool, &task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&tool, &task_id, &provider_fixture, &bg_result)
+            .await;
 
         // Check result
         let check = tool
@@ -12326,6 +13317,22 @@ mod tests {
         // The output should contain the serialized result
         assert!(check.output.contains(&task_id));
         assert!(check.output.contains("researcher"));
+        assert!(!check.success);
+        assert_eq!(check.error, bg_result.error);
+        let checked: serde_json::Value = serde_json::from_str(&check.output).unwrap();
+        assert_eq!(checked["task_id"], task_id);
+        assert_eq!(checked["agent"], "researcher");
+        assert_eq!(checked["status"], "failed");
+        assert!(checked["output"].is_null());
+        assert_eq!(checked["error"].as_str(), bg_result.error.as_deref());
+        assert_eq!(
+            checked["started_at"].as_str(),
+            Some(bg_result.started_at.as_str())
+        );
+        assert_eq!(
+            checked["finished_at"].as_str(),
+            bg_result.finished_at.as_deref()
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -12409,10 +13416,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         // Start a background task
         let result = tool
@@ -12433,7 +13437,9 @@ mod tests {
             .trim();
 
         // Wait for task to complete
-        let _ = wait_for_terminal_background_result(&tool, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_background_persistence_fixture_error(&tool, task_id, &provider_fixture, &bg_result)
+            .await;
 
         // List results
         let list = tool
@@ -12443,6 +13449,20 @@ mod tests {
 
         assert!(list.success);
         assert!(list.output.contains("researcher"));
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&list.output).unwrap();
+        assert_eq!(listed.len(), 1, "only the current task is listed");
+        assert_eq!(listed[0]["task_id"], task_id);
+        assert_eq!(listed[0]["agent"], "researcher");
+        assert_eq!(listed[0]["status"], "failed");
+        assert_eq!(listed[0]["error"].as_str(), bg_result.error.as_deref());
+        assert_eq!(
+            listed[0]["started_at"].as_str(),
+            Some(bg_result.started_at.as_str())
+        );
+        assert_eq!(
+            listed[0]["finished_at"].as_str(),
+            bg_result.finished_at.as_deref()
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -13619,6 +14639,7 @@ mod tests {
         Sync,
         Background,
         Parallel,
+        ParallelMany(&'static [&'static str]),
         ListResults,
     }
 
@@ -13627,6 +14648,344 @@ mod tests {
     /// result is in history the final text closes the loop. The tool-result
     /// message is captured so tests can assert exactly what the sub-agent's
     /// delegation returned to the delegating loop.
+    /// Stopping the root turn stops every worker of a parallel fan-out. The
+    /// workers run in spawned tasks with no turn scope of their own, so this
+    /// is the path that depends on the lineage handed to the worker's tool.
+    #[tokio::test]
+    async fn cancelling_the_root_turn_stops_every_parallel_worker() {
+        let temp = TempDir::new().unwrap();
+        // Each worker's model first asks for one more delegation, so a worker
+        // that is still alive after the cancel makes a second request. The
+        // replies are held until the test releases them, after the cancel.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (server, captured) = start_scripted_chat_server_released_by(
+            &[
+                chat_completion_tool_call(
+                    DelegateTool::NAME,
+                    "call_more_a",
+                    serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+                ),
+                chat_completion_tool_call(
+                    DelegateTool::NAME,
+                    "call_more_b",
+                    serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+                ),
+                serde_json::json!({"choices": [{"message": {"content": "worker finished"}}]}),
+                serde_json::json!({"choices": [{"message": {"content": "worker finished"}}]}),
+            ],
+            Some(Arc::clone(&release)),
+        )
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap3"),
+                ("middle", &["leaf", "other"], "cap3"),
+                ("leaf", &["deep"], "cap3"),
+                ("other", &["deep"], "cap3"),
+                ("deep", &[], "cap3"),
+            ],
+            &[("cap3", 3, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = Arc::new(DelegateCallThenFinalModelProvider::new_parallel_many(&[
+            "leaf", "other",
+        ]));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let turn = CancellationToken::new();
+        let foreground = {
+            let turn = turn.clone();
+            let provider = Arc::clone(&provider);
+            zeroclaw_spawn::spawn!(async move {
+                zeroclaw_api::tool::ToolExecutionContext::new(Some(turn))
+                    .run(async move {
+                        tool.execute_agentic(
+                            "middle",
+                            &middle_config,
+                            "custom.local",
+                            "test-model",
+                            provider.as_ref(),
+                            "fan out, then get stopped",
+                            None,
+                        )
+                        .await
+                    })
+                    .await
+            })
+        };
+
+        // Both workers are up, each waiting in its first model call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if captured.lock().unwrap().len() >= 2 {
+                break;
+            }
+            assert!(
+                provider.tool_message().is_none(),
+                "the fan-out settled before its workers reached the provider: {:?}",
+                provider.tool_message().map(|m| decoded_tool_message(&m))
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the parallel workers never started"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        turn.cancel();
+
+        // Each worker's exit is observed, not inferred: a cancelled tool loop
+        // drops its in-flight model call, and the server sees that client
+        // hang up while its reply is still held on the gate.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let hung_up = server
+                .hung_up_before_release
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if hung_up >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {hung_up} of 2 parallel workers dropped its model call after the cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        release.notify_one();
+        release.notify_one();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), foreground)
+            .await
+            .expect("the fan-out must stop once the turn is cancelled")
+            .expect("the foreground task must not panic");
+        match outcome {
+            Ok(result) => assert!(
+                !result.success,
+                "the cancelled fan-out must not report success: {result:?}"
+            ),
+            Err(error) => assert!(
+                error.to_string().to_lowercase().contains("cancel"),
+                "unexpected foreground error: {error:#}"
+            ),
+        }
+
+        // Both workers hung up before anything was released, so neither
+        // could have acted on a reply: the request log holds their two
+        // first requests and nothing else.
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "every parallel worker must stop with the turn, not go on to a second request: {bodies:?}"
+        );
+    }
+
+    /// Middle's model for the turn-cancellation test: the first call launches
+    /// `target_agent` in the background, the call after the tool result
+    /// records the receipt and then hangs, so the foreground worker ends only
+    /// because the turn it belongs to is cancelled.
+    struct DelegateBackgroundThenHangModelProvider {
+        target_agent: &'static str,
+        tool_message: std::sync::Mutex<Option<String>>,
+    }
+
+    impl DelegateBackgroundThenHangModelProvider {
+        fn new(target_agent: &'static str) -> Self {
+            Self {
+                target_agent,
+                tool_message: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn tool_message(&self) -> Option<String> {
+            self.tool_message.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for DelegateBackgroundThenHangModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
+                *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                return Ok(ChatResponse {
+                    text: Some("middle finished after all".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_leaf_bg".to_string(),
+                    name: DelegateTool::NAME.to_string(),
+                    arguments: serde_json::json!({
+                        "agent": self.target_agent,
+                        "prompt": "subtask from parent loop",
+                        "background": true
+                    })
+                    .to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DelegateBackgroundThenHangModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DelegateBackgroundThenHangModelProvider"
+        }
+    }
+
+    /// Stopping the root turn stops the foreground child it started and
+    /// spares the background grandchild that child launched: the two
+    /// cancellation lineages stay apart through a nested delegate tool.
+    #[tokio::test]
+    async fn cancelling_the_root_turn_stops_the_foreground_child_and_spares_its_background_grandchild()
+     {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_turn_cancel_spares_bg_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let temp = TempDir::new().unwrap();
+        // The leaf's model answers only once the test releases it, after the
+        // root turn has been cancelled, so the leaf cannot complete early and
+        // let a wrong lineage pass unnoticed.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (server, _captured) = start_scripted_chat_server_released_by(
+            &[serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]})],
+            Some(Arc::clone(&release)),
+        )
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap2"),
+                ("middle", &["leaf"], "cap2"),
+                ("leaf", &[], "cap2"),
+            ],
+            &[("cap2", 2, 20)],
+        );
+        let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut tool = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(workspace.clone())
+            .with_task_control_plane(task_control_plane(Arc::clone(&task_store)));
+        let reader = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(workspace.clone())
+            .with_task_control_plane(task_control_plane(Arc::clone(&task_store)));
+        let provider = Arc::new(DelegateBackgroundThenHangModelProvider::new("leaf"));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let turn = CancellationToken::new();
+        // Hand the lineage to the child without wrapping its future in an
+        // outer cancellation select: this must prove the child loop stops.
+        tool.turn_token = Some(turn.clone());
+        let foreground = {
+            let provider = Arc::clone(&provider);
+            zeroclaw_spawn::spawn!(async move {
+                tool.execute_agentic(
+                    "middle",
+                    &middle_config,
+                    "custom.local",
+                    "test-model",
+                    provider.as_ref(),
+                    "background hop, then hang",
+                    None,
+                )
+                .await
+            })
+        };
+
+        // Both workers are up: middle has launched leaf in the background and
+        // is sitting in its hanging model call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tool_message = loop {
+            if let Some(message) = provider.tool_message() {
+                break message;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "middle never received the background receipt"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let task_id = decoded_tool_message(&tool_message)
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .expect("background delegation must report a task_id");
+
+        turn.cancel();
+        release.notify_one();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), foreground)
+            .await
+            .expect("the foreground child must stop once the turn is cancelled")
+            .expect("the foreground task must not panic");
+        match outcome {
+            Ok(result) => assert!(
+                !result.success,
+                "the cancelled foreground child must not report success: {result:?}"
+            ),
+            Err(error) => assert!(
+                error.to_string().to_lowercase().contains("cancel"),
+                "unexpected foreground error: {error:#}"
+            ),
+        }
+
+        let waited = wait_for_terminal_background_result(&reader, &task_id).await;
+        assert_eq!(
+            waited.status,
+            BackgroundTaskStatus::Completed,
+            "the background grandchild must outlive the cancelled turn: {waited:?}"
+        );
+        assert!(
+            waited
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("leaf finished"),
+            "the background grandchild must deliver its result: {waited:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     struct DelegateCallThenFinalModelProvider {
         target_agent: &'static str,
         transport: MockDelegationTransport,
@@ -13644,6 +15003,10 @@ mod tests {
 
         fn new_parallel(target_agent: &'static str) -> Self {
             Self::with_transport(target_agent, MockDelegationTransport::Parallel)
+        }
+
+        fn new_parallel_many(targets: &'static [&'static str]) -> Self {
+            Self::with_transport(targets[0], MockDelegationTransport::ParallelMany(targets))
         }
 
         fn new_list_results() -> Self {
@@ -13704,6 +15067,10 @@ mod tests {
                     "parallel": [self.target_agent],
                     "prompt": "subtask from parent loop"
                 }),
+                MockDelegationTransport::ParallelMany(targets) => serde_json::json!({
+                    "parallel": targets,
+                    "prompt": "subtask from parent loop"
+                }),
                 MockDelegationTransport::ListResults => {
                     serde_json::json!({"action": "list_results"})
                 }
@@ -13752,31 +15119,96 @@ mod tests {
     async fn start_scripted_chat_server(
         responses: &[serde_json::Value],
     ) -> (LocalChatServer, Arc<std::sync::Mutex<Vec<String>>>) {
+        start_scripted_chat_server_released_by(responses, None).await
+    }
+
+    /// Like `start_scripted_chat_server`, but every response waits for one
+    /// `release.notify_one()` first, so a sub-agent served by it is still
+    /// running until the test lets it finish.
+    async fn start_scripted_chat_server_released_by(
+        responses: &[serde_json::Value],
+        release: Option<Arc<tokio::sync::Notify>>,
+    ) -> (LocalChatServer, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
-        let scripted: Vec<serde_json::Value> = responses.to_vec();
+        let scripted: Arc<Vec<serde_json::Value>> = Arc::new(responses.to_vec());
+        let hung_up = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung_up_for_server = Arc::clone(&hung_up);
         let task = zeroclaw_spawn::spawn!(async move {
-            let mut served = 0;
+            let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
-                let request = read_http_request(&mut socket).await;
-                captured_clone
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request).to_string());
-                let response = scripted.get(served).cloned().unwrap_or_else(|| {
-                    serde_json::json!({"error": {"message": "unexpected extra provider request"}})
-                });
-                write_json_response(&mut socket, response).await;
-                served += 1;
+                let captured = Arc::clone(&captured_clone);
+                let scripted = Arc::clone(&scripted);
+                let served = Arc::clone(&served);
+                let hung_up = Arc::clone(&hung_up_for_server);
+                let gated = release.is_some();
+                let release = release.clone();
+                let serve = async move {
+                    let request = read_http_request(&mut socket).await;
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request).to_string());
+                    let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = scripted.get(index).cloned().unwrap_or_else(|| {
+                        serde_json::json!({"error": {"message": "unexpected extra provider request"}})
+                    });
+                    if let Some(release) = &release {
+                        // A held reply waits for the gate, unless the client
+                        // hangs up first: that is the exit signal a cancelled
+                        // caller gives, and it is counted instead of served.
+                        tokio::select! {
+                            () = release.notified() => {}
+                            () = client_hung_up(&mut socket) => {
+                                hung_up.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                    }
+                    write_json_response(&mut socket, response).await;
+                };
+                // Held replies must not hold the listener: a gated server
+                // serves its connections concurrently, so several callers can
+                // be waiting on the gate at once. Ungated ones keep the
+                // request order the scripted replies rely on.
+                if gated {
+                    zeroclaw_spawn::spawn!(serve);
+                } else {
+                    serve.await;
+                }
             }
         });
 
-        (LocalChatServer { uri, _task: task }, captured)
+        (
+            LocalChatServer {
+                uri,
+                hung_up_before_release: hung_up,
+                _task: task,
+            },
+            captured,
+        )
+    }
+
+    /// Resolves once the peer closes `socket` (or it errors). Bytes the peer
+    /// sends while a reply is held are drained and ignored.
+    async fn client_hung_up(socket: &mut tokio::net::TcpStream) {
+        let mut scratch = [0u8; 64];
+        loop {
+            if socket.readable().await.is_err() {
+                return;
+            }
+            match socket.try_read(&mut scratch) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
     }
 
     async fn start_final_text_chat_server(
@@ -17142,7 +18574,7 @@ command = "rm independent-delegate-marker"
             }
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     /// Caller + agentic targets sharing one delegatable risk profile, with a
@@ -18299,7 +19731,7 @@ command = "rm independent-delegate-marker"
         hop_ceiling_cents: u32,
     ) -> (
         DelegateCostFixture,
-        Arc<RwLock<Config>>,
+        Arc<zeroclaw_config::live::LiveConfig>,
         Arc<dyn TaskRegistry>,
     ) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
@@ -18383,12 +19815,14 @@ command = "rm independent-delegate-marker"
         root_config.agents.insert("target2".to_string(), leaf);
 
         let root_config = Arc::new(root_config);
-        let live_config = Arc::new(RwLock::new((*root_config).clone()));
+        let live_config = Arc::new(zeroclaw_config::live::LiveConfig::new(
+            (*root_config).clone(),
+        ));
         let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
         let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&root_config))
-            .with_live_config(Some(Arc::clone(&live_config)))
+            .with_live_config(Some(live_config.handle()))
             .with_task_control_plane(task_control_plane(Arc::clone(&task_store)))
             .with_workspace_dir(workspace_dir)
             .with_runtime(Arc::new(DelegateTestRuntime))
@@ -18415,7 +19849,7 @@ command = "rm independent-delegate-marker"
     /// call it more than once (the leaf hops inherit it) keep the flipped
     /// mode.
     struct LiveConfigModeFlipTool {
-        live_config: Arc<RwLock<Config>>,
+        live_config: Arc<zeroclaw_config::live::LiveConfig>,
         disable_enabled: bool,
         disable_track_per_agent: bool,
         flipped: Arc<std::sync::atomic::AtomicBool>,
@@ -18438,14 +19872,15 @@ command = "rm independent-delegate-marker"
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            let mut reloaded = self.live_config.read().clone();
+            let mut reloaded = self.live_config.snapshot();
             if self.disable_enabled {
                 reloaded.cost.enabled = false;
             }
             if self.disable_track_per_agent {
                 reloaded.cost.track_per_agent = false;
             }
-            *self.live_config.write() = reloaded;
+            let revision = self.live_config.next_revision()?;
+            self.live_config.publish(revision, reloaded)?;
             self.flipped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ToolResult {
