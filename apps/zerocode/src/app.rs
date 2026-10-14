@@ -1894,12 +1894,9 @@ pub async fn run(
     if open_sessions.save {
         match crate::open_sessions::Store::acquire(config_dir, connect_label) {
             Ok(Some(store)) => open_sessions_store = Some(store),
-            // Another window owns this daemon's list. Restoring it here would
-            // reattach sessions live in that window, so this one starts empty
-            // and leaves the list to its owner.
-            Ok(None) => {
-                reload_status = Some(crate::i18n::t("zc-app-restore-sessions-other-window"));
-            }
+            // Every window slot is held by a running window: start empty and
+            // save nothing.
+            Ok(None) => {}
             Err(error) => {
                 reload_status = Some(crate::i18n::t_args(
                     "zc-app-restore-sessions-save-failed",
@@ -1911,9 +1908,18 @@ pub async fn run(
     let mut restored = None;
     if open_sessions.restore
         && let Some(store) = open_sessions_store.as_mut()
-        && let Some(saved) = store.load()
+        && let Some(mut saved) = store.load()
     {
+        // A session another running window has open stays there: two
+        // windows on one live session can cancel each other's turns.
+        let elsewhere = saved.without(&store.ids_open_in_other_windows());
         let (saved, dropped) = crate::open_sessions::prune_missing(&rpc, saved).await;
+        if elsewhere > 0 {
+            reload_status = Some(crate::i18n::t_args(
+                "zc-app-restore-sessions-other-window",
+                &[("count", &elsewhere.to_string())],
+            ));
+        }
         if dropped > 0 {
             reload_status = Some(crate::i18n::t_args(
                 "zc-app-restore-sessions-dropped",
