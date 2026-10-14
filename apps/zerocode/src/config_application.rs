@@ -137,13 +137,33 @@ impl ApplicationFeedback {
         missing
     }
 
+    /// True when the details view has something to show.
+    pub(crate) fn has_content(&self) -> bool {
+        self.saved.is_some() || self.has_observed_records()
+    }
+
+    fn has_observed_records(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| !status.records.is_empty())
+    }
+
     pub(crate) fn summary(&self) -> String {
         let details = t_args(
             "zc-config-application-details-hint",
             &[("key", &key_label(Action::ApplicationStatus))],
         );
         let Some((label, _)) = self.saved.as_ref() else {
-            return details;
+            // Nothing saved from this view: only point at the details when
+            // the daemon has recent changes to show.
+            return if self.has_observed_records() {
+                t_args(
+                    "zc-config-application-observed-hint",
+                    &[("key", &key_label(Action::ApplicationStatus))],
+                )
+            } else {
+                String::new()
+            };
         };
         let records = self.visible_records();
         let mut counts = [0usize; 5];
@@ -247,7 +267,11 @@ impl ApplicationFeedback {
         if let Some((_, Some(revision))) = self.saved.as_ref() {
             lines.push(revision_line("zc-config-application-receipt", revision));
         }
-        if let Some(status) = self.status.as_ref() {
+        if let Some(status) = self
+            .status
+            .as_ref()
+            .filter(|status| !status.records.is_empty())
+        {
             lines.push(revision_line(
                 "zc-config-application-published",
                 &status.published_revision,
@@ -262,7 +286,13 @@ impl ApplicationFeedback {
         }
         let records = self.visible_records();
         if records.is_empty() {
-            lines.push(Line::from(t("zc-config-application-unavailable")));
+            lines.push(Line::from(
+                if self.saved.is_none() && self.status.is_some() {
+                    t("zc-config-application-none-since-start")
+                } else {
+                    t("zc-config-application-unavailable")
+                },
+            ));
         }
         for record in &records {
             let target = match &record.target {
@@ -487,7 +517,9 @@ mod tests {
     #[test]
     fn summary_is_one_sentence_with_the_action_and_the_details_key() {
         let mut feedback = ApplicationFeedback::new();
-        assert_eq!(feedback.summary(), "Press s to view details.");
+        // Nothing saved and no status yet: no hint, nothing to open.
+        assert_eq!(feedback.summary(), "");
+        assert!(!feedback.has_content());
         let revision = PublishedConfigRevision {
             epoch: "epoch".into(),
             sequence: 7,
@@ -693,6 +725,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fresh_daemon_with_no_changes_offers_no_details() {
+        let mut peer = Peer::new();
+        let mut feedback = ApplicationFeedback::new();
+        peer.status(&mut feedback, snapshot(0, vec![])).await;
+        assert!(feedback.status.is_some());
+        assert_eq!(feedback.summary(), "");
+        assert!(!feedback.has_content());
+        let text = details(&feedback);
+        assert!(
+            text.contains("No config changes since the daemon started"),
+            "{text}"
+        );
+        assert!(!text.contains("Latest published revision"), "{text}");
+        assert!(!text.contains("Record limit"), "{text}");
+    }
+
+    #[tokio::test]
     async fn observed_details_scroll_and_consume_editor_keys() {
         let mut peer = Peer::new();
         let mut feedback = ApplicationFeedback::new();
@@ -705,7 +754,8 @@ mod tests {
         value["application"]["truncated"] = json!(true);
         peer.status(&mut feedback, value).await;
         assert!(!feedback.summary().contains("already been applied"));
-        assert!(details(&feedback).contains("Observed application status"));
+        assert!(details(&feedback).contains("Recent config changes on this daemon"));
+        assert_eq!(feedback.summary(), "Press s to see recent config changes.");
         assert!(details(&feedback).contains("Record limit: 512"));
         assert!(details(&feedback).contains("evicted records"));
         feedback.toggle_details();
