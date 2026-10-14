@@ -25976,7 +25976,15 @@ mod tests {
             .iter()
             .map(|entry| {
                 let mut lines = Vec::new();
-                render_entry_into(entry, false, false, ToolDisclosure::Full, 80, &mut lines);
+                render_entry_into(
+                    entry,
+                    false,
+                    false,
+                    ToolDisclosure::Full,
+                    80,
+                    None,
+                    &mut lines,
+                );
                 rendered_text(&lines)
             })
             .collect::<Vec<_>>();
@@ -26017,6 +26025,7 @@ mod tests {
             false,
             ToolDisclosure::Full,
             80,
+            None,
             &mut lines,
         );
         let text = rendered_text(&lines);

@@ -1383,6 +1383,8 @@ mod tests {
                         },
                         None,
                         None,
+                        None,
+                        None,
                         move |event| {
                             received.lock().unwrap().push(event);
                             std::future::ready(())
