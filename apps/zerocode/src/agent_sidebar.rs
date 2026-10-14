@@ -742,9 +742,11 @@ impl AgentSidebar {
     }
 }
 
-/// The row under a reorder drag: accent, bold, underlined across its width.
+/// The row under a reorder drag: the theme's warn colour, bold, underlined
+/// across its width. Accent is red in some themes, which reads as an error.
 fn drag_row_style() -> Style {
-    theme::accent_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
+    theme::warn_style()
+        .add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED)
 }
 
 fn status_style(status: SidebarStatus) -> Style {
@@ -901,6 +903,12 @@ mod tests {
             "the dragged row shows where it lands"
         );
         assert!(!marked(&term, rects[0]) && !marked(&term, rects[1]));
+        let name_cell = &term.backend().buffer()[(rects[2].x + 2, rects[2].y)];
+        assert_eq!(
+            name_cell.fg,
+            theme::active().warn,
+            "the drag mark uses the warn colour, not the accent"
+        );
         let landed: String = (rects[2].x..rects[2].right())
             .map(|x| term.backend().buffer()[(x, rects[2].y)].symbol())
             .collect();
