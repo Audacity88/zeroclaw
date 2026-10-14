@@ -3451,7 +3451,9 @@ impl App {
         let prop = format!("{map_path}.{key}");
         let value = serde_json::Value::String(self.edit_buf.clone());
         match self.rpc.config_set(&prop, value).await {
-            Ok(()) => {
+            Ok(revision) => {
+                self.application_feedback
+                    .record_saved(prop.clone(), revision);
                 self.secret_map_entry_key = None;
                 self.edit_buf.clear();
                 self.edit_cursor = 0;
