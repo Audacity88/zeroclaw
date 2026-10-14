@@ -9,10 +9,12 @@
 //! client that talks to two daemons keeps two lists. Only ids, aliases, order
 //! and focus are stored; queued input and drafts are not.
 //!
-//! One window owns a list at a time, held by an OS file lock beside it. A
-//! second window on the same daemon gets no store: it neither restores the
-//! first window's sessions (reattaching a session that is live in another
-//! window lets either window cancel it) nor overwrites its list.
+//! Each zerocode window on a daemon keeps its own list, in a numbered slot
+//! held by an OS file lock. A window takes the lowest free slot, so the first
+//! window gets slot 0 and a second one slot 1; closing the second and
+//! reopening it while the first still runs brings back the second's sessions.
+//! A session that another live window has in its list is not restored, since
+//! reattaching a session live in another window lets either window cancel it.
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +29,8 @@ const DIR_NAME: &str = "open-sessions";
 const FORMAT_VERSION: u32 = 1;
 /// Matches the panes' own cap; a hand-edited file cannot exceed it.
 const MAX_PER_PANE: usize = 8;
+/// Windows per daemon that keep a list; a window beyond this starts empty.
+const MAX_WINDOWS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -180,7 +184,9 @@ struct FileBody {
 /// Where one connection target's list lives, and the last list written there.
 #[derive(Debug)]
 pub(crate) struct Store {
-    path: PathBuf,
+    dir: PathBuf,
+    base: String,
+    slot: usize,
     target: String,
     last_saved: Option<Snapshot>,
     /// Held for the life of the store; the OS releases it when the process
@@ -188,52 +194,95 @@ pub(crate) struct Store {
     _lock: std::fs::File,
 }
 
+/// Slot 0 keeps the unnumbered names, so the first window's list is the
+/// same file a single-window user has always had.
+fn slot_file(dir: &Path, base: &str, slot: usize, ext: &str) -> PathBuf {
+    if slot == 0 {
+        dir.join(format!("{base}.{ext}"))
+    } else {
+        dir.join(format!("{base}-{slot}.{ext}"))
+    }
+}
+
+fn open_lock(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))
+}
+
+/// Whether some other process holds `path`'s lock. Probing takes the lock
+/// for an instant when it is free, then drops it.
+fn held_elsewhere(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(file) = open_lock(path) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 impl Store {
-    /// Take ownership of this connection target's list. `Ok(None)` means
-    /// another zerocode window already owns it.
+    /// Take the lowest free window slot for this connection target. `Ok(None)`
+    /// means every slot is held by a running window.
     pub(crate) fn acquire(config_dir: &Path, target_label: &str) -> Result<Option<Self>> {
         let digest = Sha256::digest(target_label.as_bytes());
-        let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let base: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         let dir = config_dir.join(DIR_NAME);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let lock_path = dir.join(format!("{name}.lock"));
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("opening {}", lock_path.display()))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).with_context(|| format!("locking {}", lock_path.display()));
+        for slot in 0..MAX_WINDOWS {
+            let lock_path = slot_file(&dir, &base, slot, "lock");
+            let lock = open_lock(&lock_path)?;
+            match lock.try_lock() {
+                Ok(()) => {
+                    return Ok(Some(Self {
+                        dir,
+                        base,
+                        slot,
+                        target: target_label.to_string(),
+                        last_saved: None,
+                        _lock: lock,
+                    }));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("locking {}", lock_path.display()));
+                }
             }
         }
-        Ok(Some(Self {
-            path: dir.join(format!("{name}.json")),
-            target: target_label.to_string(),
-            last_saved: None,
-            _lock: lock,
-        }))
+        Ok(None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    fn path(&self) -> PathBuf {
+        slot_file(&self.dir, &self.base, self.slot, "json")
+    }
+
+    /// Session ids saved by the other windows that are running now. Their
+    /// lists are what those windows have open, so this window must not
+    /// reattach any of them.
+    pub(crate) fn ids_open_in_other_windows(&self) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        for slot in (0..MAX_WINDOWS).filter(|slot| *slot != self.slot) {
+            if !held_elsewhere(&slot_file(&self.dir, &self.base, slot, "lock")) {
+                continue;
+            }
+            if let Some(snapshot) = read_snapshot(&slot_file(&self.dir, &self.base, slot, "json")) {
+                ids.extend(snapshot.sessions.into_iter().map(|s| s.session_id));
+            }
+        }
+        ids
     }
 
     /// The saved list, or `None` when there is none or it cannot be read. A
     /// damaged or newer-format file is ignored, not an error: the launch goes
     /// on with an empty sidebar and the next save replaces the file.
     pub(crate) fn load(&mut self) -> Option<Snapshot> {
-        let bytes = std::fs::read(&self.path).ok()?;
-        let body: FileBody = serde_json::from_slice(&bytes).ok()?;
-        if body.version != FORMAT_VERSION {
-            return None;
-        }
-        self.last_saved = Some(body.snapshot.clone());
-        Some(body.snapshot)
+        let snapshot = read_snapshot(&self.path())?;
+        self.last_saved = Some(snapshot.clone());
+        Some(snapshot)
     }
 
     /// Write `snapshot` if it differs from the last one written. Returns
@@ -251,8 +300,23 @@ impl Store {
             snapshot: snapshot.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&body).context("serializing open sessions")?;
-        crate::secure_file::write_private_atomic(&self.path, &bytes)?;
+        crate::secure_file::write_private_atomic(&self.path(), &bytes)?;
         Ok(true)
+    }
+}
+
+fn read_snapshot(path: &Path) -> Option<Snapshot> {
+    let bytes = std::fs::read(path).ok()?;
+    let body: FileBody = serde_json::from_slice(&bytes).ok()?;
+    (body.version == FORMAT_VERSION).then_some(body.snapshot)
+}
+
+impl Snapshot {
+    /// Drop the sessions another running window has open. Returns how many.
+    pub(crate) fn without(&mut self, ids: &std::collections::HashSet<String>) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|s| !ids.contains(&s.session_id));
+        before - self.sessions.len()
     }
 }
 
@@ -267,29 +331,91 @@ mod tests {
             .expect("no other window owns this list")
     }
 
+    fn saved_ids(store: &mut Store) -> Vec<String> {
+        store
+            .load()
+            .map(|s| s.sessions.into_iter().map(|s| s.session_id).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn a_second_window_does_not_get_the_list() {
+    fn a_reopened_second_window_gets_its_own_sessions_back() {
         let dir = tempfile::tempdir().unwrap();
-        let first = owned(dir.path(), "local:/run/a.sock");
+        let t = "local:/run/a.sock";
+        let mut first = owned(dir.path(), t);
+        first
+            .save_if_changed(&Snapshot::from_rows(
+                &[row(PaneKind::Acp, "w1", "a", true)],
+                None,
+            ))
+            .unwrap();
+        let mut second = owned(dir.path(), t);
         assert!(
-            Store::acquire(dir.path(), "local:/run/a.sock")
-                .unwrap()
-                .is_none(),
-            "a second window on the same daemon must not restore or save"
+            saved_ids(&mut second).is_empty(),
+            "a new second window starts empty"
         );
-        assert!(
-            Store::acquire(dir.path(), "local:/run/other.sock")
-                .unwrap()
-                .is_some(),
-            "a window on another daemon has its own list"
-        );
+        second
+            .save_if_changed(&Snapshot::from_rows(
+                &[row(PaneKind::Acp, "w2", "a", true)],
+                None,
+            ))
+            .unwrap();
+
+        // Close the second window and open it again while the first runs.
+        drop(second);
+        let mut reopened = owned(dir.path(), t);
+        assert_eq!(saved_ids(&mut reopened), ["w2"]);
+
+        // With both closed, the next launch is the first window again.
+        drop(reopened);
         drop(first);
-        assert!(
-            Store::acquire(dir.path(), "local:/run/a.sock")
-                .unwrap()
-                .is_some(),
-            "the list is free again once the owning window exits"
-        );
+        assert_eq!(saved_ids(&mut owned(dir.path(), t)), ["w1"]);
+    }
+
+    #[test]
+    fn sessions_open_in_another_running_window_are_not_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "local:/run/a.sock";
+        let mut first = owned(dir.path(), t);
+        first
+            .save_if_changed(&Snapshot::from_rows(
+                &[row(PaneKind::Acp, "shared", "a", true)],
+                None,
+            ))
+            .unwrap();
+        let mut second = owned(dir.path(), t);
+        second
+            .save_if_changed(&Snapshot::from_rows(
+                &[
+                    row(PaneKind::Acp, "shared", "a", false),
+                    row(PaneKind::Acp, "mine", "a", true),
+                ],
+                None,
+            ))
+            .unwrap();
+        drop(second);
+
+        let mut reopened = owned(dir.path(), t);
+        let mut saved = reopened.load().unwrap();
+        assert_eq!(saved.without(&reopened.ids_open_in_other_windows()), 1);
+        let ids: Vec<_> = saved
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["mine"]);
+
+        // A closed window's list does not block anything.
+        drop(first);
+        assert!(reopened.ids_open_in_other_windows().is_empty());
+    }
+
+    #[test]
+    fn windows_on_another_daemon_do_not_take_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let _a = owned(dir.path(), "local:/run/a.sock");
+        let b = owned(dir.path(), "local:/run/b.sock");
+        assert_eq!(b.slot, 0);
     }
 
     fn row(pane: PaneKind, id: &str, alias: &str, focused: bool) -> SidebarSessionSummary {

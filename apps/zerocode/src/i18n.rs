@@ -872,9 +872,13 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("save-failed message must format for {locale}"));
             assert!(failed.contains("disk full"), "{locale}: {failed}");
-            let other = format_ftl_message(&bundle, "zc-app-restore-sessions-other-window", &[])
-                .unwrap_or_else(|| panic!("other-window message must format for {locale}"));
-            assert!(!other.trim().is_empty(), "{locale}");
+            let other = format_ftl_message(
+                &bundle,
+                "zc-app-restore-sessions-other-window",
+                &[("count", "2")],
+            )
+            .unwrap_or_else(|| panic!("other-window message must format for {locale}"));
+            assert!(other.contains('2'), "{locale}: {other}");
         }
     }
 
