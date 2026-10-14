@@ -156,6 +156,34 @@ def matrix(fixture, path, token, body=None, method=None):
         return json.load(response)
 
 
+def request_body(headers, stream):
+    lengths = headers.get_all("Content-Length", [])
+    encodings = headers.get_all("Transfer-Encoding", [])
+    require(len(lengths) <= 1 and len(encodings) <= 1 and not (lengths and encodings))
+    maximum = 2 * 1024**2
+    if not encodings:
+        value = lengths[0] if lengths else "0"
+        require(re.fullmatch(r"[0-9]+", value) is not None)
+        size = int(value)
+        require(size <= maximum)
+        body = stream.read(size)
+        require(len(body) == size)
+        return body or None
+    require(encodings[0].lower() == "chunked")
+    body = bytearray()
+    while True:
+        line = stream.readline(1025)
+        require(len(line) <= 1024 and re.fullmatch(rb"[0-9a-fA-F]+(?:;[^\r\n]*)?\r\n", line) is not None)
+        size = int(line.split(b";", 1)[0].strip(), 16)
+        require(size <= maximum - len(body))
+        if size == 0:
+            require(stream.readline(3) == b"\r\n")
+            return bytes(body) or None
+        chunk = stream.read(size)
+        require(len(chunk) == size and stream.read(2) == b"\r\n")
+        body.extend(chunk)
+
+
 class Observer:
     def __init__(self, fixture):
         self.fixture = fixture
@@ -203,11 +231,9 @@ class Observer:
 
             def handle_request(self):
                 try:
-                    size = int(self.headers.get("Content-Length", "0"))
-                    require(0 <= size <= 2 * 1024**2)
-                    body = self.rfile.read(size) if size else None
+                    body = request_body(self.headers, self.rfile)
                     if self.path == "/v1/models" and self.command == "GET":
-                        require(size == 0 and self.headers.get("Authorization") == "Bearer synthetic-provider-acceptance-key")
+                        require(body is None and self.headers.get("Authorization") == "Bearer synthetic-provider-acceptance-key")
                         data = json.dumps({"object": "list", "data": [{"id": "matrix-fixture", "object": "model", "owned_by": "fixture"}]}).encode()
                         status, content_type = 200, "application/json"
                     elif self.path == "/v1/chat/completions" and self.command == "POST":
