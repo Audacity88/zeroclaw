@@ -412,6 +412,13 @@ class Runtime:
                 require(reply["event_id"] != event and event in self.observer.synced_events)
                 return True
             time.sleep(0.5)
+        print("matrix roundtrip timeout: " + json.dumps({
+            "syncs": min(self.observer.syncs, 1000000),
+            "probe_synced": event in self.observer.synced_events,
+            "provider_calls": min(self.observer.calls.get(nonce, 0), 1000000),
+            "reply_present": bool(reply),
+            "bot_messages": min(len(self.bot_messages(room)), 1000000),
+        }, sort_keys=True), flush=True)
         return False
 
     def ready(self, room, name):
@@ -620,6 +627,18 @@ def run(root):
         runtime.result["status"] = "failed"
         kinds = {"AssertionError", "OSError", "TimeoutExpired", "HTTPError", "URLError", "RuntimeError", "ValueError", "KeyError", "TypeError"}
         runtime.result["failure_kind"] = type(error).__name__ if type(error).__name__ in kinds else "other"
+        if runtime.result["phase"] == "runtime":
+            patterns = {
+                "sender_denied": b"plugin_channel_sender_denied",
+                "owner_missing": b"no agent owns this channel",
+                "inbound_received": b"channel inbound message",
+                "listener_error": b"channel listener error",
+                "poll_error": b"matrix: HTTP",
+                "reply_error": b"failed to reply",
+            }
+            for label, pattern in patterns.items():
+                found = any(pattern in path.read_bytes() for path in runtime.private.glob("runtime-*.log"))
+                print("matrix runtime flag: " + label + "=" + str(found).lower(), flush=True)
     finally:
         failed_phase = runtime.result["phase"]
         print("matrix acceptance phase: cleanup", flush=True)
