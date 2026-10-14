@@ -358,7 +358,7 @@ impl AgentSidebar {
             };
             let focused_here = summary.focused && ctx.active_pane == Some(summary.pane_kind);
             // Rows often share an agent name and colour, so the row being
-            // dragged gets an accent underline: a line marking where it lands.
+            // dragged is underlined and its status dot becomes a yellow arrow.
             let dragging_this = self.drag.as_ref().is_some_and(|(pane, sid)| {
                 *pane == summary.pane_kind && *sid == summary.session_id
             });
@@ -429,8 +429,13 @@ impl AgentSidebar {
                 SidebarStatus::Running => "\u{25b6} ",
                 _ => "\u{25cf} ",
             };
+            let (status_glyph, status_glyph_style) = if dragging_this {
+                ("\u{2195} ", drag_arrow_style())
+            } else {
+                (status_glyph, status_style(summary.status))
+            };
             let mut spans = vec![
-                Span::styled(status_glyph, status_style(summary.status)),
+                Span::styled(status_glyph, status_glyph_style),
                 Span::styled(
                     name,
                     if dragging_this {
@@ -464,11 +469,7 @@ impl AgentSidebar {
                 } else {
                     theme::dim_style()
                 };
-                let close_glyph = if dragging_this {
-                    "\u{2195}"
-                } else {
-                    "\u{2715}"
-                };
+                let close_glyph = "\u{2715}";
                 frame.render_widget(
                     Paragraph::new(Span::styled(close_glyph, close_style)).style(close_style),
                     close_rect,
@@ -742,11 +743,15 @@ impl AgentSidebar {
     }
 }
 
-/// The row under a reorder drag: the theme's warn colour, bold, underlined
-/// across its width. Accent is red in some themes, which reads as an error.
+/// The row under a reorder drag: the muted (date) colour, underlined across
+/// its width. Accent and warn read as an error or warning in some themes.
 fn drag_row_style() -> Style {
-    theme::warn_style()
-        .add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED)
+    theme::dim_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
+}
+
+/// The arrow that replaces the status dot while a row is being dragged.
+fn drag_arrow_style() -> Style {
+    theme::warn_style().add_modifier(ratatui::style::Modifier::UNDERLINED)
 }
 
 fn status_style(status: SidebarStatus) -> Style {
@@ -903,16 +908,30 @@ mod tests {
             "the dragged row shows where it lands"
         );
         assert!(!marked(&term, rects[0]) && !marked(&term, rects[1]));
-        let name_cell = &term.backend().buffer()[(rects[2].x + 2, rects[2].y)];
+        let buffer = term.backend().buffer();
+        let (arrow, name_cell) = (
+            &buffer[(rects[2].x, rects[2].y)],
+            &buffer[(rects[2].x + 2, rects[2].y)],
+        );
+        assert_eq!(
+            arrow.symbol(),
+            "\u{2195}",
+            "the arrow replaces the status dot"
+        );
+        assert_eq!(arrow.fg, theme::active().warn);
         assert_eq!(
             name_cell.fg,
-            theme::active().warn,
-            "the drag mark uses the warn colour, not the accent"
+            theme::active().dim,
+            "the dragged row uses the muted date colour, not accent or warn"
         );
         let landed: String = (rects[2].x..rects[2].right())
-            .map(|x| term.backend().buffer()[(x, rects[2].y)].symbol())
+            .map(|x| buffer[(x, rects[2].y)].symbol())
             .collect();
-        assert_eq!(landed.trim_end().chars().last(), Some('\u{2195}'));
+        assert_eq!(
+            landed.trim_end().chars().last(),
+            Some('\u{2715}'),
+            "the close mark stays"
+        );
 
         let mut release = click(rects[2].x, rects[2].y);
         release.kind = MouseEventKind::Up(MouseButton::Left);
