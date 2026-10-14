@@ -166,7 +166,36 @@ class Observer:
         self.known = set()
         self.forbidden = set()
         self.calls = {}
+        self.send_requests = 0
+        self.encryption_checks = 0
+        self.pending = 0
+        self.drained = threading.Condition()
         owner = self
+
+        class Server(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                connection, address = super().get_request()
+                connection.settimeout(40)
+                return connection, address
+
+            def process_request(self, request, address):
+                with owner.drained:
+                    owner.pending += 1
+                try:
+                    super().process_request(request, address)
+                except Exception:
+                    with owner.drained:
+                        owner.pending -= 1
+                        owner.drained.notify_all()
+                    raise
+
+            def process_request_thread(self, request, address):
+                try:
+                    super().process_request_thread(request, address)
+                finally:
+                    with owner.drained:
+                        owner.pending -= 1
+                        owner.drained.notify_all()
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -203,6 +232,10 @@ class Observer:
                     else:
                         require(self.path.startswith("/_matrix/client/v3/") and self.headers.get("Authorization") == "Bearer " + fixture["bot"]["token"])
                         owner.bot_requests += 1
+                        if self.command == "PUT" and "/send/m.room.message/" in self.path:
+                            owner.send_requests += 1
+                        if self.command == "GET" and "/state/m.room.encryption/" in self.path:
+                            owner.encryption_checks += 1
                         request = urllib.request.Request(fixture["homeserver"] + self.path, data=body, headers={"Authorization": self.headers["Authorization"], "Content-Type": "application/json"}, method=self.command)
                         try:
                             response = HTTP.open(request, timeout=35)
@@ -230,7 +263,7 @@ class Observer:
 
             do_GET = do_POST = do_PUT = handle_request
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -241,6 +274,8 @@ class Observer:
         self.server.server_close()
         self.thread.join(timeout=5)
         require(not self.thread.is_alive())
+        with self.drained:
+            require(self.drained.wait_for(lambda: self.pending == 0, timeout=45))
 
 
 class Runtime:
@@ -418,6 +453,8 @@ class Runtime:
             "provider_calls": min(self.observer.calls.get(nonce, 0), 1000000),
             "reply_present": bool(reply),
             "bot_messages": min(len(self.bot_messages(room)), 1000000),
+            "send_requests": min(self.observer.send_requests, 1000000),
+            "encryption_checks": min(self.observer.encryption_checks, 1000000),
         }, sort_keys=True), flush=True)
         return False
 
@@ -518,6 +555,8 @@ def prove(runtime, host_zip, guest_zip):
         runtime.cli(first, "config", "init", section, "--json")
     settings = {
         "plugins.enabled": "true", "plugins.auto_discover": "false",
+        "observability.log_persistence_path": str(runtime.private / "runtime-events.jsonl"),
+        "observability.log_persistence_max_entries": "1000",
         "providers.models.custom.fixture.uri": runtime.observer.base + "/v1",
         "providers.models.custom.fixture.api_key": "synthetic-provider-acceptance-key",
         "providers.models.custom.fixture.model": "matrix-fixture", "providers.models.custom.fixture.wire_api": "chat_completions",
@@ -587,7 +626,9 @@ def prove(runtime, host_zip, guest_zip):
     runtime.scored(rooms[1], "refusal-after")
     require({message["event_id"] for message in runtime.bot_messages(rooms[2])} <= baseline)
     runtime.stop()
+    runtime.observer.close()
     runtime.guard()
+    require({message["event_id"] for message in runtime.bot_messages(rooms[2])} <= baseline)
     require(runtime.config(first)["plugins"]["entries"][0]["config"]["access_token"].startswith("enc2:"))
     for log in runtime.logs:
         log.close()
@@ -635,9 +676,17 @@ def run(root):
                 "listener_error": b"channel listener error",
                 "poll_error": b"matrix: HTTP",
                 "reply_error": b"failed to reply",
+                "stream_fallback": b"llm_stream_fallback",
+                "llm_completed": b"LLM call completed",
+                "http_deadline": b"matrix: HTTP deadline exceeded",
+                "send_refused": b"matrix: encryption state present or uncertain",
+                "fuel_exhausted": b"fuel consumed",
+                "send_trapped": b"channel.send trapped",
+                "call_deadline": b"deadline exceeded",
             }
+            paths = list(runtime.private.glob("runtime-*.log")) + list(runtime.private.glob("runtime-events.jsonl"))
             for label, pattern in patterns.items():
-                found = any(pattern in path.read_bytes() for path in runtime.private.glob("runtime-*.log"))
+                found = any(pattern in path.read_bytes() for path in paths)
                 print("matrix runtime flag: " + label + "=" + str(found).lower(), flush=True)
     finally:
         failed_phase = runtime.result["phase"]
