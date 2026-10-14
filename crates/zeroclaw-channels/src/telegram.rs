@@ -3598,7 +3598,11 @@ impl TelegramChannel {
         )
     }
 
-    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
+    async fn persist_allowed_identity(
+        &self,
+        identity: &str,
+        identities: &[String],
+    ) -> anyhow::Result<()> {
         let Some(authority) = &self.persist else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3618,12 +3622,36 @@ impl TelegramChannel {
         // `peer_groups` map key. Selecting by key wrote the grant into whatever
         // group happened to be named `telegram_<alias>`, even one whose
         // `channel` points at a different instance, and reported success.
-        crate::identity_persist::persist_external_peer(
+        crate::identity_persist::persist_external_peer_checked(
             Some(authority),
             "telegram",
             &self.alias,
             &normalized,
             |entry, user| Self::normalize_identity(entry) == user,
+            None,
+            |config| {
+                anyhow::ensure!(
+                    !crate::allowlist::grants_anyone(
+                        &config.channel_external_peers("telegram", &self.alias)
+                    ),
+                    "Telegram startup pairing is no longer available"
+                );
+                let normalized: Vec<String> = identities
+                    .iter()
+                    .map(|id| Self::normalize_identity(id))
+                    .collect();
+                let borrowed: Vec<&str> = normalized.iter().map(String::as_str).collect();
+                if let Some(conflict) = crate::identity_persist::external_peer_deny_conflict(
+                    config,
+                    "telegram",
+                    &self.alias,
+                    &borrowed,
+                    |entry, user| Self::normalize_identity(entry) == user,
+                ) {
+                    anyhow::bail!(conflict);
+                }
+                Ok(())
+            },
         )
         .await
     }
@@ -4602,7 +4630,9 @@ impl TelegramChannel {
                 match pairing.reserve_pair(code, &chat_id).await {
                     Ok(Some(reservation)) => {
                         if let Some(identity) = bind_identity {
-                            match Box::pin(self.persist_allowed_identity(&identity)).await {
+                            match Box::pin(self.persist_allowed_identity(&identity, &identities))
+                                .await
+                            {
                                 Ok(()) => {
                                     // Durable write landed, so the pairing may
                                     // now consume the code and mint the token.
@@ -8896,7 +8926,7 @@ mod tests {
         .with_persistence_authority(authority.clone());
 
         channel
-            .persist_allowed_identity("someone")
+            .persist_allowed_identity("someone", &["someone".into()])
             .await
             .expect_err("save failure must reject paired identity");
 
@@ -14812,7 +14842,7 @@ mod tests {
             .with_persistence_authority(config.clone());
 
         let err = ch
-            .persist_allowed_identity("123456789")
+            .persist_allowed_identity("123456789", &["123456789".into()])
             .await
             .expect_err("an ignored identity must not be persisted as a grant");
         let message = err.to_string();
@@ -15025,6 +15055,177 @@ mod tests {
                 .is_empty(),
             "nothing was persisted for a denied account"
         );
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_rechecks_policy_after_waiting_for_config_writer() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        for (grant_channel, publish_to_live, peers, denies, expect_bound) in [
+            ("telegram", true, &["999999999"][..], &[][..], false),
+            ("telegram.default", true, &["999999999"][..], &[][..], false),
+            (
+                "telegram.default",
+                false,
+                &["999999999"][..],
+                &[][..],
+                false,
+            ),
+            ("telegram.default", true, &[][..], &["alice"][..], false),
+            (
+                "telegram.default",
+                true,
+                &["999999999"][..],
+                &["999999999"][..],
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+                )
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Default::default()
+            };
+            config
+                .channels
+                .telegram
+                .insert("default".into(), TelegramConfig::default());
+            config.save().await.expect("save isolated config");
+            let authority = LiveConfigAuthority::new(config);
+            let live = authority.live_handle();
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(move || live.read().channel_external_peers("telegram", "default")),
+                false,
+            )
+            .with_persistence_authority(authority.clone())
+            .with_mock_api_base(server.uri());
+            let pairing = channel.pairing.as_ref().expect("startup pairing");
+            let code = pairing.pairing_code().expect("fresh code");
+            let update = serde_json::json!({
+                "message": {
+                    "text": format!("/bind {code}"),
+                    "from": {"id": 123_456_789, "username": "alice"},
+                    "chat": {"id": 42},
+                }
+            });
+
+            // Hold serialization while the real handler passes its precheck
+            // and reserves the code, then save the competing policy.
+            let commit = authority.begin_config_commit().await.expect("hold writer");
+            let mut bind = Box::pin(channel.handle_unauthorized_message(&update));
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                poll_fn(|cx| {
+                    assert!(bind.as_mut().poll(cx).is_pending(), "bind must wait");
+                    if pairing.pairing_code().is_none() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .expect("handler reserves code before writer is released");
+            let mut snapshot = commit.current_config();
+            snapshot.peer_groups.insert(
+                "operator_grant".into(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new(grant_channel),
+                    external_peers: peers.iter().map(|peer| PeerUsername::new(*peer)).collect(),
+                    ignore: denies.iter().map(|peer| PeerUsername::new(*peer)).collect(),
+                    ..Default::default()
+                },
+            );
+            snapshot.mark_dirty("peer_groups");
+            let mut revision = authority.published_revision();
+            snapshot.save_dirty().await.expect("save competing policy");
+            let saved = std::fs::read(dir.path().join("config.toml")).expect("saved config");
+            let mut expected_live = if publish_to_live {
+                snapshot.channel_external_peers("telegram", "default")
+            } else {
+                Vec::new()
+            };
+            if publish_to_live {
+                revision = commit.next_revision().expect("revision");
+                commit.publish(revision, snapshot).expect("publish policy");
+            }
+            drop(commit);
+            tokio::time::timeout(Duration::from_secs(5), bind)
+                .await
+                .expect("bind settles after writer release");
+
+            if expect_bound {
+                expected_live.push("123456789".into());
+                assert!(
+                    authority
+                        .published_revision()
+                        .succeeds_within_epoch(&revision)
+                );
+                assert!(
+                    pairing.pairing_code().is_none(),
+                    "successful bind consumes code"
+                );
+                assert!(pairing.is_paired(), "successful bind commits the token");
+            } else {
+                assert_eq!(authority.published_revision(), revision);
+                assert_eq!(
+                    std::fs::read(dir.path().join("config.toml")).unwrap(),
+                    saved
+                );
+                assert_eq!(pairing.pairing_code().as_deref(), Some(code.as_str()));
+                assert!(!pairing.is_paired(), "rejected bind must not mint a token");
+            }
+            let mut actual_live = authority
+                .snapshot_config()
+                .channel_external_peers("telegram", "default");
+            expected_live.sort();
+            actual_live.sort();
+            assert_eq!(
+                actual_live, expected_live,
+                "only an admissible bind may add a peer"
+            );
+            if expect_bound {
+                let disk: Config = toml::from_str(
+                    &std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+                )
+                .expect("saved config");
+                let mut actual_disk = disk.channel_external_peers("telegram", "default");
+                actual_disk.sort();
+                assert_eq!(actual_disk, expected_live);
+            }
+            if publish_to_live && !peers.is_empty() && denies.is_empty() {
+                assert!(!channel.startup_pairing_available());
+            }
+            let requests = server.received_requests().await.expect("Bot API requests");
+            assert!(
+                !requests.is_empty(),
+                "handler must reply to the rejected bind"
+            );
+            assert_eq!(
+                requests.iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .expect("request JSON")["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("bound successfully")
+                }),
+                expect_bound
+            );
+        }
     }
 
     #[tokio::test]
