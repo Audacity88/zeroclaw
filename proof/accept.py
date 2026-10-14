@@ -289,6 +289,10 @@ class Runtime:
         self.children.append(process)
         try:
             stdout, stderr = process.communicate(timeout=min(timeout, max(1, min(self.deadline, self.phase_deadline) - time.monotonic())))
+            if process.returncode:
+                print("matrix command failed: exit " + str(process.returncode), flush=True)
+                if args[:2] == ["docker", "update"] and b"memoryswap" in stderr.lower().replace(b" ", b""):
+                    print("matrix fixture limit failure: memory/swap conflict", flush=True)
             require(process.returncode == 0)
             return (stdout or b"") + stderr
         finally:
@@ -305,6 +309,7 @@ class Runtime:
     def cli(self, profile, *args):
         home = profile / "home"
         env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "ZEROCLAW_CONFIG_DIR": str(profile), "ZEROCLAW_DATA_DIR": str(profile / "data"), "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"), "XDG_CACHE_HOME": str(home / "cache"), "LANG": "C.UTF-8", "NO_COLOR": "1"}
+        print("matrix CLI operation: " + " ".join(args[:2]), flush=True)
         output = self.command([str(self.private / "host/zeroclaw"), "--config-dir", str(profile), *args], env=env, cwd=home).decode()
         require(all(secret not in output for secret in self.secrets))
         return output
@@ -459,6 +464,7 @@ def prove(runtime, host_zip, guest_zip):
     fixture_root.mkdir()
     (runtime.private / "proof-public").mkdir()
     (runtime.private / "proof-public/identity.json").write_text("{}")
+    print("matrix fixture stage: provisioning", flush=True)
     try:
         runtime.command(["python3", str(HERE / "prepare_synapse.py"), "prepare", str(fixture_root)], timeout=180)
     except Exception:
@@ -477,7 +483,9 @@ def prove(runtime, host_zip, guest_zip):
         raise
     runtime.fixture = json.loads((fixture_root / "fixture.json").read_text())
     owned = json.loads((fixture_root / "owned.json").read_text())
-    runtime.command(["docker", "update", "--memory", "2g", "--cpus", "2", "--pids-limit", "256", owned["container"]])
+    print("matrix fixture stage: resource limits", flush=True)
+    runtime.command(["docker", "update", "--memory", "2g", "--memory-swap", "2g", "--cpus", "2", "--pids-limit", "256", owned["container"]])
+    print("matrix fixture stage: resource limits applied", flush=True)
     runtime.phase_deadline = runtime.deadline
     runtime.secrets = [runtime.fixture[role]["token"] for role in ("bot", "sender", "deny")] + ["synthetic-provider-acceptance-key"]
     runtime.observer = Observer(runtime.fixture)
