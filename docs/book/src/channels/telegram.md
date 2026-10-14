@@ -127,17 +127,9 @@ channel instance. This includes a wildcard peer group.
 
 ### What an unauthorized sender is told
 
-A sender outside the resolved peer set receives a notice instead of an agent
-reply. The built-in text follows the authorization path in use. While a
-one-time pairing code is still outstanding and no peer resolves, it carries
-the operator `zeroclaw channel bind-telegram` command. Once that code is
-redeemed or any peer resolves, authorization comes from configuration, so the
-notice names the identity to authorize instead of a command the sender cannot
-run.
+A sender outside the resolved peer set receives a notice instead of an agent reply. The built-in text follows the authorization path in use. While a one-time pairing code is still outstanding and no effective grant authorizes a peer, it carries the operator `zeroclaw channel bind-telegram` command. Once that code is redeemed or an effective grant authorizes a peer, the notice names the identity to authorize instead. Deny-only lists and grants shadowed by denies keep recovery pairing available.
 
-Set `unauthorized_message` to replace that text, for example when the bot
-faces end users who belong with a support contact rather than an operator
-terminal:
+Set `unauthorized_message` to replace that text, for example when the bot faces end users who need to contact support:
 
 ```toml
 [channels.telegram.home]
@@ -147,15 +139,9 @@ Ask our support team to release access for {identity}.
 """
 ```
 
-`{identity}` expands to the sender's Telegram user ID, or the username when no
-ID is available; `{bind_command}` expands to the bind command for this alias.
-Unset or blank keeps the built-in notice. The notice is always sent as a text
-message: a URL, a file path, or an attachment marker in it reaches the sender
-as written, never as a document or a voice note. Like every other channel
-field, an edit reaches a running listener on the terms in [Restart and
-persistence behavior](#restart-and-persistence-behavior) below: a
-`config.toml` edit or a `zeroclaw config set` change applies after a daemon
-reload or process restart.
+`{identity}` expands to the sender's Telegram user ID, or the username when no ID is available; `{bind_command}` expands to the bind command for this alias. Unset or blank keeps the built-in notice. The notice is always sent as a text message: a URL, a file path, or an attachment marker in it reaches the sender as written, never as a document or a voice note.
+
+The notice reads the daemon's published configuration when it is sent. Changes published through its shared config authority reach the next notice. Edits made only to disk, including `config.toml` edits and `zeroclaw config set`, need a daemon reload or process restart; see [Restart and persistence behavior](#restart-and-persistence-behavior).
 
 ## 4. Start the channel and inspect it
 
@@ -215,21 +201,11 @@ On success, ZeroClaw prefers the stable numeric sender ID, adds it to
 The running channel's peer resolver reads that shared config, so the user can
 send the next message immediately without a restart.
 
-The code is one-time. On later restarts the saved peer makes the resolved set
-non-empty, so pairing stays disabled and no replacement code is issued. The
-peer set is read live, so a peer that arrives from configuration while the
-channel runs ends pairing at once: an outstanding code stops being redeemable
-without waiting for a restart. If the bot says it paired only for the current
-runtime because persistence failed, fix the reported config permission or
-write error before restarting.
+The code is one-time. On later restarts the saved grant keeps pairing disabled and no replacement code is issued. An effective grant that arrives in the live peer set while the channel runs ends pairing at once: an outstanding code stops being redeemable without waiting for a restart. Binding consumes the code only after the config write succeeds. If persistence fails, nothing is bound and the code remains available; fix the reported config permission or write error and retry.
 
 ## 6. Bind another user from the operator CLI
 
-The operator runs `bind-telegram` on the ZeroClaw host with the identity to
-approve. While startup pairing is available, an unauthorized user who messages
-the bot receives this command with their numeric ID filled in. Once any peer
-resolves, the built-in notice names that ID instead, and the operator composes
-the command. For the `home` alias it has this form:
+The operator runs `bind-telegram` on the ZeroClaw host with the identity to approve. While startup pairing is available, an unauthorized user who messages the bot receives this command with their numeric ID filled in. Once an effective grant authorizes a peer, the built-in notice names that ID instead, and the operator composes the command. For the `home` alias it has this form:
 
 ```sh
 zeroclaw channel bind-telegram 111111111 --alias home
@@ -273,6 +249,34 @@ zeroclaw service stop
 zeroclaw service start
 ```
 
+## Switching models from the chat (`/model`)
+
+Authorized senders can switch the active model interactively, without leaving
+Telegram.
+
+- `/model` (no argument) opens an inline picker with provider categories and
+  model options built from configured `[[model_routes]]`. Pages navigate via
+  inline keyboard buttons; ✗ cancels.
+- Selecting an option applies it to the **sender's session scope**, the same
+  behavior as the text form `/model <hint>` on this sender. The picker never
+  creates user- or agent-scoped overrides.
+- Route hints that would collide with the command flag syntax (`--user`,
+  `--agent`, or any `--flag`) are filtered out of the picker. The text
+  command is not a fallback for them: `/model --user <hint>` and
+  `/model --agent <hint>` are broader-scope commands, and any other
+  leading `--flag` opens the help response. Rename or fix the hint in
+  `config.toml` instead, and use `/model <hint>` only for hints that
+  round-trip through the parser without being read as scope syntax.
+  Unselectable options are also skipped when the provider or target no
+  longer resolves, and so is a hint that an earlier route already claims
+  (the same hint in a different case, or a hint equal to an earlier route's
+  model identifier): `/model <hint>` would resolve to that earlier route
+  first. Every route the picker leaves out is reported in the daemon log
+  with its reason, so check the log when an expected option is missing.
+- The text alternatives remain available: `/model <hint>` for a session-scoped
+  route, `/model --user <hint>` / `/model --agent <hint>` for the broader
+  scopes (if permitted), and `/models <provider>` to list models of a provider.
+
 ## Logs and troubleshooting
 
 For an installed service:
@@ -295,6 +299,7 @@ logging is enabled, events are also written under the install directory at
 | `Telegram polling conflict (409)` | More than one process is using the same bot token. Stop the duplicate daemon or channel process. |
 | Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. Direct messages are still processed. |
 | Draft edits report `Too Many Requests` | Increase `channels.telegram.<alias>.draft_update_interval_ms` or disable streaming. |
+| Teammates in one group or forum topic do not see each other's context | Group sessions are keyed per sender by default. Set `channels.telegram.<alias>.per_user_session = false` to share one session per chat (and per forum topic, when present). The shared session shares its controls: any member's `/new` resets the conversation for the whole group/topic, and a session-level `/model` override applies to every member, while `/stop` stays personal to each sender. Direct messages are unaffected. |
 
 The full Telegram field list is generated from the live configuration schema:
 
