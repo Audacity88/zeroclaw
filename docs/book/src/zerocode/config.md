@@ -78,6 +78,21 @@ visible = true # show the agent/session sidebar at launch
 width = 24     # target width in terminal columns
 ```
 
+zerocode reopens the sessions that were open when it last quit, in the same
+order and with the same session focused, on the pane you left. The list is kept
+per daemon under `<config-dir>/open-sessions/`, and holds only session ids and
+agent aliases; transcripts stay with the daemon. Sessions the daemon no longer
+has are skipped with a notice. Queued messages and unsent drafts are not
+saved, and a turn that was running when zerocode quit is not resumed or rerun.
+
+```toml
+[sidebar]
+restore_sessions = true # reopen last launch's sessions (default)
+```
+
+Run `zerocode --fresh` to start one launch with an empty sidebar. That launch
+still saves its own list, so the next ordinary launch reopens what it had open.
+
 Press `Ctrl+B` to show or hide the sidebar. Quickstart remains reachable from
 the keyboard mode bar and also appears as a sidebar launcher, including at
 narrow terminal widths. Selecting an existing agent from the sidebar starts a
