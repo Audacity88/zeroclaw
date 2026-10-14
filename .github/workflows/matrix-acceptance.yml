@@ -1,0 +1,59 @@
+name: Downloaded Matrix acceptance
+
+on:
+  push:
+    branches: [codex/culling-matrix-downloaded-acceptance-20261014]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: culling-matrix-downloaded-acceptance-20261014
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    if: >-
+      github.repository == 'Audacity88/zeroclaw' &&
+      github.actor == 'Audacity88' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/culling-matrix-downloaded-acceptance-20261014'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONOPTIMIZE: '0'
+      INPUTS_SHA256: 4579a9fb1dcb5a7918584588c0f24a07a2086fbb14c06aeaf293b427c40c66bf
+      DRIVER_SHA256: 97806c70b0cd22c964325ad5f8e76b22eec2ee5c122405266666ab26ab6b935e
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the frozen harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$INPUTS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$DRIVER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          echo "$INPUTS_SHA256  proof/inputs.json" | sha256sum --check --status
+          echo "$DRIVER_SHA256  proof/accept.py" | sha256sum --check --status
+          echo '030d4cb2c05cd3924c5e6594b0e46cc4fb486a7a6997fd7a1eafee821cccf757  proof/prepare_synapse.py' | sha256sum --check --status
+      - name: Run one downloaded-binary attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 proof/accept.py --run
+      - name: Validate the evidence allowlist
+        if: always()
+        run: python3 proof/accept.py --check-evidence
+      - name: Retain checked assertion results
+        if: ${{ always() && env.EVIDENCE_CHECKED == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: matrix-downloaded-acceptance-${{ github.sha }}
+          path: proof-public/result.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

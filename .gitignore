@@ -1,0 +1,6 @@
+.worktree/
+proof-private/
+proof-public/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,47 @@
+{
+  "repository": "Audacity88/zeroclaw",
+  "branch": "codex/culling-matrix-downloaded-acceptance-20261014",
+  "host": {
+    "repository": "zeroclaw-labs/zeroclaw",
+    "source": "75993ac6bdd13bf2f79ac63654903810662d4d41",
+    "tree": "cabbaa5df320bc806b98b5731bdb7e5642ca16d0",
+    "run": 38476464670,
+    "attempt": 2,
+    "artifact": 11859328792,
+    "artifact_name": "stable-gnu-ubuntu22-archive-x86_64-unknown-linux-gnu",
+    "zip_bytes": 37546400,
+    "zip_sha256": "3279af6027812759526ec2c30fb1c9f0dbc8d52ed47fe9241332186ab49db071",
+    "archive": "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+    "archive_bytes": 37889577,
+    "archive_sha256": "173c6ea5eec6f93fc5174dda9b97d957844d3aeaaae9e3619777bf70315d4130",
+    "target": "x86_64-unknown-linux-gnu",
+    "payloads": 72,
+    "binary_bytes": 75894952,
+    "binary_sha256": "db69e091877a0e409850642103a29094bcf6d93555897c02fd5a165dc1c60bd4"
+  },
+  "guest": {
+    "repository": "zeroclaw-labs/zeroclaw-plugins",
+    "source": "5d34e6d9da3d20329430ca195524faffef44a0f0",
+    "run": 38331885813,
+    "artifact": 11782943168,
+    "artifact_name": "staged-shard-1",
+    "zip_bytes": 2703079,
+    "zip_sha256": "c107d543c3de392d158c31154141124061ae0b31d726da43caf59947480859a6",
+    "component_bytes": 290768,
+    "component_sha256": "abd24770425e5631bb58576ad2d251812b0ccc814992e92ad73845a074b414c9",
+    "manifest_bytes": 1445,
+    "manifest_sha256": "81e00d8917642f0a00f2b87eb48463919cc0899f2cdd6e2ba2a9968a4afb08a4",
+    "wit_pin": "9cd75ac349584bf62516ef101a77cf17617db1d8"
+  },
+  "synapse_image": "ghcr.io/element-hq/synapse@sha256:43fd704aedef503a6fba2e5696439ef7bac24479a3472e364561973f550e4aad",
+  "fixture_sha256": "030d4cb2c05cd3924c5e6594b0e46cc4fb486a7a6997fd7a1eafee821cccf757",
+  "limits": {
+    "job_minutes": 30,
+    "proof_seconds": 1500,
+    "initial_free_bytes": 10737418240,
+    "reserve_bytes": 2147483648,
+    "readiness_seconds": 90,
+    "scored_delivery_seconds": 60,
+    "refusal_observation_seconds": 10
+  }
+}
