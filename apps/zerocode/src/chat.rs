@@ -7223,6 +7223,62 @@ fn render_tool_entry(
 
 /// Render a single committed entry into `lines`.
 /// The transcript layout owner uses this renderer in every rebuild mode.
+/// The child tool calls under a delegate card: one summary line, and the
+/// call list when the card is open.
+fn render_delegate_activity(
+    lines: &mut Vec<Line<'static>>,
+    log: &DelegateActivityLog,
+    in_flight: bool,
+    is_selected: bool,
+    disclosure: ToolDisclosure,
+) {
+    if log.calls.is_empty() {
+        return;
+    }
+    let sel_mod = if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    };
+    let safe = |text: &str, max: usize| terminal_safe_tool_text_limited(text, max, 1).0;
+    let total = (log.calls.len() + log.dropped).to_string();
+    let mut summary = crate::i18n::t_args("zc-chat-tool-child-calls", &[("count", &total)]);
+    if in_flight && let Some(call) = log.running() {
+        summary.push_str(" · ");
+        summary.push_str(&crate::i18n::t_args(
+            "zc-chat-tool-child-now",
+            &[("tool", &safe(&call.tool_name, 64))],
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {summary}"),
+        theme::tool_label_style().add_modifier(sel_mod),
+    )));
+    if !disclosure.is_open() {
+        return;
+    }
+    for call in &log.calls {
+        let mark = match call.success {
+            None => "…",
+            Some(true) => "✓",
+            Some(false) => "✗",
+        };
+        let indent = "  ".repeat(call.depth.min(4) as usize);
+        let mut text = format!(
+            "    {indent}{mark} {}: {}",
+            safe(&call.agent, 40),
+            safe(&call.tool_name, 64)
+        );
+        if !call.arguments_summary.is_empty() {
+            text.push_str(&format!(" ({})", safe(&call.arguments_summary, 100)));
+        }
+        lines.push(Line::from(Span::styled(
+            text,
+            theme::dim_style().add_modifier(sel_mod),
+        )));
+    }
+}
+
 fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
@@ -7298,9 +7354,10 @@ fn render_entry_into(
             name,
             input_json,
             result,
+            delegate_activity,
             ..
         } => {
-            return render_tool_entry(
+            let footer = render_tool_entry(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
@@ -7308,6 +7365,16 @@ fn render_entry_into(
                 is_selected,
                 tool_disclosure,
             );
+            if let Some(log) = delegate_activity.as_deref() {
+                render_delegate_activity(
+                    lines,
+                    log,
+                    result.is_none(),
+                    is_selected,
+                    tool_disclosure,
+                );
+            }
+            return footer;
         }
     }
     None
@@ -9517,7 +9584,65 @@ pub enum ChatEntry {
         /// Tool output. `None` while the call is in flight,
         /// `Some(Arc<str>)` once the result arrives.
         result: Option<Arc<str>>,
+        /// Live tool calls of the delegate this call ran. `None` for
+        /// ordinary tools and for restored history.
+        delegate_activity: Option<Box<DelegateActivityLog>>,
     },
+}
+
+/// Child tool calls reported for one parent `delegate` call, newest last.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DelegateActivityLog {
+    pub calls: Vec<DelegateChildCall>,
+    /// Calls dropped from the front once the per-card limit is reached.
+    pub dropped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegateChildCall {
+    pub agent: String,
+    pub depth: u32,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_summary: String,
+    /// `None` while running, else whether it succeeded.
+    pub success: Option<bool>,
+}
+
+/// Child calls kept per delegate card.
+const DELEGATE_ACTIVITY_LIMIT: usize = 50;
+
+impl DelegateActivityLog {
+    fn apply(&mut self, activity: zeroclaw_api::agent::DelegateActivity) {
+        use zeroclaw_api::agent::DelegateActivityPhase;
+        match activity.phase {
+            DelegateActivityPhase::Started { arguments_summary } => {
+                self.calls.push(DelegateChildCall {
+                    agent: activity.agent,
+                    depth: activity.depth,
+                    tool_call_id: activity.tool_call_id,
+                    tool_name: activity.tool_name,
+                    arguments_summary,
+                    success: None,
+                });
+                if self.calls.len() > DELEGATE_ACTIVITY_LIMIT {
+                    self.calls.remove(0);
+                    self.dropped += 1;
+                }
+            }
+            DelegateActivityPhase::Finished { success, .. } => {
+                if let Some(call) = self.calls.iter_mut().rev().find(|call| {
+                    call.tool_call_id == activity.tool_call_id && call.agent == activity.agent
+                }) {
+                    call.success = Some(success);
+                }
+            }
+        }
+    }
+
+    fn running(&self) -> Option<&DelegateChildCall> {
+        self.calls.iter().rev().find(|call| call.success.is_none())
+    }
 }
 
 #[derive(Debug)]
@@ -11372,7 +11497,8 @@ impl ChatState {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::DelegateActivity { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -11431,6 +11557,7 @@ impl ChatState {
                         serde_json::to_string(&raw_input).unwrap_or_default(),
                     ),
                     result: None,
+                    delegate_activity: None,
                 });
                 self.mark_dirty_append();
             }
@@ -11457,6 +11584,25 @@ impl ChatState {
                 }
                 if self.turn_in_flight && matches!(self.turn_status, TurnStatus::CallingTool(_)) {
                     self.turn_status = TurnStatus::Working;
+                }
+            }
+            SessionUpdate::DelegateActivity { activity, .. } => {
+                let parent = activity.parent_tool_call_id.clone();
+                for entry in self.entries.iter_mut().rev() {
+                    if let ChatEntry::Tool {
+                        tool_call_id,
+                        result: None,
+                        delegate_activity,
+                        ..
+                    } = entry
+                        && tool_call_id.as_ref() == parent.as_str()
+                    {
+                        delegate_activity
+                            .get_or_insert_with(Default::default)
+                            .apply(activity);
+                        self.mark_dirty_full();
+                        break;
+                    }
                 }
             }
             SessionUpdate::ApprovalRequest {
@@ -12335,6 +12481,7 @@ impl ChatState {
                         ),
                         input_json: Arc::<str>::from(input_json),
                         result: m.tool_output.map(bounded_tool_output).map(Arc::<str>::from),
+                        delegate_activity: None,
                     });
                     continue;
                 }
@@ -12362,6 +12509,7 @@ impl ChatState {
                             ),
                             input_json: Arc::<str>::from("null"),
                             result: Some(Arc::<str>::from(output)),
+                            delegate_activity: None,
                         });
                     }
                     continue;
@@ -24745,6 +24893,7 @@ mod tests {
                 "path": "fixture.txt", "content": "a line that wraps at narrow widths\n".repeat(10)
             }).to_string()),
             result: None,
+            delegate_activity: None,
         });
         s.mark_dirty_append();
         s.rebuild_lines(40);
@@ -26043,6 +26192,74 @@ mod tests {
     }
 
     #[test]
+    fn delegate_card_shows_child_activity_while_running_and_keeps_it_after() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut s = state();
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "parent".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "researcher", "prompt": "Look it up"}),
+        });
+        let activity = |id: &str, phase| SessionUpdate::DelegateActivity {
+            session_id: "sess-1".into(),
+            activity: DelegateActivity {
+                parent_tool_call_id: "parent".into(),
+                agent: "researcher".into(),
+                depth: 0,
+                tool_call_id: id.into(),
+                tool_name: "web_fetch".into(),
+                phase,
+            },
+        };
+        s.apply_update(activity(
+            "c1",
+            DelegateActivityPhase::Started {
+                arguments_summary: "url: https://example.com".into(),
+            },
+        ));
+        let render = |s: &ChatState, disclosure| {
+            let mut lines = Vec::new();
+            render_entry_into(&s.entries()[0], false, false, disclosure, 120, &mut lines);
+            rendered_text(&lines)
+        };
+        let running = render(&s, ToolDisclosure::Collapsed);
+        assert!(
+            running.contains("1 child tool calls · now: web_fetch"),
+            "{running}"
+        );
+
+        s.apply_update(activity(
+            "c1",
+            DelegateActivityPhase::Finished {
+                success: true,
+                output_preview: "page".into(),
+            },
+        ));
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".into(),
+            tool_call_id: "parent".into(),
+            raw_output: "found it".into(),
+        });
+        let done = render(&s, ToolDisclosure::Full);
+        assert!(done.contains("1 child tool calls"), "{done}");
+        assert!(!done.contains("now:"), "{done}");
+        assert!(
+            done.contains("researcher: web_fetch (url: https://example.com)"),
+            "{done}"
+        );
+
+        // Activity for a call that is not a running tool card is ignored.
+        s.apply_update(activity(
+            "c2",
+            DelegateActivityPhase::Started {
+                arguments_summary: String::new(),
+            },
+        ));
+        assert!(!render(&s, ToolDisclosure::Full).contains("2 child tool calls"));
+    }
+
+    #[test]
     fn subagent_card_live_results_stay_with_the_call_not_the_prompt() {
         let mut s = state();
         for id in ["child-a", "child-b"] {
@@ -26215,6 +26432,7 @@ mod tests {
             name: Arc::from("delegate"),
             input_json: Arc::from(input),
             result: Some(Arc::from(result)),
+            delegate_activity: None,
         };
         let copied = clipboard_text(&entry);
         assert!(copied.contains("task-tail"));
@@ -26275,6 +26493,7 @@ mod tests {
             name: Arc::from("delegate"),
             input_json: Arc::from(input),
             result: Some(Arc::from(result)),
+            delegate_activity: None,
         };
         assert!(clipboard_text(&entry).contains(result));
         for raw in [
@@ -26381,6 +26600,7 @@ mod tests {
             name: Arc::from("shell"),
             input_json: Arc::from(input),
             result: Some(Arc::from(result)),
+            delegate_activity: None,
         };
         let copied = clipboard_text(&entry);
         assert!(copied.contains(input_tail));
@@ -26553,6 +26773,7 @@ mod tests {
             name: Arc::<str>::from("file_write"),
             input_json: Arc::<str>::from(r#"{"path":"a.txt","content":"raw"}"#),
             result: Some(Arc::<str>::from("written")),
+            delegate_activity: None,
         };
         let copied = clipboard_text(&entry);
         assert!(copied.contains(r#""content":"raw""#));
@@ -26582,6 +26803,7 @@ mod tests {
                     serde_json::json!({"path": path, "content": content.clone()}).to_string(),
                 ),
                 result: Some(Arc::<str>::from("written")),
+                delegate_activity: None,
             });
         }
         state.mark_dirty_full();
