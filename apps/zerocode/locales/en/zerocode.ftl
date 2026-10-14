@@ -669,6 +669,8 @@ zc-chat-tool-encoding = Encoding
 zc-chat-tool-write-preview = Content preview · not a diff
 zc-chat-tool-write-result-absent = Wrote { $bytes } bytes · file previously absent.
 zc-chat-tool-write-result-existing = Wrote { $bytes } bytes · file previously { $previous_bytes } bytes.
+zc-chat-tool-child-calls = { $count } child tool calls
+zc-chat-tool-child-now = now: { $tool }
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
