@@ -135,6 +135,7 @@ enum Screen {
         /// Capture the selected alias before entering the name editor.
         from: String,
         confirming: bool,
+        return_to_fields: bool,
     },
     FieldList {
         section_idx: usize,
@@ -726,12 +727,22 @@ impl App {
                     }
                 } else {
                     let help = crate::i18n::t("zc-config-footer-action-help");
+                    let rename = if self.provider_alias_rename_available() {
+                        format!(
+                            "  {}={}",
+                            tab_key(T::RenameAlias),
+                            crate::i18n::t("zc-config-footer-action-rename"),
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        " {}={}  {}={}  ?={}",
+                        " {}={}  {}={}{}  ?={}",
                         tab_key(T::Enter),
                         crate::i18n::t("zc-config-footer-action-edit"),
                         tab_key(T::DeleteRow),
                         crate::i18n::t("zc-config-footer-action-reset"),
+                        rename,
                         help,
                     )
                 }
@@ -1610,23 +1621,64 @@ impl App {
         self.alias_list_cost_target().is_some()
     }
 
+    fn provider_alias_rename_target(&self) -> Option<(usize, &str, &str)> {
+        let (section_idx, map_path, from) = match &self.screen {
+            Screen::AliasList {
+                section_idx,
+                map_path,
+                ..
+            } if self.alias_tab == 0 => (
+                *section_idx,
+                map_path.as_str(),
+                self.aliases.get(self.alias_cursor)?.as_str(),
+            ),
+            Screen::FieldList {
+                section_idx,
+                prefix,
+                ..
+            } => {
+                let (map_path, from) = prefix.rsplit_once('.')?;
+                (*section_idx, map_path, from)
+            }
+            _ => return None,
+        };
+        let section = self.sections.get(section_idx)?;
+        (matches!(
+            section.key.as_str(),
+            "providers.models" | "providers.tts" | "providers.transcription"
+        ) && is_direct_child_path(map_path, &section.key)
+            && !from.is_empty())
+        .then_some((section_idx, map_path, from))
+    }
+
     fn provider_alias_rename_available(&self) -> bool {
-        if let Screen::AliasList {
+        self.provider_alias_rename_target().is_some()
+    }
+
+    fn start_alias_rename(&mut self) {
+        let Some((section_idx, map_path, from)) = self.provider_alias_rename_target() else {
+            return;
+        };
+        let map_path = map_path.to_string();
+        let from = from.to_string();
+        let (mut breadcrumb, return_to_fields) = match &self.screen {
+            Screen::AliasList { breadcrumb, .. } => (breadcrumb.clone(), false),
+            Screen::FieldList { breadcrumb, .. } => (breadcrumb.clone(), true),
+            _ => return,
+        };
+        if return_to_fields {
+            breadcrumb.pop();
+        }
+        self.edit_buf = from.clone();
+        self.status_msg = None;
+        self.screen = Screen::AliasRename {
             section_idx,
             map_path,
-            ..
-        } = &self.screen
-        {
-            return self.alias_tab == 0
-                && self.alias_cursor < self.aliases.len()
-                && self.sections.get(*section_idx).is_some_and(|section| {
-                    matches!(
-                        section.key.as_str(),
-                        "providers.models" | "providers.tts" | "providers.transcription"
-                    ) && is_direct_child_path(map_path, &section.key)
-                });
-        }
-        false
+            breadcrumb,
+            from,
+            confirming: false,
+            return_to_fields,
+        };
     }
 
     async fn load_cost_resources(&mut self) -> Result<()> {
@@ -2274,27 +2326,7 @@ impl App {
             Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
             }
-            Some(ConfigTabAction::RenameAlias)
-                if self.provider_alias_rename_available()
-                    && self.alias_cursor < self.aliases.len() =>
-            {
-                if let Screen::AliasList {
-                    section_idx,
-                    map_path,
-                    breadcrumb,
-                } = &self.screen
-                {
-                    let from = self.aliases[self.alias_cursor].clone();
-                    self.edit_buf = from.clone();
-                    self.screen = Screen::AliasRename {
-                        section_idx: *section_idx,
-                        map_path: map_path.clone(),
-                        breadcrumb: breadcrumb.clone(),
-                        from,
-                        confirming: false,
-                    };
-                }
-            }
+            Some(ConfigTabAction::RenameAlias) => self.start_alias_rename(),
             _ if into => {
                 self.activate_alias_list().await?;
             }
@@ -2651,14 +2683,26 @@ impl App {
         if let Screen::AliasRename {
             section_idx,
             map_path,
-            breadcrumb,
+            mut breadcrumb,
+            from,
+            return_to_fields,
             ..
         } = std::mem::replace(&mut self.screen, Screen::SectionList)
         {
-            self.screen = Screen::AliasList {
-                section_idx,
-                map_path,
-                breadcrumb,
+            self.screen = if return_to_fields {
+                let prefix = format!("{map_path}.{from}");
+                breadcrumb.push(from);
+                Screen::FieldList {
+                    section_idx,
+                    prefix,
+                    breadcrumb,
+                }
+            } else {
+                Screen::AliasList {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                }
             };
         }
         self.edit_buf.clear();
@@ -2703,6 +2747,12 @@ impl App {
                         let mut status = if result.renamed {
                             // The rename has committed. Leave the editor before refreshing
                             // so a failed read cannot cause the mutation to be retried.
+                            if let Screen::AliasRename {
+                                return_to_fields, ..
+                            } = &mut self.screen
+                            {
+                                *return_to_fields = false;
+                            }
                             self.cancel_alias_rename();
                             match self.load_aliases(&map_path).await {
                                 Ok(()) => {
@@ -2805,6 +2855,7 @@ impl App {
         use crate::keymap::ConfigTabAction;
         let action = ConfigTabAction::from_chord(&key);
         match action {
+            Some(ConfigTabAction::RenameAlias) => self.start_alias_rename(),
             // Left switches the field sub-tab leftward; once on the leftmost
             // sub-tab (or when the section has none) it walks back one breadcrumb
             // level, so Left is a continuous "out" gesture like the zerocode tab.
@@ -5268,6 +5319,12 @@ impl App {
             tab_keys(A::Enter),
             crate::i18n::t("zc-config-help-edit-field"),
         ));
+        if self.provider_alias_rename_available() {
+            entries.push(E::new(
+                tab_keys(A::RenameAlias),
+                crate::i18n::t("zc-config-help-rename-alias"),
+            ));
+        }
         entries.push(E::new(
             tab_keys(A::DeleteRow),
             crate::i18n::t("zc-config-help-reset-default"),
@@ -5777,12 +5834,24 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::keymap::overrides::reset();
-        for (section, family) in [
+        for ((section, family), from_settings) in [
             ("providers.models", "anthropic"),
             ("providers.tts", "openai"),
             ("providers.transcription", "groq"),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|provider| [(provider, false), (provider, true)])
+        {
             let (mut manager, outbound, mut rx, mut term) = alias_rename_manager(section, family);
+            if from_settings {
+                manager.screen = Screen::FieldList {
+                    section_idx: 0,
+                    prefix: format!("{section}.{family}.old"),
+                    breadcrumb: vec![section.into(), family.into(), "old".into()],
+                };
+                // The open alias, not a remembered list selection, owns this target.
+                manager.alias_cursor = 1;
+            }
             enter_alias_rename(&mut manager, &mut term, "new\r\n").await;
             // The alias-list cursor is no longer authoritative once editing starts.
             manager.alias_cursor = 1;
@@ -6060,6 +6129,92 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_settings_cancel_preserves_context_and_rebinding() {
+        use crate::keymap::Chord;
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        let prefix = "providers.models.openai.old";
+        let breadcrumb = vec!["providers.models".into(), "openai".into(), "old".into()];
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: prefix.into(),
+            breadcrumb: breadcrumb.clone(),
+        };
+        manager.active_tab = 2;
+        manager.field_cursor = 3;
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "rename_alias",
+            vec![Chord::key(KeyCode::F(6))],
+        );
+        assert!(manager.bottom_hint().contains("F6=rename"));
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        config_key(&mut manager, &mut term, KeyCode::F(6)).await;
+        assert!(matches!(
+            manager.screen,
+            Screen::AliasRename {
+                return_to_fields: true,
+                ..
+            }
+        ));
+        manager.edit_buf = "new".into();
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix: actual, breadcrumb: bc, .. } if actual == prefix && bc == &breadcrumb)
+        );
+        assert_eq!(manager.active_tab, 2);
+        assert_eq!(manager.field_cursor, 3);
+        assert!(manager.edit_buf.is_empty());
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_settings_excludes_non_alias_paths_and_search_input() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        for prefix in [
+            "providers.models",
+            "providers.models.openai",
+            "providers.models.openai.old.model",
+            "cost.rates.providers.models.openai.example",
+            "channels.telegram.old",
+            "agents.old",
+        ] {
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: prefix.into(),
+                breadcrumb: vec![],
+            };
+            assert!(!manager.bottom_hint().contains("=rename"));
+            config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+            assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        }
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "providers.models.openai.old".into(),
+            breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+        };
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert_eq!(manager.filter.as_deref(), Some("e"));
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_is_cleared_when_switching_sections() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
@@ -6130,6 +6285,7 @@ mod tests {
                     breadcrumb,
                     from: "old".into(),
                     confirming: true,
+                    return_to_fields: false,
                 },
             };
             manager.templates = vec![ConfigTemplateEntry {
