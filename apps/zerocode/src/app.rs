@@ -1757,9 +1757,24 @@ pub async fn run(
     // The sidebar list saved by the last launch against this daemon. Pruned
     // against the daemon first, then fed to the same resume path a reconnect
     // rebuild uses.
-    let mut open_sessions_store = open_sessions
-        .save
-        .then(|| crate::open_sessions::Store::new(config_dir, connect_label));
+    let mut open_sessions_store = None;
+    if open_sessions.save {
+        match crate::open_sessions::Store::acquire(config_dir, connect_label) {
+            Ok(Some(store)) => open_sessions_store = Some(store),
+            // Another window owns this daemon's list. Restoring it here would
+            // reattach sessions live in that window, so this one starts empty
+            // and leaves the list to its owner.
+            Ok(None) => {
+                reload_status = Some(crate::i18n::t("zc-app-restore-sessions-other-window"));
+            }
+            Err(error) => {
+                reload_status = Some(crate::i18n::t_args(
+                    "zc-app-restore-sessions-save-failed",
+                    &[("error", &format!("{error:#}"))],
+                ));
+            }
+        }
+    }
     let mut restored = None;
     if open_sessions.restore
         && let Some(store) = open_sessions_store.as_mut()

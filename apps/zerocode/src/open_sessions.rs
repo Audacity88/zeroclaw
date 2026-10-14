@@ -8,6 +8,11 @@
 //! One file per connection target under `<config_dir>/open-sessions/`, so a
 //! client that talks to two daemons keeps two lists. Only ids, aliases, order
 //! and focus are stored; queued input and drafts are not.
+//!
+//! One window owns a list at a time, held by an OS file lock beside it. A
+//! second window on the same daemon gets no store: it neither restores the
+//! first window's sessions (reattaching a session that is live in another
+//! window lets either window cancel it) nor overwrites its list.
 
 use std::path::{Path, PathBuf};
 
@@ -178,17 +183,39 @@ pub(crate) struct Store {
     path: PathBuf,
     target: String,
     last_saved: Option<Snapshot>,
+    /// Held for the life of the store; the OS releases it when the process
+    /// exits, including on a crash.
+    _lock: std::fs::File,
 }
 
 impl Store {
-    pub(crate) fn new(config_dir: &Path, target_label: &str) -> Self {
+    /// Take ownership of this connection target's list. `Ok(None)` means
+    /// another zerocode window already owns it.
+    pub(crate) fn acquire(config_dir: &Path, target_label: &str) -> Result<Option<Self>> {
         let digest = Sha256::digest(target_label.as_bytes());
         let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-        Self {
-            path: config_dir.join(DIR_NAME).join(format!("{name}.json")),
+        let dir = config_dir.join(DIR_NAME);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let lock_path = dir.join(format!("{name}.lock"));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("locking {}", lock_path.display()));
+            }
+        }
+        Ok(Some(Self {
+            path: dir.join(format!("{name}.json")),
             target: target_label.to_string(),
             last_saved: None,
-        }
+            _lock: lock,
+        }))
     }
 
     #[cfg(test)]
@@ -234,6 +261,37 @@ mod tests {
     use super::*;
     use crate::chat::SidebarStatus;
 
+    fn owned(dir: &Path, target: &str) -> Store {
+        Store::acquire(dir, target)
+            .expect("lock file opens")
+            .expect("no other window owns this list")
+    }
+
+    #[test]
+    fn a_second_window_does_not_get_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = owned(dir.path(), "local:/run/a.sock");
+        assert!(
+            Store::acquire(dir.path(), "local:/run/a.sock")
+                .unwrap()
+                .is_none(),
+            "a second window on the same daemon must not restore or save"
+        );
+        assert!(
+            Store::acquire(dir.path(), "local:/run/other.sock")
+                .unwrap()
+                .is_some(),
+            "a window on another daemon has its own list"
+        );
+        drop(first);
+        assert!(
+            Store::acquire(dir.path(), "local:/run/a.sock")
+                .unwrap()
+                .is_some(),
+            "the list is free again once the owning window exits"
+        );
+    }
+
     fn row(pane: PaneKind, id: &str, alias: &str, focused: bool) -> SidebarSessionSummary {
         SidebarSessionSummary {
             session_id: id.to_string(),
@@ -254,10 +312,11 @@ mod tests {
             row(PaneKind::Chat, "chat-1", "fable", true),
         ];
         let snapshot = Snapshot::from_rows(&rows, Some(PaneKind::Acp));
-        let mut store = Store::new(dir.path(), "local:/run/a.sock");
+        let mut store = owned(dir.path(), "local:/run/a.sock");
         assert!(store.save_if_changed(&snapshot).unwrap());
+        drop(store);
 
-        let mut reopened = Store::new(dir.path(), "local:/run/a.sock");
+        let mut reopened = owned(dir.path(), "local:/run/a.sock");
         let loaded = reopened.load().expect("saved list loads");
         assert_eq!(loaded, snapshot);
 
@@ -282,8 +341,8 @@ mod tests {
     #[test]
     fn each_connection_target_keeps_its_own_list() {
         let dir = tempfile::tempdir().unwrap();
-        let mut main = Store::new(dir.path(), "local:/run/main.sock");
-        let mut other = Store::new(dir.path(), "local:/run/experiment.sock");
+        let mut main = owned(dir.path(), "local:/run/main.sock");
+        let mut other = owned(dir.path(), "local:/run/experiment.sock");
         assert_ne!(main.path(), other.path());
         main.save_if_changed(&Snapshot::from_rows(
             &[row(PaneKind::Acp, "main-1", "fable", true)],
@@ -300,7 +359,7 @@ mod tests {
     #[test]
     fn unchanged_list_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::new(dir.path(), "local:/run/a.sock");
+        let mut store = owned(dir.path(), "local:/run/a.sock");
         let snapshot = Snapshot::from_rows(&[row(PaneKind::Chat, "c", "a", true)], None);
         assert!(store.save_if_changed(&snapshot).unwrap());
         assert!(!store.save_if_changed(&snapshot).unwrap());
@@ -315,10 +374,8 @@ mod tests {
     fn a_loaded_list_is_not_written_back_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = Snapshot::from_rows(&[row(PaneKind::Acp, "s", "a", true)], None);
-        Store::new(dir.path(), "t")
-            .save_if_changed(&snapshot)
-            .unwrap();
-        let mut store = Store::new(dir.path(), "t");
+        owned(dir.path(), "t").save_if_changed(&snapshot).unwrap();
+        let mut store = owned(dir.path(), "t");
         let loaded = store.load().unwrap();
         assert!(!store.save_if_changed(&loaded).unwrap());
     }
@@ -326,7 +383,7 @@ mod tests {
     #[test]
     fn damaged_or_newer_files_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::new(dir.path(), "t");
+        let mut store = owned(dir.path(), "t");
         std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         std::fs::write(store.path(), b"{not json").unwrap();
         assert!(store.load().is_none());
@@ -473,7 +530,7 @@ mod tests {
     fn saved_list_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::new(dir.path(), "t");
+        let mut store = owned(dir.path(), "t");
         store
             .save_if_changed(&Snapshot::from_rows(
                 &[row(PaneKind::Acp, "s", "a", true)],

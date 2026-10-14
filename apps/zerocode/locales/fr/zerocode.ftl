@@ -435,6 +435,7 @@ zc-chat-session-cap = Limite de sessions de ce panneau atteinte ({ $max }). Ferm
 zc-chat-resume-dropped = { $count } session(s) précédente(s) n'ont pas pu être rattachées et ont été conservées pour une nouvelle tentative.
 zc-app-restore-sessions-dropped = { $count } session(s) enregistrée(s) n'existe(nt) plus et n'ont pas été rouvertes.
 zc-app-restore-sessions-save-failed = Impossible d'enregistrer la liste des sessions ouvertes : { $error }
+zc-app-restore-sessions-other-window = Une autre fenêtre zerocode utilise ce daemon : ses sessions ouvertes n'ont pas été rouvertes ici.
 zc-chat-reconnect-interrupted = La connexion a été rétablie et les messages en file ont été conservés. Attente de l'arrêt du tour précédent avant de recharger la conversation persistante.
 zc-chat-resyncing = Des mises à jour en direct ont été manquées. Rechargement de cette session avant l’envoi des messages en file…
 zc-chat-resynced = Des mises à jour en direct ont été manquées ; la conversation persistante a donc été rechargée. Toute approbation ou question en cours a été annulée.

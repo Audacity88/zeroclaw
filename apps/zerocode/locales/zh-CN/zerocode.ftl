@@ -435,6 +435,7 @@ zc-chat-session-cap = 已达到此面板的会话上限（{ $max }）。请先�
 zc-chat-resume-dropped = 有 { $count } 个先前会话无法重新连接，已保留以便重试。
 zc-app-restore-sessions-dropped = 有 { $count } 个已保存的会话已不存在，未重新打开。
 zc-app-restore-sessions-save-failed = 无法保存已打开会话列表：{ $error }
+zc-app-restore-sessions-other-window = 另一个 zerocode 窗口正在使用此守护进程，因此未在此处重新打开其会话。
 zc-chat-reconnect-interrupted = 连接已重建，排队消息已保留。正在等待先前轮次停止，然后重新加载持久化对话。
 zc-chat-resyncing = 部分实时更新丢失。正在重新加载此会话，然后再发送排队消息…
 zc-chat-resynced = 实时更新丢失，因此已重新加载持久化对话。任何进行中的审批或提问均已取消。
