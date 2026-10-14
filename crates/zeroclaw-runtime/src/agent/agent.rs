@@ -3999,6 +3999,8 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+
+            yield_to_steering: false,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -4543,6 +4545,9 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            // This wrapper judges and writes steering itself; the loop only
+            // stops after a tool round when a message is waiting.
+            yield_to_steering: true,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -4698,7 +4703,7 @@ impl Agent {
                                 .as_ref()
                                 .map(crate::agent::tool_receipts::ReceiptScope::collector),
                             event_tx: Some(event_tx.clone()),
-                            steering: None,
+                            steering: steering_rx.as_deref_mut(),
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(crate::agent::turn::ToolLoopImageState {
                                 cache: &mut self.image_cache,
@@ -4953,6 +4958,37 @@ impl Agent {
                         final_context_limits: final_limits,
                         safeguard_fallback: turn_safeguard_fallback,
                     });
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::agent::turn::SteeringPending>()
+                        .is_some() =>
+                {
+                    // The loop stopped after a tool round because steering is
+                    // waiting. The round's messages are replayed above; commit
+                    // its text, then judge the steering exactly as at the end
+                    // of a round, so it reaches the model at the next step
+                    // instead of after the final answer. A cancelled turn
+                    // prepares nothing; the next round's top records the
+                    // interruption.
+                    if let Some(pending) =
+                        error.downcast_ref::<crate::agent::turn::SteeringPending>()
+                    {
+                        committed_response.push_str(&pending.display_text);
+                    }
+                    let notice = self.trim_history(Some(&turn_id));
+                    forward_history_trim_notice(&event_tx, notice).await;
+                    let cancelled = cancel_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    if !cancelled {
+                        let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                        let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                        if !admitted.is_empty() {
+                            steered_continuation = Some(admitted);
+                        }
+                    }
+                    continue;
                 }
                 Err(error) => {
                     // Model switch requested mid-turn: the unified loop
@@ -14013,6 +14049,144 @@ mod tests {
             provider_steering.content.ends_with("]\n\nsecond"),
             "the provider's steering turn must end with the raw user text, got: {}",
             provider_steering.content
+        );
+    }
+
+    /// Steering sent while a tool runs reaches the model at the very next
+    /// step of the same turn, after that tool's result, not after the model's
+    /// final answer.
+    #[tokio::test]
+    async fn steering_sent_during_a_tool_reaches_the_next_step() {
+        // Sends once, during the first tool call only.
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
+
+        let tool_step = |id: &str| zeroclaw_providers::ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: id.into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(TranscriptCaptureModelProvider {
+            alias: "steer-step".into(),
+            // Two tool steps, then an answer: if steering waited for the
+            // final answer, neither the second nor third call would see it.
+            responses: Mutex::new(vec![
+                tool_step("call-1"),
+                tool_step("call-2"),
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+            seen_messages: seen.clone(),
+        });
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish")
+        .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "final");
+
+        let seen = seen.lock();
+        let second_call = seen.get(1).expect("the turn must make a second model call");
+        let steer_at = second_call
+            .iter()
+            .position(|m| m.role == "user" && m.content.ends_with("]\n\nsteer-now"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the step after the tool must see the steering message: {:?}",
+                    second_call
+                        .iter()
+                        .map(|m| (&m.role, &m.content))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let tool_result_at = second_call
+            .iter()
+            .position(|m| m.role == "tool" || m.content.contains("tool-out"))
+            .expect("the step after the tool must see its result");
+        assert!(
+            tool_result_at < steer_at,
+            "the steering message must follow the tool result it was sent during"
+        );
+        assert_eq!(
+            outcome
+                .new_messages
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    ConversationMessage::Chat(c) if c.role == "user" && c.content.ends_with("steer-now")
+                ))
+                .count(),
+            1,
+            "each steering message is persisted once as its own user turn"
         );
     }
 
