@@ -696,6 +696,7 @@ zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel
 zc-config-footer-action-save = save
 zc-config-footer-action-edit = edit
+zc-config-footer-action-delete = delete
 zc-config-footer-action-reset = reset
 zc-config-footer-action-clear-filter = clear filter
 zc-config-footer-action-back-to-files = back to files

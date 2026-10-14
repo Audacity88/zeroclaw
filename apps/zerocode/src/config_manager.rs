@@ -687,6 +687,26 @@ impl App {
         let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
 
         match &self.screen {
+            Screen::AliasList { .. }
+                if self.zeroclaw_pane == ZeroclawPane::Detail && self.filter.is_none() =>
+            {
+                let existing_row = if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    self.cost_cursor < self.cost_resources.len()
+                } else {
+                    self.alias_cursor < self.aliases.len()
+                };
+                let delete_key = tab_key(T::Delete);
+                if existing_row && !delete_key.is_empty() {
+                    format!(
+                        " {}={}  ?={}",
+                        delete_key,
+                        crate::i18n::t("zc-config-footer-action-delete"),
+                        crate::i18n::t("zc-config-footer-action-help"),
+                    )
+                } else {
+                    default()
+                }
+            }
             Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
                 if self.filter.is_some() {
                     let help = crate::i18n::t("zc-config-footer-action-help");
@@ -5898,6 +5918,47 @@ mod tests {
         };
         manager.aliases = vec!["first".into(), "second".into()];
         manager.zeroclaw_pane = ZeroclawPane::Detail;
+    }
+
+    #[tokio::test]
+    async fn config_delete_footer_tracks_available_action_and_resolved_binding() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "toggle_secret",
+            vec![crate::keymap::Chord::char('z')],
+        );
+        let mut manager = test_manager();
+        prepare_alias_confirmation(&mut manager);
+        let delete_hint = format!("z={}", crate::i18n::t("zc-config-footer-action-delete"));
+        assert!(manager.bottom_hint().contains(&delete_hint));
+
+        manager.alias_cursor = manager.aliases.len();
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["priced-model".into()];
+        assert!(manager.bottom_hint().contains(&delete_hint));
+        manager.cost_cursor = manager.cost_resources.len();
+        manager.alias_cursor = 0;
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+
+        manager.alias_tab = 0;
+        manager.filter = Some(String::new());
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+        manager.filter = None;
+        manager.zeroclaw_pane = ZeroclawPane::Sections;
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        crate::keymap::overrides::set_row("config_tab", "toggle_secret", vec![]);
+        assert!(
+            !manager
+                .bottom_hint()
+                .contains(&crate::i18n::t("zc-config-footer-action-delete"))
+        );
+        crate::keymap::overrides::reset();
     }
 
     #[tokio::test]
