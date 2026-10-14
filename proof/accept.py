@@ -184,6 +184,25 @@ def request_body(headers, stream):
         body.extend(chunk)
 
 
+def trace_counts(path):
+    counts = {"agent_complete": 0, "agent_fail": 0, "provider_complete": 0, "provider_fail": 0}
+    kinds = {"context_window", "credentials_missing", "auth", "rate_limited", "provider_server", "connect_timeout", "timeout", "connect", "dns", "model_not_found", "unknown", "http_client", "http_server"}
+    if path.exists():
+        require(path.stat().st_size <= 8 * 1024**2)
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            descriptor = event.get("event", {})
+            label = descriptor.get("category", "") + "_" + descriptor.get("action", "")
+            if label in counts:
+                counts[label] = min(counts[label] + 1, 1000000)
+            if descriptor.get("category") == "provider":
+                kind = event.get("attributes", {}).get("error_kind")
+                if kind in kinds:
+                    label = "provider_error_" + kind
+                    counts[label] = min(counts.get(label, 0) + 1, 1000000)
+    return counts
+
+
 class Observer:
     def __init__(self, fixture):
         self.fixture = fixture
@@ -695,6 +714,7 @@ def run(root):
         kinds = {"AssertionError", "OSError", "TimeoutExpired", "HTTPError", "URLError", "RuntimeError", "ValueError", "KeyError", "TypeError"}
         runtime.result["failure_kind"] = type(error).__name__ if type(error).__name__ in kinds else "other"
         if runtime.result["phase"] == "runtime":
+            print("matrix trace counts: " + json.dumps(trace_counts(runtime.private / "runtime-events.jsonl"), sort_keys=True), flush=True)
             patterns = {
                 "sender_denied": b"plugin_channel_sender_denied",
                 "owner_missing": b"no agent owns this channel",
