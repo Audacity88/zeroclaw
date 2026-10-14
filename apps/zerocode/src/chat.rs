@@ -6921,7 +6921,9 @@ impl Chat {
     pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
         match &self.phase {
             ChatPhase::Active(state) => {
-                !state.composer_owns_text_input()
+                // Browse mode is not a modal: an unclaimed session shortcut
+                // switches straight away instead of only leaving browse mode.
+                state.overlay_owns_keys()
                     || crate::keymap::ChatTabAction::from_chord(key).is_some()
                     || crate::keymap::InputBarAction::from_chord(key).is_some()
             }
@@ -12445,14 +12447,18 @@ impl ChatState {
     /// Whether text input currently belongs to the composer rather than a
     /// modal, picker, explorer, or transcript-browse surface.
     fn composer_owns_text_input(&self) -> bool {
-        !self.model_picker.is_open()
-            && self.pending_elicitation().is_none()
-            && self.pending_approval().is_none()
-            && matches!(self.session_overlay, SessionOverlay::None)
-            && self.context_menu.is_none()
-            && !self.input_bar.has_file_explorer()
-            && !self.input_bar.has_attachment_manager()
-            && !self.in_browse_mode()
+        !self.overlay_owns_keys() && !self.in_browse_mode()
+    }
+
+    /// A picker, modal, menu or input-bar overlay is open and owns every key.
+    fn overlay_owns_keys(&self) -> bool {
+        self.model_picker.is_open()
+            || self.pending_elicitation().is_some()
+            || self.pending_approval().is_some()
+            || !matches!(self.session_overlay, SessionOverlay::None)
+            || self.context_menu.is_some()
+            || self.input_bar.has_file_explorer()
+            || self.input_bar.has_attachment_manager()
     }
 
     /// Route a key to an input-bar-owned overlay and retain its user feedback.
@@ -41604,5 +41610,12 @@ mod tests {
             "an explicit input-bar override must outrank the global default"
         );
         overrides::reset();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        assert!(
+            !chat.claims_session_shortcut(&shortcut),
+            "browse mode yields the shortcut so one press switches sessions"
+        );
     }
 }
