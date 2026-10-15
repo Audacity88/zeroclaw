@@ -5682,9 +5682,10 @@ impl App {
                 .and_then(|section| setup_section_key(&section.key)),
             _ => None,
         };
+        // One paragraph: the narrow create pane has no row to spare for a break.
         let hint = if let Some(key) = setup_section {
             format!(
-                "{}\n{}",
+                "{} {}",
                 crate::i18n::t(key),
                 crate::i18n::t_args(
                     "zc-config-setup-create",
@@ -5712,7 +5713,7 @@ impl App {
         self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
-            Paragraph::new(Text::styled(hint, theme::dim_style())).wrap(Wrap { trim: false }),
+            Paragraph::new(Span::styled(hint, theme::dim_style())).wrap(Wrap { trim: false }),
             r.help,
         );
 
