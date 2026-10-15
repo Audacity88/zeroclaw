@@ -18,7 +18,7 @@ use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -4787,7 +4787,7 @@ impl App {
             render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
-                Paragraph::new(Span::styled(
+                Paragraph::new(Text::styled(
                     guidance.as_deref().unwrap_or(&section.help),
                     theme::dim_style(),
                 ))
@@ -4939,7 +4939,7 @@ impl App {
         self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, theme::dim_style())).wrap(Wrap { trim: false }),
+            Paragraph::new(Text::styled(hint, theme::dim_style())).wrap(Wrap { trim: false }),
             r.help,
         );
 
@@ -7191,6 +7191,7 @@ mod tests {
                 .collect();
             assert!(text.contains("optional"));
             assert!(text.contains("[+ Add]"));
+            assert!(!text.contains("list.Text"), "guidance lines ran together");
             assert_eq!(manager.alias_cursor, 0);
             assert!(manager.last_main_area.height >= 4);
             manager.aliases = vec!["present".to_string()];
