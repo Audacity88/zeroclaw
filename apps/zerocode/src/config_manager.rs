@@ -18,7 +18,7 @@ use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -5556,7 +5556,7 @@ impl App {
             render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else if let Some(guidance) = &guidance {
             frame.render_widget(
-                Paragraph::new(Span::styled(guidance, theme::dim_style()))
+                Paragraph::new(Text::styled(guidance.as_str(), theme::dim_style()))
                     .wrap(Wrap { trim: false }),
                 r.help,
             );
@@ -5682,9 +5682,10 @@ impl App {
                 .and_then(|section| setup_section_key(&section.key)),
             _ => None,
         };
+        // One paragraph: the narrow create pane has no row to spare for a break.
         let hint = if let Some(key) = setup_section {
             format!(
-                "{}\n{}",
+                "{} {}",
                 crate::i18n::t(key),
                 crate::i18n::t_args(
                     "zc-config-setup-create",
@@ -7439,6 +7440,7 @@ mod tests {
                 .collect();
             assert!(text.contains("optional"));
             assert!(text.contains("[+ Add]"));
+            assert!(!text.contains("list.Text"), "guidance lines ran together");
             assert_eq!(manager.alias_cursor, 0);
             assert!(manager.last_main_area.height >= 4);
             manager.aliases = vec!["present".to_string()];
