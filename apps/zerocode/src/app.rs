@@ -2021,6 +2021,7 @@ pub async fn run(
                             chat_pane.current_cwd(),
                             acp_pane.focused_runtime_context(),
                             chat_pane.focused_runtime_context(),
+                            &terminal_candidates,
                         ),
                         Mode::Config => config_app.draw_into(frame, content_area),
                         Mode::Doctor => doctor_pane.draw(frame, content_area),

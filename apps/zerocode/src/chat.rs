@@ -409,7 +409,6 @@ pub(crate) struct FocusedRuntimeContext<'a> {
     pub agent_alias: &'a str,
     pub model_provider_ref: Option<&'a str>,
     pub model: Option<&'a str>,
-    pub lifecycle_state: zeroclaw_api::lifecycle::LifecycleState,
     pub queued_messages: usize,
     pub queue_paused: bool,
 }
@@ -5719,7 +5718,6 @@ impl Chat {
             agent_alias: &state.agent_alias,
             model_provider_ref: state.model_provider_ref.as_deref(),
             model: state.model.as_deref(),
-            lifecycle_state: state.terminal_status().lifecycle_state(),
             queued_messages: state.queue_len(),
             queue_paused: state.queue_paused(),
         })
@@ -12448,10 +12446,6 @@ mod tests {
         assert_eq!(context.agent_alias, "myagent");
         assert_eq!(context.model_provider_ref, Some("openai.session"));
         assert_eq!(context.model, Some("gpt-session"));
-        assert_eq!(
-            context.lifecycle_state,
-            zeroclaw_api::lifecycle::LifecycleState::Blocked
-        );
         assert_eq!(context.queued_messages, 1);
         assert!(context.queue_paused);
     }

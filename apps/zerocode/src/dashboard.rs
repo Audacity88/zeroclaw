@@ -18,6 +18,7 @@ use crate::client::{
 };
 use crate::mouse;
 use crate::theme;
+use crate::turn_status::TurnStatus;
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -445,6 +446,7 @@ impl Dashboard {
         chat_cwd: Option<&str>,
         code_context: Option<FocusedRuntimeContext<'_>>,
         chat_context: Option<FocusedRuntimeContext<'_>>,
+        sessions: &[(TurnStatus, String)],
     ) {
         self.drain_cron_trigger_updates();
 
@@ -482,6 +484,7 @@ impl Dashboard {
                 chat_cwd,
                 code_context,
                 chat_context,
+                sessions,
             ),
             Tab::Sessions => self.draw_sessions(frame, chunks[2]),
             Tab::Agents => self.draw_agents(frame, chunks[2]),
@@ -611,6 +614,7 @@ impl Dashboard {
         chat_cwd: Option<&str>,
         code_context: Option<FocusedRuntimeContext<'_>>,
         chat_context: Option<FocusedRuntimeContext<'_>>,
+        sessions: &[(TurnStatus, String)],
     ) {
         let status_lines = status.map(|s| {
             overview_status_lines(
@@ -622,6 +626,7 @@ impl Dashboard {
                 chat_cwd,
                 code_context,
                 chat_context,
+                sessions,
                 &self.agents,
             )
         });
@@ -2965,6 +2970,7 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-context",
     "zc-dashboard-label-code-context",
     "zc-dashboard-label-chat-context",
+    "zc-dashboard-label-sessions",
     "zc-dashboard-label-daemon-memory",
     "zc-dashboard-label-daemon-cpu",
     "zc-dashboard-label-health",
@@ -3047,6 +3053,7 @@ fn overview_status_lines(
     chat_cwd: Option<&str>,
     code_context: Option<FocusedRuntimeContext<'_>>,
     chat_context: Option<FocusedRuntimeContext<'_>>,
+    sessions: &[(TurnStatus, String)],
     agents: &[AgentStatusEntry],
 ) -> Vec<Line<'static>> {
     let label_width = overview_status_label_width();
@@ -3151,6 +3158,7 @@ fn overview_status_lines(
         agents,
         label_width,
     ));
+    lines.extend(session_state_lines(sessions, label_width));
 
     lines.extend(health_rollup_lines(health, label_width));
 
@@ -3509,8 +3517,69 @@ fn runtime_context_value(context: FocusedRuntimeContext<'_>) -> String {
         (None, Some(model)) => parts.push(model.to_string()),
         (None, None) => {}
     }
-    parts.push(runtime_context_lifecycle_label(context.lifecycle_state));
     parts.join(" · ")
+}
+
+/// One row per agent with how many of this window's sessions are in each
+/// lifecycle state, across both panes, focused or not. The focused session
+/// alone would read "idle" while another session of the same agent works.
+fn session_state_lines(
+    sessions: &[(TurnStatus, String)],
+    label_width: usize,
+) -> Vec<Line<'static>> {
+    use zeroclaw_api::lifecycle::LifecycleState;
+    const ORDER: [LifecycleState; 4] = [
+        LifecycleState::Blocked,
+        LifecycleState::Working,
+        LifecycleState::Idle,
+        LifecycleState::Done,
+    ];
+    let mut by_agent: std::collections::BTreeMap<&str, [usize; 4]> =
+        std::collections::BTreeMap::new();
+    for (status, agent) in sessions {
+        let state = status.lifecycle_state();
+        if let Some(slot) = ORDER.iter().position(|s| *s == state) {
+            by_agent.entry(agent.as_str()).or_default()[slot] += 1;
+        }
+    }
+    by_agent
+        .into_iter()
+        .enumerate()
+        .map(|(index, (agent, counts))| {
+            let states = ORDER
+                .iter()
+                .zip(counts)
+                .filter(|(_, count)| *count > 0)
+                .map(|(state, count)| {
+                    crate::i18n::t_args(
+                        "zc-dashboard-session-state-count",
+                        &[
+                            ("count", &count.to_string()),
+                            ("state", &runtime_context_lifecycle_label(*state)),
+                        ],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let value = crate::i18n::t_args(
+                "zc-dashboard-session-agent",
+                &[("agent", agent), ("states", &states)],
+            );
+            if index == 0 {
+                status_row(
+                    "zc-dashboard-label-sessions",
+                    &value,
+                    theme::body_style(),
+                    label_width,
+                )
+            } else {
+                Line::from(vec![
+                    Span::raw(" ".repeat(label_width)),
+                    Span::styled(value, theme::body_style()),
+                ])
+            }
+        })
+        .collect()
 }
 
 fn runtime_context_lifecycle_label(state: zeroclaw_api::lifecycle::LifecycleState) -> String {
@@ -3616,6 +3685,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         ));
 
         assert!(
@@ -3653,6 +3723,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         ));
 
         assert!(
@@ -3686,6 +3757,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         ));
 
         assert!(
@@ -3712,6 +3784,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         ));
 
         assert!(
@@ -3736,6 +3809,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         ));
 
         assert!(
@@ -3756,7 +3830,6 @@ mod tests {
             agent_alias: "primary",
             model_provider_ref: Some("openai.main"),
             model: Some("gpt-5"),
-            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Working,
             queued_messages: 1,
             queue_paused: false,
         };
@@ -3776,10 +3849,6 @@ mod tests {
         assert!(text.contains("primary"), "agent: {text}");
         assert!(text.contains("openai.main / gpt-5"), "route: {text}");
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-context-working")),
-            "lifecycle: {text}"
-        );
-        assert!(
             text.contains(&crate::i18n::t_args(
                 "zc-dashboard-context-client-queue",
                 &[("count", "1")],
@@ -3794,7 +3863,6 @@ mod tests {
             agent_alias: "primary",
             model_provider_ref: None,
             model: None,
-            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Idle,
             queued_messages: 0,
             queue_paused: false,
         };
@@ -3814,7 +3882,6 @@ mod tests {
             agent_alias: "coder",
             model_provider_ref: Some("anthropic.code"),
             model: Some("claude-code"),
-            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Idle,
             queued_messages: 0,
             queue_paused: false,
         };
@@ -3822,7 +3889,6 @@ mod tests {
             agent_alias: "support",
             model_provider_ref: Some("openai.chat"),
             model: Some("gpt-chat"),
-            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Blocked,
             queued_messages: 2,
             queue_paused: true,
         };
@@ -3834,10 +3900,6 @@ mod tests {
         assert!(text.contains(&crate::i18n::t("zc-dashboard-label-chat-context")));
         assert!(text.contains("coder"), "code agent: {text}");
         assert!(text.contains("support"), "chat agent: {text}");
-        assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-context-blocked")),
-            "blocked state: {text}"
-        );
         assert!(
             text.contains(&crate::i18n::t_args(
                 "zc-dashboard-context-client-queue-paused",
@@ -3857,7 +3919,6 @@ mod tests {
             agent_alias: "coder",
             model_provider_ref: None,
             model: None,
-            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Idle,
             queued_messages: 0,
             queue_paused: false,
         };
@@ -3908,6 +3969,70 @@ mod tests {
             channels: Vec::new(),
         };
         assert_eq!(configured_profile(&[blank_profile], "coder"), None);
+    }
+
+    #[test]
+    fn session_state_lines_count_each_agents_sessions_by_state() {
+        let row = |agent: &str, states: &[(&str, &str)]| {
+            let states = states
+                .iter()
+                .map(|(n, key)| {
+                    crate::i18n::t_args(
+                        "zc-dashboard-session-state-count",
+                        &[("count", n), ("state", &crate::i18n::t(key))],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            crate::i18n::t_args(
+                "zc-dashboard-session-agent",
+                &[("agent", agent), ("states", &states)],
+            )
+        };
+        let mut sessions = vec![
+            (TurnStatus::Idle, "fable".to_string()),
+            (TurnStatus::Working, "fable".to_string()),
+            (TurnStatus::Idle, "ox".to_string()),
+            (TurnStatus::WaitingForApproval, "ox".to_string()),
+        ];
+        let lines = session_state_lines(&sessions, overview_status_label_width());
+        let text = lines_text(&lines);
+        assert_eq!(lines.len(), 2, "one row per agent: {text}");
+        assert_eq!(
+            lines[0].spans[0].content.trim(),
+            crate::i18n::t("zc-dashboard-label-sessions")
+        );
+        assert!(
+            text.contains(&row(
+                "fable",
+                &[
+                    ("1", "zc-dashboard-context-working"),
+                    ("1", "zc-dashboard-context-idle")
+                ]
+            )),
+            "fable counts: {text}"
+        );
+        assert!(
+            text.contains(&row(
+                "ox",
+                &[
+                    ("1", "zc-dashboard-context-blocked"),
+                    ("1", "zc-dashboard-context-idle")
+                ]
+            )),
+            "ox counts: {text}"
+        );
+
+        sessions[1].0 = TurnStatus::Idle;
+        let text = lines_text(&session_state_lines(
+            &sessions,
+            overview_status_label_width(),
+        ));
+        assert!(
+            text.contains(&row("fable", &[("2", "zc-dashboard-context-idle")])),
+            "finished turn moves to idle: {text}"
+        );
+        assert!(session_state_lines(&[], overview_status_label_width()).is_empty());
     }
 
     #[test]
@@ -3975,6 +4100,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
         ));
 
         let daemon_memory = crate::i18n::t("zc-dashboard-label-daemon-memory");
@@ -4014,6 +4140,7 @@ mod tests {
             Some("/work/chat"),
             None,
             None,
+            &[],
             &[],
         );
         let value_columns = lines
@@ -4111,6 +4238,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
         ));
 
