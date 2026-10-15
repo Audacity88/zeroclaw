@@ -71,10 +71,15 @@ impl DelegateActivityForwarder {
                         id
                     }
                 };
-                let arguments = arguments
+                let mut arguments = arguments
                     .as_deref()
                     .and_then(|raw| serde_json::from_str(raw).ok())
                     .unwrap_or(serde_json::Value::Null);
+                // A tool's own `approved` input is not an approval decision;
+                // shown under the card it reads as a refusal.
+                if let Some(map) = arguments.as_object_mut() {
+                    map.remove("approved");
+                }
                 (
                     id,
                     tool,
