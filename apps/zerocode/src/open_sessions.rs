@@ -231,6 +231,10 @@ pub(crate) struct Restore {
     pub elsewhere: usize,
     /// No longer known to the daemon.
     pub dropped: usize,
+    /// The early write of this window's list failed. The restore still goes
+    /// ahead, and the file keeps its previous contents; the next change to
+    /// the sidebar writes again.
+    pub publish_error: Option<anyhow::Error>,
 }
 
 impl Store {
@@ -250,7 +254,7 @@ impl Store {
     /// Decide what this window reopens and publish it as the window's list
     /// before any pane starts. With `restore` off (`--fresh`) the published
     /// list is empty, so the previous occupant's sessions are not claimed.
-    pub(crate) async fn start(&mut self, rpc: &RpcClient, restore: bool) -> Result<Restore> {
+    pub(crate) async fn start(&mut self, rpc: &RpcClient, restore: bool) -> Restore {
         let mut outcome = Restore::default();
         if restore && let Some(mut saved) = self.load() {
             outcome.elsewhere = saved.without(&self.ids_open_in_other_windows());
@@ -259,8 +263,8 @@ impl Store {
             outcome.snapshot = Some(saved);
         }
         let claim = outcome.snapshot.clone().unwrap_or_default();
-        self.save_if_changed(&claim)?;
-        Ok(outcome)
+        outcome.publish_error = self.save_if_changed(&claim).err();
+        outcome
     }
 
     /// Take the lowest free window slot for this connection target. `Ok(None)`
@@ -708,7 +712,7 @@ mod tests {
         // A `--fresh` window takes the slot whose file still lists "old".
         let mut fresh = owned(dir.path(), t);
         let (_out, client, _rx) = rpc_on(Transport::Local);
-        let outcome = fresh.start(&client, false).await.unwrap();
+        let outcome = fresh.start(&client, false).await;
         assert!(outcome.snapshot.is_none());
 
         // A second window must not treat "old" as open in the fresh one.
@@ -747,7 +751,7 @@ mod tests {
                 None,
             );
         });
-        let outcome = window.start(&client, true).await.unwrap();
+        let outcome = window.start(&client, true).await;
         answer.await.unwrap();
         assert_eq!(outcome.dropped, 1);
 
@@ -758,6 +762,56 @@ mod tests {
             !claimed.contains("gone"),
             "a session not reopened is not claimed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_early_write_still_restores_the_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let t = "local:/run/a.sock";
+        let mut previous = owned(dir.path(), t);
+        previous
+            .save_if_changed(&Snapshot::from_rows(
+                &[
+                    row(PaneKind::Acp, "keep", "a", true),
+                    row(PaneKind::Acp, "gone", "a", false),
+                ],
+                None,
+            ))
+            .unwrap();
+        drop(previous);
+
+        let mut window = owned(dir.path(), t);
+        let slots = dir.path().join(DIR_NAME);
+        std::fs::set_permissions(&slots, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let answer = tokio::spawn(async move {
+            let line = rx.recv().await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({ "sessions": [{
+                    "session_id": "keep", "session_key": "keep",
+                    "created_at": "", "last_activity": "", "message_count": 1,
+                    "agent_alias": "a"
+                }]})),
+                None,
+            );
+        });
+        let outcome = window.start(&client, true).await;
+        answer.await.unwrap();
+        std::fs::set_permissions(&slots, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(outcome.publish_error.is_some(), "the write was refused");
+        let ids: Vec<_> = outcome
+            .snapshot
+            .expect("the restore goes ahead")
+            .sessions
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["keep"]);
     }
 
     #[cfg(unix)]
