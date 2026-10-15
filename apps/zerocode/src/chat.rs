@@ -6952,6 +6952,7 @@ fn render_tool_entry(
     name: &str,
     input_json: &str,
     result: Option<&str>,
+    waiting: bool,
     is_selected: bool,
     disclosure: ToolDisclosure,
 ) -> Option<usize> {
@@ -7170,7 +7171,13 @@ fn render_tool_entry(
     }
 
     if let Some(input) = subagent_input.as_ref() {
-        let missing = crate::i18n::t("zc-chat-tool-result-not-recorded");
+        // Only a call this pane saw start in the running turn may say it is
+        // waiting; restored history cannot know, so it stays neutral.
+        let missing = crate::i18n::t(if waiting {
+            "zc-chat-tool-waiting-for-response"
+        } else {
+            "zc-chat-tool-result-not-recorded"
+        });
         let res = result.unwrap_or(&missing);
         let (response, details) = if name == "delegate" {
             delegate_response_parts(input, res)
@@ -7237,6 +7244,7 @@ fn render_entry_into(
     show_thoughts: bool,
     tool_disclosure: ToolDisclosure,
     width: u16,
+    waiting: bool,
     lines: &mut Vec<Line<'static>>,
 ) -> Option<usize> {
     let sel_mod = if is_selected {
@@ -7313,6 +7321,7 @@ fn render_entry_into(
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
+                waiting && result.is_none(),
                 is_selected,
                 tool_disclosure,
             );
@@ -9792,6 +9801,9 @@ pub struct ChatState {
     tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Per-tool disclosure overrides; file tools otherwise default to preview.
     tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
+    /// Tool calls this pane saw start in the turn still running. Only these
+    /// may claim to be waiting; restored or abandoned calls stay neutral.
+    live_tool_calls: HashSet<Arc<str>>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
     /// URL hit segments projected from the complete wrapped transcript into
@@ -9913,6 +9925,7 @@ impl ChatState {
             tool_header_rects: Vec::new(),
             tool_footer_rects: Vec::new(),
             tool_disclosures: BTreeMap::new(),
+            live_tool_calls: HashSet::new(),
             copy_hit_regions: Vec::new(),
             url_hit_regions: Vec::new(),
             pending_url_activation: None,
@@ -10756,34 +10769,38 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
-        let inputs =
-            self.entries[range.clone()]
-                .iter()
-                .enumerate()
-                .map(|(relative_index, entry)| {
-                    let index = range.start + relative_index;
-                    let highlighted = browse_multi.contains(&index)
-                        || browse_range.is_some_and(|(lo, hi)| index >= lo && index <= hi)
-                        || browse_cursor == Some(index);
-                    let disclosure = match entry {
-                        ChatEntry::Tool {
-                            tool_call_id,
-                            name,
-                            input_json,
-                            ..
-                        } => tool_disclosures
-                            .get(tool_call_id)
-                            .copied()
-                            .unwrap_or_else(|| default_tool_disclosure(name, input_json)),
-                        _ => ToolDisclosure::Collapsed,
-                    };
-                    EntryLayoutInput {
-                        index,
-                        entry,
-                        highlighted,
-                        disclosure,
-                    }
-                });
+        let live_tool_calls = &self.live_tool_calls;
+        let inputs = self.entries[range.clone()].iter().enumerate().map(
+            |(relative_index, entry)| {
+                let index = range.start + relative_index;
+                let highlighted = browse_multi.contains(&index)
+                    || browse_range.is_some_and(|(lo, hi)| index >= lo && index <= hi)
+                    || browse_cursor == Some(index);
+                let disclosure = match entry {
+                    ChatEntry::Tool {
+                        tool_call_id,
+                        name,
+                        input_json,
+                        ..
+                    } => tool_disclosures
+                        .get(tool_call_id)
+                        .copied()
+                        .unwrap_or_else(|| default_tool_disclosure(name, input_json)),
+                    _ => ToolDisclosure::Collapsed,
+                };
+                let waiting = matches!(
+                    entry,
+                    ChatEntry::Tool { tool_call_id, .. } if live_tool_calls.contains(tool_call_id)
+                );
+                EntryLayoutInput {
+                    index,
+                    entry,
+                    highlighted,
+                    disclosure,
+                    waiting,
+                }
+            },
+        );
         self.transcript_layout
             .rebuild(width, range.clone(), self.show_thoughts, inputs);
     }
@@ -11343,8 +11360,12 @@ impl ChatState {
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
+                let tool_call_id = Arc::<str>::from(tool_call_id);
+                if self.turn_in_flight {
+                    self.live_tool_calls.insert(Arc::clone(&tool_call_id));
+                }
                 self.entries.push(ChatEntry::Tool {
-                    tool_call_id: Arc::<str>::from(tool_call_id),
+                    tool_call_id,
                     name: Arc::<str>::from(name),
                     input_json: Arc::<str>::from(
                         serde_json::to_string(&raw_input).unwrap_or_default(),
@@ -11617,6 +11638,10 @@ impl ChatState {
 
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
+        if !self.live_tool_calls.is_empty() {
+            self.live_tool_calls.clear();
+            self.mark_dirty_full();
+        }
         self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -12102,6 +12127,7 @@ impl ChatState {
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.turn_in_flight = false;
+        self.live_tool_calls.clear();
         self.optimistic_user_message = None;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
@@ -12345,6 +12371,7 @@ impl ChatState {
         self.tool_header_rects.clear();
         self.tool_footer_rects.clear();
         self.tool_disclosures.clear();
+        self.live_tool_calls.clear();
         self.copy_hit_regions.clear();
         self.url_hit_regions.clear();
         self.pending_url_activation = None;
@@ -12634,6 +12661,7 @@ mod tests {
             false,
             ToolDisclosure::Collapsed,
             80,
+            false,
             &mut lines,
         );
         let url_span = lines[0]
@@ -25726,6 +25754,32 @@ mod tests {
     }
 
     #[test]
+    fn subagent_card_says_waiting_only_while_its_turn_runs() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "child".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "reviewer", "prompt": "Inspect the parser"}),
+        });
+        let render = |s: &mut ChatState| {
+            s.rebuild_lines(120);
+            rendered_text(&s.transcript_layout.view().cached_lines)
+        };
+        assert!(render(&mut s).contains("Response:\n    Waiting for response"));
+
+        // The turn ends without a result (cancelled, failed): neutral again.
+        s.settle_turn_lifecycle(false, QueuePauseReason::Generic);
+        let settled = render(&mut s);
+        assert!(
+            settled.contains("Response:\n    Result not recorded"),
+            "{settled}"
+        );
+        assert!(!settled.contains("Waiting"));
+    }
+
+    #[test]
     fn subagent_card_live_results_stay_with_the_call_not_the_prompt() {
         let mut s = state();
         for id in ["child-a", "child-b"] {
@@ -25748,7 +25802,15 @@ mod tests {
             .iter()
             .map(|entry| {
                 let mut lines = Vec::new();
-                render_entry_into(entry, false, false, ToolDisclosure::Full, 80, &mut lines);
+                render_entry_into(
+                    entry,
+                    false,
+                    false,
+                    ToolDisclosure::Full,
+                    80,
+                    false,
+                    &mut lines,
+                );
                 rendered_text(&lines)
             })
             .collect::<Vec<_>>();
@@ -25789,6 +25851,7 @@ mod tests {
             false,
             ToolDisclosure::Full,
             80,
+            false,
             &mut lines,
         );
         let text = rendered_text(&lines);
@@ -25817,6 +25880,7 @@ mod tests {
             &input,
             Some(output),
             false,
+            false,
             ToolDisclosure::Full,
         );
         let text = rendered_text(&lines);
@@ -25842,6 +25906,7 @@ mod tests {
                 "delegate",
                 &input.to_string(),
                 Some("Task started"),
+                false,
                 false,
                 ToolDisclosure::Full,
             );
@@ -25869,6 +25934,7 @@ mod tests {
             &input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let collapsed = rendered_text(&collapsed);
@@ -25881,6 +25947,7 @@ mod tests {
             "delegate",
             &input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Full,
         );
@@ -25918,6 +25985,7 @@ mod tests {
                 &input,
                 None,
                 false,
+                false,
                 ToolDisclosure::Full,
             );
             let text = rendered_text(&lines);
@@ -25938,6 +26006,7 @@ mod tests {
                 "delegate",
                 input,
                 Some(result),
+                false,
                 false,
                 disclosure,
             );
@@ -25978,6 +26047,7 @@ mod tests {
                 input,
                 Some(raw),
                 false,
+                false,
                 ToolDisclosure::Full,
             );
             let text = rendered_text(&lines);
@@ -26008,6 +26078,7 @@ mod tests {
             &input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let collapsed_text = rendered_text(&collapsed);
@@ -26023,6 +26094,7 @@ mod tests {
             "shell",
             &input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Full,
         );
@@ -26049,6 +26121,7 @@ mod tests {
             "shell",
             &input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Full,
         );
@@ -26085,6 +26158,7 @@ mod tests {
             &edit_input,
             Some("done"),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
@@ -26110,6 +26184,7 @@ mod tests {
             "file_write",
             &write_input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Preview,
         );
@@ -26141,6 +26216,7 @@ mod tests {
             &write_input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Full,
         );
         let full_text = rendered_text(&full_lines);
@@ -26168,6 +26244,7 @@ mod tests {
             &base64_input,
             None,
             false,
+            false,
             ToolDisclosure::Preview,
         );
         let base64_text = rendered_text(&base64_lines);
@@ -26183,6 +26260,7 @@ mod tests {
             "file_write",
             malformed,
             None,
+            false,
             false,
             ToolDisclosure::Preview,
         );

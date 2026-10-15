@@ -598,6 +598,7 @@ zc-chat-tool-target = Target
 zc-chat-tool-response = Response
 zc-chat-tool-details = Details
 zc-chat-tool-result-not-recorded = Result not recorded
+zc-chat-tool-waiting-for-response = Waiting for response
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
