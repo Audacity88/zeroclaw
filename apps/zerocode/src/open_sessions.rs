@@ -15,6 +15,12 @@
 //! reopening it while the first still runs brings back the second's sessions.
 //! A session that another live window has in its list is not restored, since
 //! reattaching a session live in another window lets either window cancel it.
+//! Each window publishes the list it is about to open as soon as it decides,
+//! before its panes start, so other windows never judge by a stale list.
+//!
+//! Local connections only. Over WSS the daemon admits a resume only from the
+//! client identity that owns the session right now, and a relaunched window
+//! has a new one, so a saved remote list could only produce failed rows.
 
 use std::path::{Path, PathBuf};
 
@@ -147,15 +153,7 @@ impl Snapshot {
 /// Check a loaded list against the daemon before resuming it, so a session
 /// deleted or pruned since the last launch is skipped instead of showing as a
 /// failed row that cannot be closed.
-///
-/// Local connections only. Over WSS the daemon lists just the sessions this
-/// client instance owns right now, which after a restart is none, so a check
-/// there would drop the whole list. Remote entries go straight to the resume
-/// path, which keeps any that fail as retryable rows.
-pub(crate) async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize) {
-    if rpc.transport() != Transport::Local {
-        return (saved, 0);
-    }
+async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize) {
     let wants = |pane| saved.sessions.iter().any(|s| s.pane == pane);
     let code = if wants(SavedPane::Code) {
         rpc.acp_session_list().await.ok().map(|list| list.sessions)
@@ -225,10 +223,49 @@ fn held_elsewhere(path: &Path) -> bool {
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
+/// What a launch reopens, and why any saved sessions were left out.
+#[derive(Debug, Default)]
+pub(crate) struct Restore {
+    pub snapshot: Option<Snapshot>,
+    /// Open in another running window.
+    pub elsewhere: usize,
+    /// No longer known to the daemon.
+    pub dropped: usize,
+}
+
 impl Store {
+    /// The store for this launch, or `Ok(None)` when the connection is not
+    /// local (see the module docs) or every window slot is taken.
+    pub(crate) fn for_launch(
+        config_dir: &Path,
+        target_label: &str,
+        transport: Transport,
+    ) -> Result<Option<Self>> {
+        if transport != Transport::Local {
+            return Ok(None);
+        }
+        Self::acquire(config_dir, target_label)
+    }
+
+    /// Decide what this window reopens and publish it as the window's list
+    /// before any pane starts. With `restore` off (`--fresh`) the published
+    /// list is empty, so the previous occupant's sessions are not claimed.
+    pub(crate) async fn start(&mut self, rpc: &RpcClient, restore: bool) -> Result<Restore> {
+        let mut outcome = Restore::default();
+        if restore && let Some(mut saved) = self.load() {
+            outcome.elsewhere = saved.without(&self.ids_open_in_other_windows());
+            let (saved, dropped) = prune_missing(rpc, saved).await;
+            outcome.dropped = dropped;
+            outcome.snapshot = Some(saved);
+        }
+        let claim = outcome.snapshot.clone().unwrap_or_default();
+        self.save_if_changed(&claim)?;
+        Ok(outcome)
+    }
+
     /// Take the lowest free window slot for this connection target. `Ok(None)`
     /// means every slot is held by a running window.
-    pub(crate) fn acquire(config_dir: &Path, target_label: &str) -> Result<Option<Self>> {
+    fn acquire(config_dir: &Path, target_label: &str) -> Result<Option<Self>> {
         let digest = Sha256::digest(target_label.as_bytes());
         let base: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         let dir = config_dir.join(DIR_NAME);
@@ -639,15 +676,87 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn remote_restore_keeps_the_list_without_asking() {
-        let (_out, client, mut rx) = rpc_on(Transport::Wss);
-        let saved = Snapshot::from_rows(&[row(PaneKind::Acp, "s", "a", true)], None);
-        let (kept, dropped) = prune_missing(&client, saved.clone()).await;
-        assert_eq!((kept, dropped), (saved, 0));
+    #[test]
+    fn remote_connections_neither_save_nor_restore() {
+        let dir = tempfile::tempdir().unwrap();
         assert!(
-            rx.try_recv().is_err(),
-            "a remote restore must not list sessions"
+            Store::for_launch(dir.path(), "wss://host:9781", Transport::Wss)
+                .unwrap()
+                .is_none(),
+            "a relaunched remote window cannot reclaim its sessions, so it keeps no list"
+        );
+        assert!(
+            Store::for_launch(dir.path(), "local:/run/a.sock", Transport::Local)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_window_publishes_an_empty_list_before_its_panes_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "local:/run/a.sock";
+        let mut previous = owned(dir.path(), t);
+        previous
+            .save_if_changed(&Snapshot::from_rows(
+                &[row(PaneKind::Acp, "old", "a", true)],
+                None,
+            ))
+            .unwrap();
+        drop(previous);
+
+        // A `--fresh` window takes the slot whose file still lists "old".
+        let mut fresh = owned(dir.path(), t);
+        let (_out, client, _rx) = rpc_on(Transport::Local);
+        let outcome = fresh.start(&client, false).await.unwrap();
+        assert!(outcome.snapshot.is_none());
+
+        // A second window must not treat "old" as open in the fresh one.
+        let other = owned(dir.path(), t);
+        assert!(other.ids_open_in_other_windows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_restoring_window_publishes_only_what_it_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "local:/run/a.sock";
+        let mut previous = owned(dir.path(), t);
+        previous
+            .save_if_changed(&Snapshot::from_rows(
+                &[
+                    row(PaneKind::Acp, "alive", "a", true),
+                    row(PaneKind::Acp, "gone", "a", false),
+                ],
+                None,
+            ))
+            .unwrap();
+        drop(previous);
+
+        let mut window = owned(dir.path(), t);
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let answer = tokio::spawn(async move {
+            let line = rx.recv().await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({ "sessions": [{
+                    "session_id": "alive", "session_key": "alive",
+                    "created_at": "", "last_activity": "", "message_count": 1,
+                    "agent_alias": "a"
+                }]})),
+                None,
+            );
+        });
+        let outcome = window.start(&client, true).await.unwrap();
+        answer.await.unwrap();
+        assert_eq!(outcome.dropped, 1);
+
+        let other = owned(dir.path(), t);
+        let claimed = other.ids_open_in_other_windows();
+        assert!(claimed.contains("alive"));
+        assert!(
+            !claimed.contains("gone"),
+            "a session not reopened is not claimed"
         );
     }
 

@@ -1759,11 +1759,8 @@ pub async fn run(
     // rebuild uses.
     let mut open_sessions_store = None;
     if open_sessions.save {
-        match crate::open_sessions::Store::acquire(config_dir, connect_label) {
-            Ok(Some(store)) => open_sessions_store = Some(store),
-            // Every window slot is held by a running window: start empty and
-            // save nothing.
-            Ok(None) => {}
+        match crate::open_sessions::Store::for_launch(config_dir, connect_label, rpc.transport()) {
+            Ok(store) => open_sessions_store = store,
             Err(error) => {
                 reload_status = Some(crate::i18n::t_args(
                     "zc-app-restore-sessions-save-failed",
@@ -1773,27 +1770,30 @@ pub async fn run(
         }
     }
     let mut restored = None;
-    if open_sessions.restore
-        && let Some(store) = open_sessions_store.as_mut()
-        && let Some(mut saved) = store.load()
-    {
-        // A session another running window has open stays there: two
-        // windows on one live session can cancel each other's turns.
-        let elsewhere = saved.without(&store.ids_open_in_other_windows());
-        let (saved, dropped) = crate::open_sessions::prune_missing(&rpc, saved).await;
-        if elsewhere > 0 {
-            reload_status = Some(crate::i18n::t_args(
-                "zc-app-restore-sessions-other-window",
-                &[("count", &elsewhere.to_string())],
-            ));
+    if let Some(store) = open_sessions_store.as_mut() {
+        match store.start(&rpc, open_sessions.restore).await {
+            Ok(outcome) => {
+                if outcome.elsewhere > 0 {
+                    reload_status = Some(crate::i18n::t_args(
+                        "zc-app-restore-sessions-other-window",
+                        &[("count", &outcome.elsewhere.to_string())],
+                    ));
+                }
+                if outcome.dropped > 0 {
+                    reload_status = Some(crate::i18n::t_args(
+                        "zc-app-restore-sessions-dropped",
+                        &[("count", &outcome.dropped.to_string())],
+                    ));
+                }
+                restored = outcome.snapshot;
+            }
+            Err(error) => {
+                reload_status = Some(crate::i18n::t_args(
+                    "zc-app-restore-sessions-save-failed",
+                    &[("error", &format!("{error:#}"))],
+                ));
+            }
         }
-        if dropped > 0 {
-            reload_status = Some(crate::i18n::t_args(
-                "zc-app-restore-sessions-dropped",
-                &[("count", &dropped.to_string())],
-            ));
-        }
-        restored = Some(saved);
     }
     let (resume_chat, resume_acp) = restored
         .as_ref()
