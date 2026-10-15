@@ -35,6 +35,8 @@ pub(super) struct EntryLayoutInput<'a> {
     pub highlighted: bool,
     pub disclosure: ToolDisclosure,
     pub local_diff: Option<&'a zeroclaw_api::local_file_diff::LocalFileDiff>,
+    /// A tool card whose call started in the running turn and has no result.
+    pub waiting: bool,
 }
 
 /// Coupled committed layout indexes. Production consumers only borrow this view.
@@ -276,6 +278,7 @@ impl TranscriptLayoutCache {
             input.disclosure,
             width,
             input.local_diff,
+            input.waiting,
             &mut self.layout.cached_lines,
         );
         let after = self.layout.cached_lines.len();

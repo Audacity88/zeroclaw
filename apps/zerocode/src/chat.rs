@@ -8176,6 +8176,7 @@ fn render_tool_entry(
         is_selected,
         disclosure,
         None,
+        false,
     )
 }
 
@@ -8189,6 +8190,7 @@ fn render_tool_entry_with_diff(
     is_selected: bool,
     disclosure: ToolDisclosure,
     local_diff: Option<&zeroclaw_api::local_file_diff::LocalFileDiff>,
+    waiting: bool,
 ) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
@@ -8550,7 +8552,13 @@ fn render_tool_entry_with_diff(
     }
 
     if let Some(input) = subagent_input.as_ref() {
-        let missing = crate::i18n::t("zc-chat-tool-result-not-recorded");
+        // Only a call this pane saw start in the running turn may say it is
+        // waiting; restored history cannot know, so it stays neutral.
+        let missing = crate::i18n::t(if waiting {
+            "zc-chat-tool-waiting-for-response"
+        } else {
+            "zc-chat-tool-result-not-recorded"
+        });
         let res = result.unwrap_or(&missing);
         let (response, details) = if name == "delegate" {
             delegate_response_parts(input, res)
@@ -8683,6 +8691,7 @@ fn render_entry_into(
     tool_disclosure: ToolDisclosure,
     width: u16,
     local_diff: Option<&zeroclaw_api::local_file_diff::LocalFileDiff>,
+    waiting: bool,
     lines: &mut Vec<Line<'static>>,
 ) -> Option<usize> {
     let sel_mod = if is_selected {
@@ -8789,6 +8798,7 @@ fn render_entry_into(
                 is_selected,
                 tool_disclosure,
                 local_diff,
+                waiting && result.is_none(),
             );
             if let Some(log) = delegate_activity.as_deref() {
                 render_delegate_activity(
@@ -12180,6 +12190,9 @@ pub struct ChatState {
     tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Per-tool disclosure overrides; file tools otherwise default to preview.
     tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
+    /// Tool calls this pane saw start in the turn still running. Only these
+    /// may claim to be waiting; restored or abandoned calls stay neutral.
+    live_tool_calls: HashSet<Arc<str>>,
     /// Indexed by live card occurrence, since provider IDs can recur in history.
     local_file_diffs: BTreeMap<usize, CachedLocalFileDiff>,
     local_diff_live_start: usize,
@@ -12329,6 +12342,7 @@ impl ChatState {
             tool_header_rects: Vec::new(),
             tool_footer_rects: Vec::new(),
             tool_disclosures: BTreeMap::new(),
+            live_tool_calls: HashSet::new(),
             local_file_diffs: BTreeMap::new(),
             local_diff_live_start: 0,
             copy_hit_regions: Vec::new(),
@@ -13383,6 +13397,7 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
+        let live_tool_calls = &self.live_tool_calls;
         let local_file_diffs = &self.local_file_diffs;
         let today = chrono::Local::now().date_naive();
         let is_user: Vec<bool> = self
@@ -13424,6 +13439,10 @@ impl ChatState {
                         highlighted,
                         disclosure,
                         local_diff: local_file_diffs.get(&index).map(|cached| &cached.diff),
+                        waiting: matches!(
+                            entry,
+                            ChatEntry::Tool { tool_call_id, .. } if live_tool_calls.contains(tool_call_id)
+                        ),
                     }
                 });
         self.transcript_layout
@@ -14272,8 +14291,12 @@ impl ChatState {
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
+                let tool_call_id = Arc::<str>::from(tool_call_id);
+                if self.turn_in_flight {
+                    self.live_tool_calls.insert(Arc::clone(&tool_call_id));
+                }
                 self.push_entry(ChatEntry::Tool {
-                    tool_call_id: Arc::<str>::from(tool_call_id),
+                    tool_call_id,
                     name: Arc::<str>::from(name),
                     input_json: Arc::<str>::from(
                         serde_json::to_string(&raw_input).unwrap_or_default(),
@@ -14678,6 +14701,10 @@ impl ChatState {
             TurnEndChange::Full => self.mark_dirty_full(),
         }
         self.turn_in_flight = false;
+        if !self.live_tool_calls.is_empty() {
+            self.live_tool_calls.clear();
+            self.mark_dirty_full();
+        }
         self.observing_foreign_turn = false;
         self.optimistic_user_message = None;
         self.dispatched_prompt = None;
@@ -15375,6 +15402,7 @@ impl ChatState {
         self.transcript_snapshot = None;
         self.clear_transcript_selection();
         self.turn_in_flight = false;
+        self.live_tool_calls.clear();
         self.optimistic_user_message = None;
         self.dispatched_prompt = None;
         self.prompt_settled_awaiting_terminal = false;
@@ -15978,6 +16006,7 @@ impl ChatState {
         self.tool_header_rects.clear();
         self.tool_footer_rects.clear();
         self.tool_disclosures.clear();
+        self.live_tool_calls.clear();
         self.copy_hit_regions.clear();
         self.url_hit_regions.clear();
         self.pending_url_activation = None;
@@ -16645,6 +16674,7 @@ mod tests {
             ToolDisclosure::Collapsed,
             80,
             None,
+            false,
             &mut lines,
         );
         let url_span = lines[0]
@@ -16675,6 +16705,7 @@ mod tests {
             ToolDisclosure::Collapsed,
             80,
             None,
+            false,
             &mut lines,
         );
         let label = &lines[0].spans[0];
@@ -16710,6 +16741,7 @@ mod tests {
             ToolDisclosure::Collapsed,
             80,
             None,
+            false,
             &mut local,
         );
         assert_eq!(
@@ -31205,6 +31237,7 @@ mod tests {
                 disclosure,
                 120,
                 None,
+                false,
                 &mut lines,
             );
             rendered_text(&lines)
@@ -31246,6 +31279,32 @@ mod tests {
     }
 
     #[test]
+    fn subagent_card_says_waiting_only_while_its_turn_runs() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "child".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "reviewer", "prompt": "Inspect the parser"}),
+        });
+        let render = |s: &mut ChatState| {
+            s.rebuild_lines(120);
+            rendered_text(&s.transcript_layout.view().cached_lines)
+        };
+        assert!(render(&mut s).contains("Response:\n    Waiting for response"));
+
+        // The turn ends without a result (cancelled, failed): neutral again.
+        s.settle_turn_lifecycle(false, QueuePauseReason::Generic);
+        let settled = render(&mut s);
+        assert!(
+            settled.contains("Response:\n    Result not recorded"),
+            "{settled}"
+        );
+        assert!(!settled.contains("Waiting"));
+    }
+
+    #[test]
     fn subagent_card_live_results_stay_with_the_call_not_the_prompt() {
         let mut s = state();
         for id in ["child-a", "child-b"] {
@@ -31275,6 +31334,7 @@ mod tests {
                     ToolDisclosure::Full,
                     80,
                     None,
+                    false,
                     &mut lines,
                 );
                 rendered_text(&lines)
@@ -31318,6 +31378,7 @@ mod tests {
             ToolDisclosure::Full,
             80,
             None,
+            false,
             &mut lines,
         );
         let text = rendered_text(&lines);
@@ -31828,6 +31889,7 @@ mod tests {
                 false,
                 disclosure,
                 Some(&diff),
+                false,
             );
             let text = rendered_text(&lines);
             assert!(text.contains("Overwrote existing file"));
@@ -31866,6 +31928,7 @@ mod tests {
             false,
             ToolDisclosure::Preview,
             Some(&unchanged),
+            false,
         );
         assert!(rendered_text(&unchanged_lines).contains("Content unchanged"));
         assert!(unchanged_footer.is_none());

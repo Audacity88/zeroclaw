@@ -675,6 +675,7 @@ zc-chat-tool-target = Target
 zc-chat-tool-response = Response
 zc-chat-tool-details = Details
 zc-chat-tool-result-not-recorded = Result not recorded
+zc-chat-tool-waiting-for-response = Waiting for response
 zc-chat-tool-encoding = Encoding
 zc-chat-tool-write-preview = Content preview · not a diff
 zc-chat-tool-write-result-absent = Wrote { $bytes } bytes · file previously absent.
