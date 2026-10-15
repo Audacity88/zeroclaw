@@ -2772,6 +2772,16 @@ impl App {
         self.status_msg = None;
     }
 
+    fn finish_alias_rename(&mut self) {
+        if let Screen::AliasRename {
+            return_to_fields, ..
+        } = &mut self.screen
+        {
+            *return_to_fields = false;
+        }
+        self.cancel_alias_rename();
+    }
+
     async fn handle_alias_rename(&mut self, key: KeyEvent) -> Result<()> {
         use crate::keymap::ConfigEditorAction;
         let Screen::AliasRename {
@@ -2810,13 +2820,7 @@ impl App {
                         let mut status = if result.renamed {
                             // The rename has committed. Leave the editor before refreshing
                             // so a failed read cannot cause the mutation to be retried.
-                            if let Screen::AliasRename {
-                                return_to_fields, ..
-                            } = &mut self.screen
-                            {
-                                *return_to_fields = false;
-                            }
-                            self.cancel_alias_rename();
+                            self.finish_alias_rename();
                             match self.load_aliases(&map_path).await {
                                 Ok(()) => {
                                     self.alias_cursor = self
@@ -2856,13 +2860,45 @@ impl App {
                         self.status_msg = Some(status);
                     }
                     Err(e) => {
-                        if let Screen::AliasRename { confirming, .. } = &mut self.screen {
-                            *confirming = false;
+                        use crate::jsonrpc::{JsonRpcError, error_codes};
+                        // Only method/parameter refusals establish that no mutation ran.
+                        // A timeout, transport loss or internal error may follow a save.
+                        let refused = e.downcast_ref::<JsonRpcError>().is_some_and(|error| {
+                            matches!(
+                                error.code,
+                                error_codes::METHOD_NOT_FOUND | error_codes::INVALID_PARAMS
+                            )
+                        });
+                        if refused {
+                            if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                                *confirming = false;
+                            }
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-alias-rename-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        } else {
+                            // Retire the stale source before reading. Failed reconciliation
+                            // must not leave a retryable mutation or cached aliases behind.
+                            self.finish_alias_rename();
+                            self.aliases.clear();
+                            self.alias_enabled.clear();
+                            self.alias_cursor = 0;
+                            self.loaded_section = None;
+                            self.status_msg = Some(match self.load_aliases(&map_path).await {
+                                Ok(()) => crate::i18n::t_args(
+                                    "zc-config-status-alias-rename-unknown",
+                                    &[("err", &e.to_string())],
+                                ),
+                                Err(refresh_error) => crate::i18n::t_args(
+                                    "zc-config-status-alias-rename-unknown-refresh-failed",
+                                    &[
+                                        ("err", &e.to_string()),
+                                        ("refresh_err", &refresh_error.to_string()),
+                                    ],
+                                ),
+                            });
                         }
-                        self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-alias-rename-failed",
-                            &[("err", &e.to_string())],
-                        ));
                     }
                 }
             }
@@ -6401,6 +6437,91 @@ mod tests {
                 .contains("not applied warning")
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_lost_reply_reconciles_before_another_mutation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for refresh_succeeds in [true, false] {
+            let (mut manager, outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            enter_alias_rename(&mut manager, &mut term, "new").await;
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            let mut saved_aliases = vec!["old".to_string()];
+            let (result, ()) = tokio::join!(
+                manager.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term),
+                async {
+                    let raw = rx.recv().await.unwrap();
+                    let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(req["method"], "config/map-key-rename");
+                    assert_eq!(
+                        req["params"],
+                        serde_json::json!({"path": "providers.models.openai", "from": "old", "to": "new"})
+                    );
+                    // Commit the fixture rename, but suppress its success response.
+                    saved_aliases[0] = "new".into();
+                    tokio::time::advance(std::time::Duration::from_secs(121)).await;
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-keys",
+                        serde_json::json!({"path": "providers.models.openai"}),
+                        if refresh_succeeds {
+                            Ok(serde_json::json!({"keys": saved_aliases}))
+                        } else {
+                            Err("reload unavailable")
+                        },
+                    )
+                    .await;
+                    assert_eq!(outbound.pending_count(), 0);
+                    if refresh_succeeds {
+                        answer_config_request(
+                            &outbound,
+                            &mut rx,
+                            "config/list",
+                            serde_json::json!({"prefix": "providers.models.openai.new.enabled"}),
+                            Ok(serde_json::json!({"entries": []})),
+                        )
+                        .await;
+                    }
+                }
+            );
+            result.unwrap();
+            assert_eq!(saved_aliases, ["new"]);
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(manager.edit_buf.is_empty());
+            assert!(
+                manager
+                    .status_msg
+                    .as_deref()
+                    .unwrap()
+                    .contains("outcome is unknown")
+            );
+            if refresh_succeeds {
+                assert_eq!(manager.aliases, saved_aliases);
+                // A fresh Rename explicitly targets the reconciled destination.
+                enter_alias_rename(&mut manager, &mut term, "next").await;
+                config_key(&mut manager, &mut term, KeyCode::Enter).await;
+                assert!(
+                    matches!(&manager.screen, Screen::AliasRename { from, confirming: true, .. } if from == "new")
+                );
+            } else {
+                assert!(manager.aliases.is_empty());
+                assert!(manager.alias_enabled.is_empty());
+                assert!(manager.loaded_section.is_none());
+                config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+                config_key(&mut manager, &mut term, KeyCode::Enter).await;
+                config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "confirmation must not replay the stale rename"
+            );
+        }
     }
 
     #[tokio::test]

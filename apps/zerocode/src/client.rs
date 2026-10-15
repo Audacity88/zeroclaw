@@ -2213,7 +2213,10 @@ impl RpcClient {
                     timeout,
                 })
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                let message = format!("RPC {method}: {} ({})", e.message, e.code);
+                anyhow::Error::new(e).context(message)
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
