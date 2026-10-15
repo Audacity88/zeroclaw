@@ -90,6 +90,10 @@ running, and it reopens the sessions the second window had. A session another
 running window has open is not reopened twice, because two windows on one live
 session can cancel each other's turns.
 
+This applies to local daemon connections. A remote (`--connect`) window does not
+save or reopen its list: the daemon admits a remote resume only from the client
+identity that owns the session, and a relaunched window has a new one.
+
 ```toml
 [sidebar]
 restore_sessions = true # reopen last launch's sessions (default)
