@@ -4591,6 +4591,9 @@ impl Agent {
         // Steering prepared and judged at the end of a round, consumed at the
         // top of the next with no await in between.
         let mut steered_continuation: Option<Vec<ChatMessage>> = None;
+        // Provider-reported usage handed over by a run that yielded to
+        // steering, so the resumed run keeps the same token calibration.
+        let mut carried_reported_usage: Option<crate::agent::turn::ReportedRequestUsage> = None;
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
@@ -4754,6 +4757,7 @@ impl Agent {
                             }),
                         },
                         initial_ingress_subject,
+                        carried_reported_usage.take(),
                     )),
                 ),
             );
@@ -4988,10 +4992,9 @@ impl Agent {
                     // instead of after the final answer. A cancelled turn
                     // prepares nothing; the next round's top records the
                     // interruption.
-                    if let Some(pending) =
-                        error.downcast_ref::<crate::agent::turn::SteeringPending>()
-                    {
+                    if let Ok(pending) = error.downcast::<crate::agent::turn::SteeringPending>() {
                         committed_response.push_str(&pending.display_text);
+                        carried_reported_usage = pending.reported_usage;
                     }
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
@@ -15374,6 +15377,168 @@ mod tests {
                 .count(),
             1,
             "each steering message is persisted once as its own user turn"
+        );
+    }
+
+    /// The provider's reported usage from the step before a steering yield
+    /// still calibrates the step after it. Here that usage says the request
+    /// was far larger than estimated, so the resumed step must be refused
+    /// before dispatch instead of being sent on the raw estimate.
+    #[tokio::test]
+    async fn steering_yield_keeps_reported_usage_for_the_next_step() {
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
+
+        // Answers the first request with a tool call and a usage report a
+        // thousand times its own estimate; any later request gets a plain
+        // answer.
+        struct UndercountedProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ModelProvider for UndercountedProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("final".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                let estimated = crate::agent::history::estimate_history_tokens(request.messages)
+                    + request
+                        .tools
+                        .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "call-1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(estimated as u64 * 1_000),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        output_tokens: Some(1),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for UndercountedProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "undercounted"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(UndercountedProvider {
+                calls: Arc::clone(&calls),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the step after the yield must be refused on the carried usage, not dispatched"
+        );
+        let mut calibrated_trim = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::HistoryTrimmed {
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                ..
+            } = event
+            {
+                calibrated_trim = true;
+            }
+        }
+        assert!(
+            calibrated_trim,
+            "the resumed step must count its request with the carried calibration"
         );
     }
 

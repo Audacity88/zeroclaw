@@ -402,10 +402,13 @@ impl std::error::Error for ModelSwitchRequested {}
 /// A loop running with `LoopKnobs::yield_to_steering` stopped after a tool
 /// round because steering is waiting. The round's messages are already in the
 /// canonical buffer; `display_text` is the text the round showed, for the
-/// caller to commit before it starts the steered round.
+/// caller to commit before it starts the steered round. `reported_usage` is
+/// the last request's provider-reported usage, for the caller to hand to the
+/// resumed run so its token calibration carries over.
 #[derive(Debug)]
 pub(crate) struct SteeringPending {
     pub(crate) display_text: String,
+    pub(crate) reported_usage: Option<super::ReportedRequestUsage>,
 }
 
 impl std::fmt::Display for SteeringPending {

@@ -961,6 +961,7 @@ async fn projected_provider_facing_tokens(
         .round() as usize
 }
 
+#[derive(Debug)]
 pub(crate) struct ReportedRequestUsage {
     provider_name: String,
     model: String,
@@ -1577,22 +1578,27 @@ pub(crate) enum InitialIngressSubject<'a> {
     AlreadyAdmitted,
 }
 
+/// `reported_usage` is the last provider-reported usage from a run that
+/// yielded with `SteeringPending`, so the resumed run calibrates its first
+/// dispatch exactly as the yielded run would have.
 pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
+    reported_usage: Option<ReportedRequestUsage>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject))
+    run_tool_call_loop_impl(p, Some(subject), reported_usage)
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None)
+    run_tool_call_loop_impl(p, None, None)
 }
 
 async fn run_tool_call_loop_impl<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
 ) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -1850,7 +1856,7 @@ async fn run_tool_call_loop_impl<'a>(
 
     // Usage describes the completed request, not a prediction of the next
     // hook-selected model, schemas, or prepared messages.
-    let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
+    let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
@@ -1900,6 +1906,7 @@ async fn run_tool_call_loop_impl<'a>(
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 return Err(SteeringPending {
                     display_text: accumulated_display_text,
+                    reported_usage: pending_reported_usage.take(),
                 }
                 .into());
             }
