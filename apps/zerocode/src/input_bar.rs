@@ -244,7 +244,7 @@ pub(crate) enum InputBarAction {
     /// User typed `/reload-context` — parent asks the daemon to re-read the
     /// agent's personality files (`AGENTS.md`, `SOUL.md`, ...) for this
     /// session. Sessions otherwise keep the text from their first turn so an
-    /// edit doesn't invalidate the prompt cache (#11696).
+    /// edit doesn't invalidate the prompt cache.
     ReloadContext,
     /// User typed `/change-directory` — parent should open a directory picker
     /// and start a new session in the selected directory. Takes no argument:
