@@ -5889,6 +5889,24 @@ impl Chat {
             _ => false,
         }
     }
+
+    /// Whether the active Chat surface owns a global session shortcut chord.
+    ///
+    /// Pickers and modal overlays get first refusal over every key. In the
+    /// normal composer, an explicitly rebound pane or input-bar action keeps
+    /// its chord instead of being shadowed by the global default.
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        match &self.phase {
+            ChatPhase::Active(state) => {
+                // Browse mode is not a modal: an unclaimed session shortcut
+                // switches straight away instead of only leaving browse mode.
+                state.overlay_owns_keys()
+                    || crate::keymap::ChatTabAction::from_chord(key).is_some()
+                    || crate::keymap::InputBarAction::from_chord(key).is_some()
+            }
+            _ => true,
+        }
+    }
 }
 
 impl crate::widgets::HelpContext for Chat {
@@ -9967,14 +9985,18 @@ impl ChatState {
     /// Whether text input currently belongs to the composer rather than a
     /// modal, picker, explorer, or transcript-browse surface.
     fn composer_owns_text_input(&self) -> bool {
-        !self.model_picker.is_open()
-            && self.pending_elicitation().is_none()
-            && self.pending_approval().is_none()
-            && matches!(self.session_overlay, SessionOverlay::None)
-            && self.context_menu.is_none()
-            && !self.input_bar.has_file_explorer()
-            && !self.input_bar.has_attachment_manager()
-            && !self.in_browse_mode()
+        !self.overlay_owns_keys() && !self.in_browse_mode()
+    }
+
+    /// A picker, modal, menu or input-bar overlay is open and owns every key.
+    fn overlay_owns_keys(&self) -> bool {
+        self.model_picker.is_open()
+            || self.pending_elicitation().is_some()
+            || self.pending_approval().is_some()
+            || !matches!(self.session_overlay, SessionOverlay::None)
+            || self.context_menu.is_some()
+            || self.input_bar.has_file_explorer()
+            || self.input_bar.has_attachment_manager()
     }
 
     /// Route a key to an input-bar-owned overlay and retain its user feedback.
@@ -20049,11 +20071,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_session_swaps_states_and_preserves_transcripts() {
+    async fn session_shortcut_focus_swaps_states_and_preserves_running_transcripts() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = two_session_chat(&rpc);
         if let ChatPhase::Active(a) = &mut chat.phase {
+            a.turn_in_flight = true;
             a.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from("from-a")));
             a.rebuild_lines(40);
@@ -20094,6 +20117,11 @@ mod tests {
             .iter()
             .find(|s| s.session_id == "sess-a")
             .expect("previous session stays tracked");
+        assert!(
+            a.turn_in_flight,
+            "switching must not cancel the running session"
+        );
+        assert_eq!(a.sidebar_status(), SidebarStatus::Running);
         assert!(matches!(&a.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-a"));
         assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
         assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
@@ -30412,6 +30440,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_tool_rounds_notifications_reach_final_chat_and_code_cells_in_order() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/single-tool-rounds.json"
+        )))
+        .unwrap();
+        let notice = fixture["unsupported_notice"].as_str().unwrap();
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for unsupported in [false, true] {
+                for width in [120, 160] {
+                    let (mut chat, _writer_rx) = test_chat();
+                    chat.pane_kind = pane;
+                    let mut active = state();
+                    active.turn_in_flight = true;
+                    for id in ["call-one", "call-two"] {
+                        active
+                            .tool_disclosures
+                            .insert(id.into(), ToolDisclosure::Full);
+                    }
+                    chat.phase = ChatPhase::Active(Box::new(active));
+                    let mut updates = fixture["updates"].as_array().unwrap().clone();
+                    if unsupported {
+                        updates.insert(0, serde_json::json!({
+                            "method": "session/update",
+                            "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": format!("{notice}\n\n")}
+                        }));
+                    }
+                    let area = Rect::new(0, 0, width, 48);
+                    let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                    let mut ordered = Vec::new();
+                    for update in &updates {
+                        chat.rpc.push_notification_for_test(
+                            update["method"].as_str().unwrap(),
+                            update["params"].clone(),
+                        );
+                        chat.tick_transport_events();
+                        terminal
+                            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+                            .unwrap();
+                        let params = &update["params"];
+                        let token = match params["type"].as_str().unwrap() {
+                            "agent_message_chunk" => params["text"].as_str().unwrap(),
+                            "tool_call" => "[tool: echo]",
+                            "tool_result" => params["raw_output"].as_str().unwrap(),
+                            _ => unreachable!(),
+                        };
+                        if !token.contains(notice) {
+                            ordered.push(token);
+                        }
+                        let rendered = overlay_text(&terminal, area);
+                        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let mut remainder = normalized.as_str();
+                        for token in &ordered {
+                            let offset = remainder.find(token).unwrap_or_else(|| {
+                                panic!(
+                                    "missing or out-of-order {token} at width {width}: {rendered}"
+                                )
+                            });
+                            remainder = &remainder[offset + token.len()..];
+                        }
+                        assert_eq!(
+                            normalized.matches(notice).count(),
+                            usize::from(unsupported),
+                            "notice count at width {width}: {rendered}"
+                        );
+                        assert_eq!(
+                            rendered.matches("[tool: echo]").count(),
+                            ordered
+                                .iter()
+                                .filter(|token| **token == "[tool: echo]")
+                                .count(),
+                            "wrong tool-card count at width {width}: {rendered}"
+                        );
+                        for token in [
+                            "before-first",
+                            "result-1",
+                            "after-first",
+                            "result-2",
+                            "done",
+                        ] {
+                            assert_eq!(
+                                rendered.matches(token).count(),
+                                usize::from(ordered.contains(&token)),
+                                "wrong count for {token}: {rendered}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prompt_completion_settles_turn_when_terminal_update_is_missing() {
         let (mut chat, mut writer_rx) = test_chat();
         let mut active = state();
@@ -31601,6 +31724,64 @@ mod tests {
             agents: Vec::new(),
         };
         assert!(!chat.claims_pane_navigation(&word_left));
+    }
+
+    #[tokio::test]
+    async fn session_shortcut_respects_modal_and_explicit_input_bar_owners() {
+        use crate::keymap::{Chord, overrides};
+        use crossterm::event::KeyCode;
+
+        let shortcut = KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::with_primary(KeyCode::Char('1'), crossterm::event::KeyModifiers::CONTROL)
+                .effective_modifiers(),
+        );
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(
+            !chat.claims_session_shortcut(&shortcut),
+            "the unobstructed composer leaves the default global shortcut available"
+        );
+
+        active_state(&mut chat).pending_approval = Some(PendingApproval {
+            request_id: "session-shortcut-approval".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        assert!(
+            chat.claims_session_shortcut(&shortcut),
+            "the approval modal must keep ownership of every key"
+        );
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::reset();
+        overrides::set_row(
+            "input_bar",
+            "clear_input",
+            vec![Chord::with_primary(
+                KeyCode::Char('1'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )],
+        );
+        let chat = chat_with_active_input(PaneKind::Chat);
+        assert!(
+            chat.claims_session_shortcut(&KeyEvent::new(
+                KeyCode::Char('1'),
+                Chord::with_primary(KeyCode::Char('1'), crossterm::event::KeyModifiers::CONTROL,)
+                    .effective_modifiers(),
+            )),
+            "an explicit input-bar override must outrank the global default"
+        );
+        overrides::reset();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        assert!(
+            !chat.claims_session_shortcut(&shortcut),
+            "browse mode yields the shortcut so one press switches sessions"
+        );
     }
 
     #[tokio::test]
