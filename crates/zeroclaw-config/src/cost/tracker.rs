@@ -260,6 +260,17 @@ impl BudgetOverrides {
         fs::rename(&tmp, path).with_context(|| format!("Failed to replace {}", path.display()))
     }
 
+    /// These overrides plus `period` granted for `at`. `Session` is not a
+    /// budget period and adds nothing.
+    fn with(mut self, period: UsagePeriod, at: ReportingPeriod) -> Self {
+        match period {
+            UsagePeriod::Day => self.day = Some(at.day),
+            UsagePeriod::Month => self.month = Some((at.year, at.month)),
+            UsagePeriod::Session => {}
+        }
+        self
+    }
+
     fn covers(self, period: UsagePeriod, at: ReportingPeriod) -> bool {
         match period {
             UsagePeriod::Day => self.covers_day(at),
@@ -275,6 +286,33 @@ impl BudgetOverrides {
     fn covers_month(self, period: ReportingPeriod) -> bool {
         self.month == Some((period.year, period.month))
     }
+}
+
+/// An exceeded shared limit the operator may override, as it was checked:
+/// the spend and limit shown in the prompt, and the reporting period they
+/// belong to. Granting it lifts that period's limit only; once the period
+/// has rolled over the offer is stale and grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverrideOffer {
+    /// Spend in the exceeded period when it was checked.
+    pub current_usd: f64,
+    /// The exceeded shared limit.
+    pub limit_usd: f64,
+    /// `Day` or `Month`.
+    pub period: UsagePeriod,
+    at: ReportingPeriod,
+}
+
+/// What [`CostTracker::grant_offer`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideGrant {
+    /// The offered period's limit is lifted (or already was).
+    Granted,
+    /// The offered period rolled over before the answer: nothing recorded.
+    /// Check again; the new period may not be exceeded at all.
+    Expired,
+    /// `cost.allow_override` is off: nothing recorded.
+    Refused,
 }
 
 /// Cheap process-local totals for one optional agent attribution bucket.
@@ -323,17 +361,73 @@ impl CostTracker {
         self.grant_override_at_period(period, ReportingPeriod::current())
     }
 
-    fn grant_override_at_period(&self, period: UsagePeriod, at: ReportingPeriod) -> bool {
+    /// The exceeded shared limit an operator approval would actually clear,
+    /// or `None` when there is nothing to offer: within budget, overrides
+    /// not allowed, or the binding limit is a per-hop or per-agent ceiling
+    /// that a shared override would leave in place. A delegate whose
+    /// per-hop ceiling tightens the shared daily limit reports
+    /// `agent_alias: None`, so this re-checks with the period granted and
+    /// offers only when that check no longer fails on the same period.
+    pub fn override_offer(&self) -> Option<OverrideOffer> {
+        self.override_offer_at_period(ReportingPeriod::current())
+    }
+
+    fn override_offer_at_period(&self, at: ReportingPeriod) -> Option<OverrideOffer> {
         if !self.config.read().allow_override {
+            return None;
+        }
+        let BudgetCheck::Exceeded {
+            current_usd,
+            limit_usd,
+            period,
+            agent_alias: None,
+        } = self.check_budget_with(0.0, at, None).ok()?
+        else {
+            return None;
+        };
+        if matches!(period, UsagePeriod::Session) {
+            return None;
+        }
+        let still_binding = matches!(
+            self.check_budget_with(0.0, at, Some(period)).ok()?,
+            BudgetCheck::Exceeded { period: again, .. } if again == period
+        );
+        (!still_binding).then_some(OverrideOffer {
+            current_usd,
+            limit_usd,
+            period,
+            at,
+        })
+    }
+
+    /// Record the operator's approval of `offer`: lift its limit for the
+    /// period it was checked in, never for a later one.
+    pub fn grant_offer(&self, offer: &OverrideOffer) -> OverrideGrant {
+        self.grant_offer_at_period(offer, ReportingPeriod::current())
+    }
+
+    fn grant_offer_at_period(&self, offer: &OverrideOffer, now: ReportingPeriod) -> OverrideGrant {
+        let same_period = match offer.period {
+            UsagePeriod::Day => offer.at.day == now.day,
+            UsagePeriod::Month => (offer.at.year, offer.at.month) == (now.year, now.month),
+            UsagePeriod::Session => false,
+        };
+        if !same_period {
+            return OverrideGrant::Expired;
+        }
+        if self.grant_override_at_period(offer.period, offer.at) {
+            OverrideGrant::Granted
+        } else {
+            OverrideGrant::Refused
+        }
+    }
+
+    fn grant_override_at_period(&self, period: UsagePeriod, at: ReportingPeriod) -> bool {
+        if !self.config.read().allow_override || matches!(period, UsagePeriod::Session) {
             return false;
         }
         let mut overrides = self.overrides.current.lock();
-        let mut next = *overrides;
-        match period {
-            UsagePeriod::Day => next.day = Some(at.day),
-            UsagePeriod::Month => next.month = Some((at.year, at.month)),
-            UsagePeriod::Session => return false,
-        }
+        let next = overrides.with(period, at);
         if next == *overrides {
             return true;
         }
@@ -349,21 +443,23 @@ impl CostTracker {
                 "cost override granted but not persisted; a restart will ask again"
             );
         }
-        drop(overrides);
+        // Publish under the same lock, so concurrent grants reach the
+        // watch in the order they were applied.
         self.overrides.granted.send_replace(next);
         true
     }
 
-    /// Resolves once the shared `period` limit is overridden for the
-    /// current reporting period, immediately when it already is. A turn
-    /// waiting on its own override prompt races this so an approval in
-    /// another session releases it.
-    pub async fn wait_for_override(&self, period: UsagePeriod) {
+    /// Resolves once `offer`'s limit is overridden for the period it was
+    /// checked in, immediately when it already is. A turn waiting on its
+    /// own override prompt races this so an approval in another session
+    /// releases it. The watch only wakes the waiter; the decision reads the
+    /// current overrides, so a stale published value cannot strand it.
+    pub async fn wait_for_offer_granted(&self, offer: &OverrideOffer) {
         let mut rx = self.overrides.granted.subscribe();
         // The sender lives as long as the tracker, which this borrow holds,
         // so `wait_for` cannot fail with a closed channel.
         let _ = rx
-            .wait_for(|overrides| overrides.covers(period, ReportingPeriod::current()))
+            .wait_for(|_| self.overrides.get().covers(offer.period, offer.at))
             .await;
     }
 
@@ -580,6 +676,17 @@ impl CostTracker {
         estimated_cost_usd: f64,
         period: ReportingPeriod,
     ) -> Result<BudgetCheck> {
+        self.check_budget_with(estimated_cost_usd, period, None)
+    }
+
+    /// The budget check, optionally as if `assume_granted` were already
+    /// overridden for `period` (to learn whether an override would help).
+    fn check_budget_with(
+        &self,
+        estimated_cost_usd: f64,
+        period: ReportingPeriod,
+        assume_granted: Option<UsagePeriod>,
+    ) -> Result<BudgetCheck> {
         let config = self.config_snapshot();
         let (enabled, _) = self.mode();
         if !enabled {
@@ -602,11 +709,14 @@ impl CostTracker {
         let day = storage.reporting_period().day;
         // A persisted override only counts while the operator still allows
         // overrides: turning `allow_override` off restores the limit.
-        let overrides = if config.allow_override {
+        let mut overrides = if config.allow_override {
             self.overrides.get()
         } else {
             BudgetOverrides::default()
         };
+        if let Some(assumed) = assume_granted {
+            overrides = overrides.with(assumed, period);
+        }
         let day_overridden = overrides.covers_day(period);
         let month_overridden = overrides.covers_month(period);
 
@@ -1368,7 +1478,7 @@ impl AppendOutcome {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReportingPeriod {
     day: NaiveDate,
     year: i32,
@@ -3985,14 +4095,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_override_wakes_on_a_grant_from_a_derived_tracker() {
+    async fn wait_for_offer_granted_wakes_on_a_grant_from_a_derived_tracker() {
         let tmp = TempDir::new().unwrap();
         let tracker = Arc::new(over_daily_limit(tmp.path(), true));
+        let offer = tracker
+            .override_offer()
+            .expect("the shared daily limit is offered");
         let waiter = Arc::clone(&tracker);
         let waiting =
-            ::zeroclaw_spawn::spawn!(
-                async move { waiter.wait_for_override(UsagePeriod::Day).await }
-            );
+            ::zeroclaw_spawn::spawn!(async move { waiter.wait_for_offer_granted(&offer).await });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
 
@@ -4004,9 +4115,115 @@ mod tests {
         // Already granted: resolves at once.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tracker.wait_for_override(UsagePeriod::Day),
+            tracker.wait_for_offer_granted(&offer),
         )
         .await
         .unwrap();
+    }
+
+    /// Concurrent grants can leave an older value on the watch; the waiter
+    /// decides from the current overrides, not from that value.
+    #[tokio::test]
+    async fn a_stale_watch_value_does_not_strand_a_waiter() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = over_daily_limit(tmp.path(), true);
+        let offer = tracker.override_offer().unwrap();
+        assert!(tracker.grant_override(UsagePeriod::Day));
+        // A racing grant publishes its older copy last.
+        tracker
+            .overrides
+            .granted
+            .send_replace(BudgetOverrides::default());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tracker.wait_for_offer_granted(&offer),
+        )
+        .await
+        .expect("an existing grant must release the waiter");
+    }
+
+    /// A delegate's per-hop ceiling tightens the shared daily check and
+    /// reports `agent_alias: None`, but a shared override would not clear
+    /// it: no offer.
+    #[test]
+    fn per_hop_ceiling_is_not_offered() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                allow_override: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage(TokenUsage::new(
+            "test/model",
+            1_000_000,
+            0,
+            0,
+            2.0,
+            0.0,
+            0.0,
+        ))
+        .unwrap();
+        let capped = base.derived_shared_capped(1.0);
+        assert!(matches!(
+            capped.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                agent_alias: None,
+                ..
+            }
+        ));
+        assert_eq!(capped.override_offer(), None);
+
+        // The shared limit itself is still offered when it binds.
+        let tight_dir = TempDir::new().unwrap();
+        let tight = over_daily_limit(tight_dir.path(), true);
+        assert!(tight.derived_shared_capped(50.0).override_offer().is_some());
+    }
+
+    /// An answer that arrives after UTC midnight grants nothing: the
+    /// prompt showed yesterday's spend and limit, not today's.
+    #[test]
+    fn an_offer_expires_at_rollover() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = over_daily_limit(tmp.path(), true);
+        let day_d = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let day_d1 = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let period = |day: NaiveDate| ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+        for (exceeded, cost) in [(day_d, 2.0), (day_d1, 2.0)] {
+            tracker
+                .record_usage(usage_costing_at(
+                    cost,
+                    Utc.from_utc_datetime(&exceeded.and_hms_opt(12, 0, 0).unwrap()),
+                ))
+                .unwrap();
+        }
+        let offer = tracker
+            .override_offer_at_period(period(day_d))
+            .expect("day D is over its limit");
+        assert_eq!(
+            tracker.grant_offer_at_period(&offer, period(day_d1)),
+            OverrideGrant::Expired
+        );
+        assert!(matches!(
+            tracker.check_budget_at_period(0.0, period(day_d1)).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                ..
+            }
+        ));
+        assert_eq!(
+            tracker.grant_offer_at_period(&offer, period(day_d)),
+            OverrideGrant::Granted
+        );
     }
 }

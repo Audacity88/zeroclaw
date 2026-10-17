@@ -345,11 +345,16 @@ impl RpcOutbound {
     }
 
     /// Queue a notification without waiting, for callers that cannot
-    /// await (a `Drop`). Dropped silently when the writer is full or gone.
-    pub fn try_notify(&self, method: &'static str, params: Value) {
+    /// await (a `Drop`). Returns the line it could not queue because the
+    /// writer is full, so the caller can deliver it later with
+    /// [`Self::send_raw`]; `None` when queued, or when the writer is gone
+    /// and there is no one left to tell.
+    pub fn try_notify(&self, method: &'static str, params: Value) -> Option<String> {
         let n = JsonRpcNotification::new(method, params);
-        if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.writer_tx.try_send(s);
+        let s = serde_json::to_string(&n).ok()?;
+        match self.writer_tx.try_send(s) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => None,
+            Err(mpsc::error::TrySendError::Full(s)) => Some(s),
         }
     }
 

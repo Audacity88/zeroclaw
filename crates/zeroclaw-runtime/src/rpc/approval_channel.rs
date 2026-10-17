@@ -36,15 +36,27 @@ struct WithdrawOnDrop {
 
 impl Drop for WithdrawOnDrop {
     fn drop(&mut self) {
-        if self.armed {
-            self.rpc.try_notify(
-                "session/update",
-                json!({
-                    "type": "approval_withdrawn",
-                    "session_id": self.session_id,
-                    "request_id": self.request_id,
-                }),
-            );
+        if !self.armed {
+            return;
+        }
+        let unsent = self.rpc.try_notify(
+            "session/update",
+            json!({
+                "type": "approval_withdrawn",
+                "session_id": self.session_id,
+                "request_id": self.request_id,
+            }),
+        );
+        // A full writer queue must not lose the withdrawal: the client would
+        // keep a blocking prompt up for a turn that already moved on. Wait
+        // for room on a task instead of dropping it.
+        if let Some(line) = unsent
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            let rpc = Arc::clone(&self.rpc);
+            zeroclaw_spawn::spawn!(async move {
+                rpc.send_raw(line).await;
+            });
         }
     }
 }
@@ -522,6 +534,43 @@ mod tests {
         assert_eq!(v["params"]["type"], "approval_withdrawn");
         assert_eq!(v["params"]["request_id"], request_id.as_str());
         assert_eq!(v["params"]["session_id"], "sess-1");
+    }
+
+    /// The withdrawal still reaches the client when the shared writer queue
+    /// is full at the moment the request ends.
+    #[tokio::test]
+    async fn withdrawal_survives_a_full_writer_queue() {
+        let (tx, mut write_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let pending = make_pending();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "sleep 60".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))
+                .await
+        });
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+
+        // Another session's output fills the only slot.
+        assert!(rpc.send_raw("other".to_string()).await);
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(write_rx.recv().await.unwrap(), "other");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), write_rx.recv())
+            .await
+            .expect("the withdrawal must be delivered once the queue drains")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["type"], "approval_withdrawn");
+        assert_eq!(v["params"]["request_id"], request_id.as_str());
     }
 
     #[tokio::test]

@@ -13,10 +13,11 @@ use super::stream_consume::{
     StreamProviderFailure, consume_provider_streaming_response_with_policy,
 };
 use crate::agent::cost::{
-    check_tool_loop_budget, grant_tool_loop_budget_override, tool_loop_budget_override_allowed,
+    check_tool_loop_budget, grant_tool_loop_budget_offer, tool_loop_budget_override_offer,
     tool_loop_budget_tracker,
 };
 use crate::cost::types::{BudgetCheck, UsagePeriod};
+use crate::cost::{OverrideGrant, OverrideOffer};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
@@ -264,38 +265,37 @@ pub(crate) const BUDGET_OVERRIDE_WAIT: Duration = Duration::from_secs(600);
 /// shared cost tracker); deny, timeout, or no answer stops the turn exactly
 /// as before. Per-agent delegation ceilings are never offered.
 pub(crate) async fn gate_tool_loop_budget(ctx: &TurnCtx<'_>) -> Result<()> {
-    let mut granted: Vec<UsagePeriod> = Vec::new();
-    // A day override can still meet an exhausted month, so up to one prompt
-    // per period; a limit still exceeded after its own grant (a per-hop
-    // ceiling) falls through to the hard stop.
-    while let Some(BudgetCheck::Exceeded {
-        current_usd,
-        limit_usd,
-        period,
-        agent_alias: None,
-    }) = check_tool_loop_budget()
+    // A day override can still meet an exhausted month, so one prompt per
+    // offer. The tracker offers only a shared limit an approval would
+    // actually clear: a per-hop or per-agent ceiling gets no prompt and
+    // falls through to the hard stop. An answer that arrives after its
+    // period rolled over grants nothing and the loop checks afresh. The
+    // bound covers day + month plus one re-ask per rollover.
+    let mut prompts = 0;
+    while let Some(channel) = ctx.channel
+        && prompts < 4
+        && let Some(offer) = tool_loop_budget_override_offer()
     {
-        let Some(channel) = ctx.channel else { break };
-        if granted.contains(&period) || !tool_loop_budget_override_allowed() {
+        prompts += 1;
+        if !ask_budget_override(ctx, channel, &offer).await? {
             break;
         }
-        if !ask_budget_override(ctx, channel, current_usd, limit_usd, period).await?
-            || !grant_tool_loop_budget_override(period)
-        {
-            break;
+        match grant_tool_loop_budget_offer(&offer) {
+            OverrideGrant::Granted => {}
+            OverrideGrant::Expired => continue,
+            OverrideGrant::Refused => break,
         }
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_attrs(::serde_json::json!({
-                    "current_usd": current_usd,
-                    "limit_usd": limit_usd,
-                    "period": format!("{period:?}"),
+                    "current_usd": offer.current_usd,
+                    "limit_usd": offer.limit_usd,
+                    "period": format!("{:?}", offer.period),
                 })),
             "cost limit overridden by the operator for the rest of the period"
         );
-        granted.push(period);
     }
     enforce_tool_loop_budget()
 }
@@ -307,11 +307,9 @@ pub(crate) async fn gate_tool_loop_budget(ctx: &TurnCtx<'_>) -> Result<()> {
 async fn ask_budget_override(
     ctx: &TurnCtx<'_>,
     channel: &dyn zeroclaw_api::channel::Channel,
-    current_usd: f64,
-    limit_usd: f64,
-    period: UsagePeriod,
+    offer: &OverrideOffer,
 ) -> Result<bool> {
-    let key = match period {
+    let key = match offer.period {
         UsagePeriod::Day => "turn-cost-limit-override-day",
         UsagePeriod::Month => "turn-cost-limit-override-month",
         UsagePeriod::Session => return Ok(false),
@@ -321,8 +319,8 @@ async fn ask_budget_override(
         arguments_summary: crate::i18n::get_required_cli_string_with_args(
             key,
             &[
-                ("spent", &format!("{current_usd:.2}")),
-                ("limit", &format!("{limit_usd:.2}")),
+                ("spent", &format!("{:.2}", offer.current_usd)),
+                ("limit", &format!("{:.2}", offer.limit_usd)),
             ],
         ),
         raw_arguments: None,
@@ -337,7 +335,7 @@ async fn ask_budget_override(
     // dropping `ask` withdraws it from this session's client.
     let granted_elsewhere = async {
         match tool_loop_budget_tracker() {
-            Some(tracker) => tracker.wait_for_override(period).await,
+            Some(tracker) => tracker.wait_for_offer_granted(offer).await,
             None => std::future::pending().await,
         }
     };
@@ -4444,6 +4442,42 @@ mod budget_override_tests {
             channel.withdrawn.load(Ordering::SeqCst),
             "the released prompt's request must be dropped so the client withdraws it"
         );
+    }
+
+    /// A delegate stopped by its own per-hop ceiling is not asked: a
+    /// shared override would not let it continue.
+    #[tokio::test]
+    async fn a_per_hop_ceiling_is_never_offered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 100.0,
+                allow_override: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage(TokenUsage::new(
+            "test/model",
+            1_000_000,
+            0,
+            0,
+            3.0,
+            0.0,
+            0.0,
+        ))
+        .unwrap();
+        let capped = Arc::new(base.derived_shared_capped(1.0));
+        let channel = ScriptedChannel::answering(AttributedApprovalResponse::operator(
+            ChannelApprovalResponse::Approve,
+        ));
+        let (observer, pacing) = (NoopObserver, PacingConfig::default());
+
+        let result = gate(&capped, &ctx(&observer, &pacing, Some(&channel))).await;
+        assert!(is_budget_stop(&result), "{result:?}");
+        assert!(channel.asked.lock().is_empty());
     }
 
     #[tokio::test]
