@@ -802,6 +802,7 @@ zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 zc-config-footer-action-create = create
 zc-config-footer-action-add = add
 zc-config-footer-action-rename = rename
+zc-config-footer-action-delete = delete
 zc-config-footer-action-review-rename = review rename
 zc-config-footer-action-cancel = cancel
 zc-config-footer-action-save = save
