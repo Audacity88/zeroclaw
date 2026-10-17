@@ -4712,24 +4712,25 @@ impl App {
         breadcrumb: &[String],
     ) {
         let section = &self.sections[section_idx];
-        let guidance = if self.aliases.is_empty() && self.filter.is_none() && self.alias_tab == 0 {
-            setup_section_key(&section.key).map(|key| {
-                format!(
-                    "{}\n{}\n{}",
-                    crate::i18n::t("zc-config-setup-empty"),
-                    crate::i18n::t(key),
-                    crate::i18n::t_args(
-                        "zc-config-setup-add",
-                        &[("keys", &tab_key(crate::keymap::ConfigTabAction::Enter))],
-                    ),
-                )
-            })
-        } else {
-            None
-        };
+        let guidance =
+            if self.aliases.is_empty() && self.detail_filter().is_none() && self.alias_tab == 0 {
+                setup_section_key(&section.key).map(|key| {
+                    format!(
+                        "{}\n{}\n{}",
+                        crate::i18n::t("zc-config-setup-empty"),
+                        crate::i18n::t(key),
+                        crate::i18n::t_args(
+                            "zc-config-setup-add",
+                            &[("keys", &tab_key(crate::keymap::ConfigTabAction::Enter))],
+                        ),
+                    )
+                })
+            } else {
+                None
+            };
         let mut r = guidance.as_ref().map_or_else(
             || {
-                if self.filter.is_some()
+                if self.detail_filter().is_some()
                     && self.filtered_indices(&self.aliases).is_empty()
                     && self.alias_list_has_tabs()
                 {
@@ -4797,7 +4798,7 @@ impl App {
         }
 
         let visible = self.filtered_indices(&self.aliases);
-        if self.filter.is_some() && visible.is_empty() && r.help.height > 1 {
+        if self.detail_filter().is_some() && visible.is_empty() && r.help.height > 1 {
             frame.render_widget(
                 Paragraph::new(crate::i18n::t("zc-config-setup-no-filter-matches"))
                     .style(theme::dim_style()),
@@ -4904,7 +4905,12 @@ impl App {
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
         let setup_section = match &self.screen {
-            Screen::AliasCreate { section_idx, .. } => self
+            // Rate sheets created from the Costs tab are not aliases.
+            Screen::AliasCreate {
+                section_idx,
+                map_path,
+                ..
+            } if !map_path.starts_with("cost.") => self
                 .sections
                 .get(*section_idx)
                 .and_then(|section| setup_section_key(&section.key)),
@@ -7177,6 +7183,55 @@ mod tests {
         let mut rx = responder.await.unwrap();
         assert!(rx.try_recv().is_err());
         assert!(matches!(manager.screen, Screen::AliasList { .. }));
+    }
+
+    fn render_setup_text(manager: &mut App) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_setup_test_frame(frame, manager))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn section_search_keeps_setup_guidance_in_the_detail_preview() {
+        let mut manager = test_manager();
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.tts.edge".to_string(),
+            breadcrumb: vec![],
+        };
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Sections,
+            section_cursor: 0,
+            active_tab: manager.active_tab,
+            detail: None,
+        });
+        manager.filter = Some("tts".to_string());
+        let text = render_setup_text(&mut manager);
+        assert!(text.contains("No aliases are configured"), "{text}");
+        assert!(!text.contains("No matches. Clear filter."));
+    }
+
+    #[tokio::test]
+    async fn cost_rate_creation_keeps_the_generic_name_hint() {
+        let mut manager = test_manager();
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "cost.rates.providers.tts.openai".to_string(),
+            breadcrumb: vec![],
+        };
+        let text = render_setup_text(&mut manager);
+        assert!(!text.contains("Text-to-speech is optional"), "{text}");
+        assert!(!text.contains("[missing]"), "{text}");
     }
 
     #[tokio::test]
