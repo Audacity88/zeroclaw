@@ -1635,6 +1635,7 @@ impl Chat {
         // rebuild and its agent is still present, reattach to it automatically
         // rather than forcing the user back through the picker and minting a
         // fresh session. The resume id is consumed by `start_session`.
+        self.promote_resumable_background(&agents);
         if let Some(prior) = self
             .resume_focused
             .as_ref()
@@ -1683,6 +1684,32 @@ impl Chat {
 
         self.show_agent_picker(agents);
         Ok(ChatInitOutcome::Other)
+    }
+
+    /// When the focused resume's agent is no longer enabled, focus the first
+    /// retained background whose agent still is, so one disabled agent does
+    /// not hold back the rest of the pane. The unmatched entry stays retained
+    /// for a later retry.
+    fn promote_resumable_background(&mut self, agents: &[String]) {
+        let Some(focused) = self.resume_focused.as_ref() else {
+            return;
+        };
+        if agents.iter().any(|a| a == &focused.agent_alias) {
+            return;
+        }
+        let Some(idx) = self
+            .resume_backgrounds
+            .iter()
+            .position(|entry| agents.iter().any(|a| a == &entry.agent_alias))
+        else {
+            return;
+        };
+        let mut promoted = self.resume_backgrounds.remove(idx);
+        promoted.was_focused = true;
+        if let Some(mut previous) = self.resume_focused.replace(promoted) {
+            previous.was_focused = false;
+            self.resume_backgrounds.insert(0, previous);
+        }
     }
 
     fn show_agent_picker(&mut self, agents: Vec<String>) {
@@ -16886,6 +16913,78 @@ mod tests {
             "failed resume entries stay available for a later reconnect retry"
         );
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_focused_agent_does_not_block_the_other_resumes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.set_resume_sessions(vec![
+            resume_entry("sess-ghost", "ghost", true),
+            resume_entry("sess-alpha", "alpha", false),
+        ]);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "ghost", "enabled": false, "live_sessions": 0, "persisted_sessions": 1},
+                    {"alias": "alpha", "enabled": true, "live_sessions": 1, "persisted_sessions": 1},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        // Fail every later request; record which sessions init tries.
+        let mut attached = Vec::new();
+        let chat = loop {
+            if init.is_finished() {
+                break init.await.unwrap();
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(line)) => {
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if request["method"] == method::SESSION_NEW {
+                        attached.push(
+                            request["params"]["session_id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                    respond_err(&rpc, &request, -32000, "stop here");
+                }
+                _ => {
+                    if !init.is_finished() {
+                        panic!("init stalled; attached so far: {attached:?}");
+                    }
+                }
+            }
+        };
+        assert_eq!(
+            attached.first().map(String::as_str),
+            Some("sess-alpha"),
+            "the enabled background is resumed first"
+        );
+        let retained: Vec<_> = chat
+            .resume_focused
+            .iter()
+            .chain(chat.resume_backgrounds.iter())
+            .map(|entry| entry.session_id.as_str())
+            .collect();
+        assert!(
+            retained.contains(&"sess-ghost"),
+            "the disabled agent's session stays retained for a later retry"
+        );
     }
 
     #[tokio::test]
