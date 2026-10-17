@@ -20717,7 +20717,10 @@ mod tests {
                 .push(resume_entry(&session_id, "agent", false));
         }
 
-        assert_eq!(chat.tracked_session_count(), chat.max_tracked_sessions_per_pane);
+        assert_eq!(
+            chat.tracked_session_count(),
+            chat.max_tracked_sessions_per_pane
+        );
     }
 
     #[tokio::test]
@@ -21360,7 +21363,10 @@ mod tests {
             chat.session_order.push(session_id.clone());
             chat.background.push(state_for(&session_id, "alpha"));
         }
-        assert_eq!(chat.tracked_session_count(), chat.max_tracked_sessions_per_pane);
+        assert_eq!(
+            chat.tracked_session_count(),
+            chat.max_tracked_sessions_per_pane
+        );
 
         chat.begin_change_directory();
 
