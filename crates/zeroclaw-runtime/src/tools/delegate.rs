@@ -5307,7 +5307,16 @@ impl DelegateTool {
             )),
         );
         // A delegate the child runs reports one level deeper, still against
-        // the parent's delegate call.
+        // the parent's delegate call. The child loop is type-erased first so
+        // the extra scope does not deepen the `Send` proof for `execute`.
+        let execution: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<anyhow::Result<String>, tokio::time::error::Elapsed>,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(execution);
         let execution = crate::agent::tool_execution::scope_parent_turn_events(
             parent_turn_events.map(super::delegate_activity::one_level_deeper),
             execution,
