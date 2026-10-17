@@ -7378,7 +7378,7 @@ fn render_entry_into(
                 render_delegate_activity(
                     lines,
                     log,
-                    result.is_none(),
+                    waiting && result.is_none(),
                     is_selected,
                     tool_disclosure,
                 );
@@ -26254,7 +26254,7 @@ mod tests {
                 false,
                 disclosure,
                 120,
-                false,
+                true,
                 &mut lines,
             );
             rendered_text(&lines)
@@ -26293,6 +26293,43 @@ mod tests {
             },
         ));
         assert!(!render(&s, ToolDisclosure::Full).contains("2 child tool calls"));
+    }
+
+    #[test]
+    fn cancelled_delegate_card_stops_naming_a_running_child_tool() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "parent".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "researcher", "prompt": "Look it up"}),
+        });
+        s.apply_update(SessionUpdate::DelegateActivity {
+            session_id: "sess-1".into(),
+            activity: DelegateActivity {
+                parent_tool_call_id: "parent".into(),
+                agent: "researcher".into(),
+                depth: 0,
+                tool_call_id: "c1".into(),
+                tool_name: "web_fetch".into(),
+                phase: DelegateActivityPhase::Started {
+                    arguments_summary: String::new(),
+                },
+            },
+        });
+        let render = |s: &mut ChatState| {
+            s.rebuild_lines(120);
+            rendered_text(&s.transcript_layout.view().cached_lines)
+        };
+        assert!(render(&mut s).contains("now: web_fetch"));
+
+        // Cancelled: no parent result, no child finish.
+        s.settle_turn_lifecycle(false, QueuePauseReason::Generic);
+        let settled = render(&mut s);
+        assert!(settled.contains("1 child tool calls"), "{settled}");
+        assert!(!settled.contains("now:"), "{settled}");
     }
 
     #[test]
