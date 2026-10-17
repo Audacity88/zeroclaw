@@ -11437,33 +11437,23 @@ impl ChatState {
         std::mem::take(&mut self.withdrawn_elicitations)
     }
 
-    /// Note how a question ended (answered, dismissed, withdrawn, expired).
-    /// The question itself is not written here: the `ask_user` / `poll`
-    /// tool card already shows it with its choices, in the agent's turn,
-    /// and the daemon persists that card. The `elicitation/create` request
+    /// Note how a question ended (answered, dismissed, withdrawn, expired),
+    /// but only when no `ask_user` / `poll` card on screen asked it. The
+    /// card is the record: it shows the question and choices in the agent's
+    /// turn, and its `result:` line shows the outcome once the tool returns,
+    /// so a line here would repeat both. The `elicitation/create` request
     /// can reach the pane before the `ToolCall` update that draws the card
-    /// (the router drains inbound requests before notifications), so a
-    /// line written on arrival landed above the agent's text and repeated
-    /// the question. The outcome is written on the user's action or at the
-    /// turn's end, and goes directly under the card that asked, so a
-    /// parallel tool call that finished meanwhile does not separate them.
-    /// With no matching card on screen it is appended.
+    /// (the router drains inbound requests before notifications), which is
+    /// why nothing is written on arrival. With no matching card (an older
+    /// history, a card that never arrived) the line is appended so the
+    /// outcome is still on record.
     fn record_elicitation_outcome(&mut self, question: &str, text: String) {
-        let entry = ChatEntry::SystemMessage(Arc::<str>::from(text));
-        let Some(card) = self.elicitation_card_index(question) else {
-            self.entries.push(entry);
-            self.mark_dirty_append();
-            return;
-        };
-        let at = card + 1;
-        if at == self.entries.len() {
-            self.entries.push(entry);
-            self.mark_dirty_append();
+        if self.elicitation_card_index(question).is_some() {
             return;
         }
-        self.entries.insert(at, entry);
-        self.shift_entry_indices_from(at);
-        self.mark_dirty_full();
+        self.entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(text)));
+        self.mark_dirty_append();
     }
 
     /// The newest `ask_user` / `poll` card whose question is `question`.
@@ -11484,36 +11474,6 @@ impl ChatState {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|q| q.trim() == question)
         })
-    }
-
-    /// Keep entry-index state pointing at the same entries after an insert
-    /// at `at`.
-    fn shift_entry_indices_from(&mut self, at: usize) {
-        let bump = |index: &mut usize| {
-            if *index >= at {
-                *index += 1;
-            }
-        };
-        if let Some((_, index, _)) = self.optimistic_user_message.as_mut() {
-            bump(index);
-        }
-        if let Some((_, index)) = self.prompt_settled_stream_entry.as_mut() {
-            bump(index);
-        }
-        if let Some(index) = self.browse_cursor.as_mut() {
-            bump(index);
-        }
-        if let Some(index) = self.browse_anchor.as_mut() {
-            bump(index);
-        }
-        if let Some(index) = self.mouse_down_entry.as_mut() {
-            bump(index);
-        }
-        self.browse_multi = std::mem::take(&mut self.browse_multi)
-            .into_iter()
-            .map(|index| if index >= at { index + 1 } else { index })
-            .collect();
-        self.clear_transcript_selection();
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -31053,9 +31013,16 @@ mod tests {
         let frame = next_rpc_request(&mut writer_rx, "the answer must be sent").await;
         assert_eq!(frame["id"], "e-rec");
         assert_eq!(frame["result"]["content"]["choice"], "choice-1");
-        let answered = crate::i18n::t_args("zc-chat-elicitation-answered", &[("answer", "No")]);
         let state = active_state(&mut chat);
-        assert_eq!(system_texts(state), vec![answered.clone()]);
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            raw_output: "No".to_string(),
+        });
+        assert!(
+            system_texts(state).is_empty(),
+            "the card's result is the record of the answer; no extra line"
+        );
         let text = rendered_transcript(state);
         assert_eq!(
             text.matches("Pick one").count(),
@@ -31069,18 +31036,17 @@ mod tests {
         );
     }
 
-    /// Regression (Dan's dogfood, 2026-10-13): the "asked" line was written
-    /// when `elicitation/create` arrived. The inbound router drains requests
-    /// before the pane drains notifications, so the request can be handled
-    /// while the agent's text and the `ask_user` `ToolCall` are still queued.
-    /// The line then sat above the agent label and repeated the card. Here
-    /// the request lands first, the turn streams in after it, a parallel
-    /// tool call finishes, and then the user presses Esc. The question must
-    /// appear once, inside the agent's turn, and the outcome must sit
-    /// directly under its own card.
+    /// Regression (dogfood, 2026-10-13 and 2026-10-17): the "asked" line was
+    /// written when `elicitation/create` arrived, which can be before the
+    /// agent's text and the `ask_user` `ToolCall` are drained, so it sat
+    /// above the agent label and repeated the card. The outcome line then
+    /// repeated the card's `result:`. Here the request lands first, the turn
+    /// streams in after it, a parallel tool call finishes, and the user
+    /// presses Esc. The question appears once, inside the agent's turn, and
+    /// no outcome line is added next to the card.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn elicitation_outcome_sits_under_its_card_inside_the_agent_turn() {
+    async fn elicitation_with_a_card_adds_no_outcome_line() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -31115,7 +31081,6 @@ mod tests {
         assert_eq!(frame["id"], "e-ord");
         assert_eq!(frame["result"]["action"], "cancel");
 
-        let dismissed = crate::i18n::t("zc-chat-elicitation-cancelled");
         let state = active_state(&mut chat);
         let kinds: Vec<String> = state
             .entries()
@@ -31132,14 +31097,13 @@ mod tests {
             vec![
                 "agent".to_string(),
                 "tool:ask_user".to_string(),
-                format!("system:{dismissed}"),
                 "tool:shell".to_string(),
             ]
         );
         assert_eq!(
             state.browse_cursor,
-            Some(3),
-            "the browse cursor stays on the shell card"
+            Some(2),
+            "the browse cursor is untouched"
         );
         let text = rendered_transcript(state);
         assert_eq!(text.matches("Pick one").count(), 1, "{text}");
@@ -31147,11 +31111,9 @@ mod tests {
             .find(&crate::i18n::t("zc-chat-label-agent"))
             .expect("agent label");
         let question = text.find("question: Pick one").expect("card question");
-        let outcome = text.find(&dismissed).expect("outcome line");
-        let shell = text.find("[tool: shell]").expect("shell card");
         assert!(
-            label < question && question < outcome && outcome < shell,
-            "agent label, then the card, then its outcome: {text}"
+            label < question,
+            "the card sits inside the agent turn: {text}"
         );
     }
 
