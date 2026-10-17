@@ -6207,6 +6207,76 @@ mod tests {
         crate::keymap::overrides::reset();
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn connection_editor_hints_follow_outer_section_routing() {
+        use crate::keymap::{
+            Chord, ConfigEditorAction as E, ConfigTabAction as A, RebindableActions,
+        };
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut manager = App::new(rpc, dir.path());
+        manager.section = ConfigSection::Zerocode;
+        // Connection is the sixth section; its first field is the URI editor.
+        for _ in 0..5 {
+            manager
+                .zerocode
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for _ in 0..2 {
+            manager
+                .zerocode
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        assert!(manager.zerocode.wants_text_input());
+        let save = Chord::with(KeyCode::F(9), KeyModifiers::ALT);
+        crate::keymap::overrides::set_row(
+            "config_editor",
+            E::Save.key().split_once('.').unwrap().1,
+            vec![Chord::key(KeyCode::Tab), save.clone()],
+        );
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            A::SectionNext.key().split_once('.').unwrap().1,
+            vec![Chord::char('n'), Chord::key(KeyCode::Tab)],
+        );
+        let entries = manager.zerocode.help_context().entries;
+        let advertised = |key: &str, action: &str| {
+            entries
+                .iter()
+                .any(|e| e.keys.contains(&key.to_string()) && e.action == crate::i18n::t(action))
+        };
+        assert!(advertised(&save.display(), "zc-config-footer-action-save"));
+        assert!(!advertised("Tab", "zc-config-footer-action-save"));
+        assert!(advertised("Tab", "zc-zerocode-hint-section"));
+        assert!(advertised("n", "zc-zerocode-hint-section"));
+        let mut term = Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(crate::config::config_path(dir.path())).ok();
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zeroclaw);
+        assert_eq!(
+            before,
+            std::fs::read(crate::config::config_path(dir.path())).ok()
+        );
+        crate::keymap::overrides::reset();
+    }
+
     #[test]
     fn mouse_shift_capture_uses_xtshiftescape_sequences() {
         assert_eq!(mouse_shift_capture_sequence(true), "\x1b[>1s");
