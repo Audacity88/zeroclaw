@@ -177,6 +177,12 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
+tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
+tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -214,6 +220,7 @@ tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not
 tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
 tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
 tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
+tool-browser-screenshot-error-allocated-target-exists = Allocated screenshot target '{ $filename }' already exists; pass an explicit `path` instead of overwriting it
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 

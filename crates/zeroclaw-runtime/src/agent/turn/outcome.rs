@@ -97,31 +97,6 @@ impl std::error::Error for StreamInterruptedAfterOutput {
     }
 }
 
-/// A transport stream failure before user-visible output. The cumulative usage
-/// snapshot is retained so Reliable recovery can bill the exact selected
-/// stream attempt once.
-#[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    /// The typed stream error that produced this outcome. `Terminal` is
-    /// load-bearing: the provider-call step reads it to skip the
-    /// non-streaming fallback the error's producer already performed.
-    pub(crate) source: zeroclaw_api::model_provider::StreamError,
-}
-
-impl std::fmt::Display for StreamErrorWithUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StreamErrorWithUsage {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
 /// side effects, so this bypasses the normal non-streaming fallback.
@@ -423,6 +398,26 @@ impl std::fmt::Display for ModelSwitchRequested {
 }
 
 impl std::error::Error for ModelSwitchRequested {}
+
+/// A loop running with `LoopKnobs::yield_to_steering` stopped after a tool
+/// round because steering is waiting. The round's messages are already in the
+/// canonical buffer; `display_text` is the text the round showed, for the
+/// caller to commit before it starts the steered round. `reported_usage` is
+/// the last request's provider-reported usage, for the caller to hand to the
+/// resumed run so its token calibration carries over.
+#[derive(Debug)]
+pub(crate) struct SteeringPending {
+    pub(crate) display_text: String,
+    pub(crate) reported_usage: Option<super::ReportedRequestUsage>,
+}
+
+impl std::fmt::Display for SteeringPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop yielded to pending steering")
+    }
+}
+
+impl std::error::Error for SteeringPending {}
 
 pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
     err.chain()
@@ -794,13 +789,9 @@ mod tests {
 
     #[test]
     fn streamed_refusal_cause_projects_safety_guidance() {
-        let error = anyhow::Error::new(StreamErrorWithUsage {
-            message: "model_provider stream error: refusal".to_string(),
-            usage: None,
-            source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
-                private_refusal(),
-            )),
-        });
+        let error = anyhow::Error::new(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+            Box::new(private_refusal()),
+        ));
 
         let message = terminal_completion_error_message_in_english(&error, None)
             .expect("a streamed refusal must project a user-facing message");
