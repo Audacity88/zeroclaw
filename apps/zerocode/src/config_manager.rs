@@ -7058,7 +7058,18 @@ mod tests {
         assert_eq!(manager.section_cursor, 1);
     }
 
+    fn set_detail_filter(manager: &mut App, query: String) {
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: manager.section_cursor,
+            active_tab: manager.active_tab,
+            detail: None,
+        });
+        manager.filter = Some(query);
+    }
+
     fn draw_setup_test_frame(frame: &mut Frame, manager: &mut App) {
+        manager.loaded_section = Some(manager.section_cursor);
         let mut chat = crate::chat::Chat::new(manager.rpc.clone(), crate::chat::PaneKind::Chat);
         let mut acp = crate::acp::Acp::new(manager.rpc.clone());
         crate::app::draw_app_frame(
@@ -7196,7 +7207,7 @@ mod tests {
             assert_eq!(manager.alias_cursor, 0);
             assert!(manager.last_main_area.height >= 4);
             manager.aliases = vec!["present".to_string()];
-            manager.filter = Some("nomatch".to_string());
+            set_detail_filter(&mut manager, "nomatch".to_string());
             terminal
                 .draw(|frame| draw_setup_test_frame(frame, &mut manager))
                 .unwrap();

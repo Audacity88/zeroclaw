@@ -412,6 +412,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         tab: #tab_token,
                         alias_source: None,
                         multiline: false,
+                        setup: None,
                     });
                     if let Some(map) = #map_expr {
                         let mut entries: Vec<(&String, &String)> = map.iter().collect();
