@@ -1708,20 +1708,28 @@ impl App {
                     }
                 }
             }
-            Screen::FieldEdit { .. } => {
-                if self.is_select_edit() {
-                    let visible = self.filtered_indices(&self.select_items);
-                    let cursor = if self.detail_filter().is_some() {
-                        self.filter_cursor
-                    } else {
-                        self.select_cursor
-                    };
-                    if let Some(&orig) = visible.get(cursor) {
-                        self.deactivate_filter();
-                        self.commit_select(orig).await?;
-                    }
-                }
+            Screen::FieldEdit { .. } => self.activate_select_row().await?,
+        }
+        Ok(())
+    }
+
+    /// Mouse activation of the highlighted choice. An array picker stays open
+    /// after a toggle, so it keeps the search, as Enter does.
+    async fn activate_select_row(&mut self) -> Result<()> {
+        if !self.is_select_edit() {
+            return Ok(());
+        }
+        let visible = self.filtered_indices(&self.select_items);
+        let cursor = if self.detail_filter().is_some() {
+            self.filter_cursor
+        } else {
+            self.select_cursor
+        };
+        if let Some(&orig) = visible.get(cursor) {
+            if self.array_selection.is_none() {
+                self.deactivate_filter();
             }
+            self.commit_select(orig).await?;
         }
         Ok(())
     }
@@ -8721,6 +8729,30 @@ mod tests {
         manager.prepare_edit_at(1);
         manager.resolve_field_aliases(1).await;
         (manager, calls)
+    }
+
+    #[tokio::test]
+    async fn array_picker_mouse_toggle_keeps_search() {
+        let (mut manager, _calls) = array_picker_manager(
+            &["z.old"],
+            Some(vec!["a.live".into(), "b.new".into(), "b.next".into()]),
+        )
+        .await;
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager.activate_select_row().await.unwrap();
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["z.old", "b.new"]
+        );
+        assert_eq!(manager.detail_filter().map(String::as_str), Some("b"));
+        assert_eq!(manager.filtered_indices(&manager.select_items).len(), 2);
     }
 
     #[tokio::test]
