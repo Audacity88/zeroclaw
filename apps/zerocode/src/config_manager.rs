@@ -2900,11 +2900,15 @@ impl App {
     async fn handle_alias_rename(&mut self, key: KeyEvent) -> Result<()> {
         use crate::keymap::ConfigEditorAction;
         let Screen::AliasRename {
-            from, confirming, ..
+            section_idx,
+            from,
+            confirming,
+            ..
         } = &self.screen
         else {
             return Ok(());
         };
+        let section_idx = *section_idx;
         let from = from.clone();
         let confirming = *confirming;
         match ConfigEditorAction::from_chord(&key) {
@@ -3001,10 +3005,13 @@ impl App {
                             self.alias_cursor = 0;
                             self.loaded_section = None;
                             self.status_msg = Some(match self.load_aliases(&map_path).await {
-                                Ok(()) => crate::i18n::t_args(
-                                    "zc-config-status-alias-rename-unknown",
-                                    &[("err", &e.to_string())],
-                                ),
+                                Ok(()) => {
+                                    self.loaded_section = Some(section_idx);
+                                    crate::i18n::t_args(
+                                        "zc-config-status-alias-rename-unknown",
+                                        &[("err", &e.to_string())],
+                                    )
+                                }
                                 Err(refresh_error) => crate::i18n::t_args(
                                     "zc-config-status-alias-rename-unknown-refresh-failed",
                                     &[
@@ -7264,8 +7271,11 @@ mod tests {
                     .unwrap()
                     .contains("outcome is unknown")
             );
+            render_config_for_mouse(&mut manager);
             if refresh_succeeds {
                 assert_eq!(manager.aliases, saved_aliases);
+                assert_eq!(manager.loaded_section, Some(0));
+                assert_ne!(manager.last_main_area, Rect::default());
                 // A fresh Rename explicitly targets the reconciled destination.
                 enter_alias_rename(&mut manager, &mut term, "next").await;
                 config_key(&mut manager, &mut term, KeyCode::Enter).await;
@@ -7276,6 +7286,7 @@ mod tests {
                 assert!(manager.aliases.is_empty());
                 assert!(manager.alias_enabled.is_empty());
                 assert!(manager.loaded_section.is_none());
+                assert_eq!(manager.last_main_area, Rect::default());
                 config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
                 config_key(&mut manager, &mut term, KeyCode::Enter).await;
                 config_key(&mut manager, &mut term, KeyCode::Enter).await;
