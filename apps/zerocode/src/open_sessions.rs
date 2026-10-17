@@ -28,13 +28,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chat::{PaneKind, ResumeEntry, SidebarSessionSummary};
+use crate::chat::{MAX_TRACKED_SESSIONS_PER_PANE, PaneKind, ResumeEntry, SidebarSessionSummary};
 use crate::client::{RpcClient, SessionEntry, Transport};
 
 const DIR_NAME: &str = "open-sessions";
 const FORMAT_VERSION: u32 = 1;
-/// Matches the panes' own cap; a hand-edited file cannot exceed it.
-const MAX_PER_PANE: usize = 8;
 /// Windows per daemon that keep a list; a window beyond this starts empty.
 const MAX_WINDOWS: usize = 16;
 
@@ -96,7 +94,7 @@ impl Snapshot {
                 SavedPane::Chat => &mut chat,
                 SavedPane::Code => &mut code,
             };
-            if list.len() < MAX_PER_PANE {
+            if list.len() < MAX_TRACKED_SESSIONS_PER_PANE {
                 list.push(ResumeEntry::saved(
                     saved.session_id.clone(),
                     saved.agent_alias.clone(),
@@ -568,7 +566,7 @@ mod tests {
             .map(|i| row(PaneKind::Acp, &format!("s{i}"), "a", i == 0))
             .collect();
         let (_, code) = Snapshot::from_rows(&rows, None).resume_entries();
-        assert_eq!(code.len(), MAX_PER_PANE);
+        assert_eq!(code.len(), MAX_TRACKED_SESSIONS_PER_PANE);
         assert_eq!(code[0].session_id, "s0");
     }
 

@@ -502,7 +502,7 @@ fn classify_turn_failure(content: &str) -> SessionError {
 
 /// Upper bound on sessions one chat-like pane tracks (focused + background).
 /// Two panes keep the TUI comfortably under the daemon's 64-session cap.
-const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
 
 pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
