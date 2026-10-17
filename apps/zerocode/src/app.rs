@@ -1886,6 +1886,7 @@ pub async fn run(
                             chat_pane.commit_reconnect_handoff();
                             acp_pane.commit_reconnect_handoff();
                             let previous_flushed = inbound_router.cancel_pending().await;
+                            config_app.hand_off_mutation_outcome(&mut panes.1);
                             // Assigned as one tuple: every pane the builder
                             // produces is adopted, and a later pane addition
                             // cannot stay bound to the old client silently.

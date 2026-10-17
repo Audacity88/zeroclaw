@@ -520,6 +520,8 @@ pub(crate) struct App {
     select_items: Vec<String>,
     status_msg: Option<String>,
     mutation_dialog: Option<ConfigMutationDialog>,
+    /// Furthest the dialog text can scroll, measured at the last draw.
+    mutation_scroll_max: std::cell::Cell<u16>,
     application_feedback: crate::config_application::ApplicationFeedback,
     // Filter state: None = inactive, Some(buf) = active filter
     filter: Option<String>,
@@ -598,6 +600,7 @@ impl App {
             select_items: Vec::new(),
             status_msg: None,
             mutation_dialog: None,
+            mutation_scroll_max: std::cell::Cell::new(0),
             application_feedback: crate::config_application::ApplicationFeedback::new(),
             filter: None,
             filter_cursor: 0,
@@ -3293,6 +3296,25 @@ impl App {
 
     // ── Composite tab helpers ──────────────────────────────────────
 
+    /// Record how far the dialog text can scroll at this size and clamp the
+    /// requested offset, so Down never scrolls the last line out of view.
+    fn clamp_mutation_scroll(&self, text: &Paragraph<'_>, area: Rect, scroll: u16) -> u16 {
+        let lines = u16::try_from(text.line_count(area.width)).unwrap_or(u16::MAX);
+        let max = lines.saturating_sub(area.height);
+        self.mutation_scroll_max.set(max);
+        scroll.min(max)
+    }
+
+    /// A reconnect rebuilds the Config pane. Carry a mutation result into the
+    /// replacement so an error or cleanup warning stays until dismissed; a
+    /// pending confirmation is dropped, since its preview came from the old
+    /// connection.
+    pub(crate) fn hand_off_mutation_outcome(&self, next: &mut App) {
+        if let Some(ConfigMutationDialog::Outcome { message, .. }) = self.mutation_dialog.as_ref() {
+            next.show_mutation_outcome(message.clone());
+        }
+    }
+
     pub(crate) fn has_mutation_dialog(&self) -> bool {
         self.mutation_dialog.is_some()
     }
@@ -3373,7 +3395,9 @@ impl App {
                 };
                 match T::from_chord(&key) {
                     Some(T::Up) => *scroll = scroll.saturating_sub(1),
-                    Some(T::Down) => *scroll = scroll.saturating_add(1),
+                    Some(T::Down) => {
+                        *scroll = scroll.saturating_add(1).min(self.mutation_scroll_max.get())
+                    }
                     _ => {}
                 }
             }
@@ -3545,12 +3569,9 @@ impl App {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(2)])
                 .split(inner);
-            frame.render_widget(
-                Paragraph::new(message.as_str())
-                    .wrap(Wrap { trim: false })
-                    .scroll((*scroll, 0)),
-                chunks[0],
-            );
+            let text = Paragraph::new(message.as_str()).wrap(Wrap { trim: false });
+            let scroll = self.clamp_mutation_scroll(&text, chunks[0], *scroll);
+            frame.render_widget(text.scroll((scroll, 0)), chunks[0]);
             let hint = crate::i18n::t_args(
                 "zc-config-confirm-result-hint",
                 &[
@@ -3620,12 +3641,9 @@ impl App {
         } else {
             lines.push(Line::from(crate::i18n::t("zc-config-confirm-reset-effect")));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((pending.scroll, 0)),
-            chunks[0],
-        );
+        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let scroll = self.clamp_mutation_scroll(&text, chunks[0], pending.scroll);
+        frame.render_widget(text.scroll((scroll, 0)), chunks[0]);
         let confirm = editor_key(crate::keymap::ConfigEditorAction::Confirm);
         let cancel = editor_key(crate::keymap::ConfigEditorAction::Cancel);
         let hint = if pending.preview.as_ref().is_some_and(|plan| !plan.allowed) {
@@ -9321,6 +9339,66 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn config_mutation_result_scroll_stops_at_the_last_line() {
+        let mut manager = test_manager();
+        manager.show_mutation_outcome("first\nsecond\nlast line".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_mutation_confirmation(frame, frame.area()))
+            .unwrap();
+        let mut term = confirmation_term();
+        for _ in 0..40 {
+            manager
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+                .await
+                .unwrap();
+        }
+        terminal
+            .draw(|frame| manager.draw_mutation_confirmation(frame, frame.area()))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("last line"));
+        // The stored offset is clamped too, so one Up scrolls back at once.
+        assert!(matches!(
+            manager.mutation_dialog,
+            Some(ConfigMutationDialog::Outcome { scroll: 0, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_reconnect_keeps_a_mutation_result_and_drops_a_pending_confirmation() {
+        let mut old = test_manager();
+        old.show_mutation_outcome("cleanup incomplete".into());
+        let mut next = test_manager();
+        old.hand_off_mutation_outcome(&mut next);
+        assert!(matches!(
+            next.mutation_dialog.as_ref(),
+            Some(ConfigMutationDialog::Outcome { message, .. }) if message == "cleanup incomplete"
+        ));
+
+        let mut old = test_manager();
+        old.mutation_dialog = Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+            action: ConfigMutation::Reset {
+                prop: "cost.daily_limit_usd".into(),
+                prefix: "cost".into(),
+                tab: None,
+            },
+            preview: None,
+            scroll: 0,
+        }));
+        let mut next = test_manager();
+        old.hand_off_mutation_outcome(&mut next);
+        assert!(!next.has_mutation_dialog());
     }
 
     #[tokio::test]
