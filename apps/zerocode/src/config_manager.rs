@@ -797,7 +797,8 @@ impl App {
 
     fn has_pending_edits(&self) -> bool {
         (matches!(self.screen, Screen::FieldEdit { .. })
-            && self.field_draft() != self.field_draft_loaded)
+            && (self.field_draft() != self.field_draft_loaded
+                || self.secret_map_entry_key.is_some()))
             || (self.personality_active_file.is_some()
                 && self.personality_content != self.personality_loaded)
             || (self.skills_active.is_some() && self.skills_body != self.skills_body_loaded)
@@ -828,6 +829,7 @@ impl App {
                 self.edit_buf = self.field_draft_loaded.clone();
                 self.edit_cursor = self.edit_buf.len();
             }
+            self.secret_map_entry_key = None;
         }
         self.deactivate_filter();
         self.personality_content = self.personality_loaded.clone();
@@ -4677,6 +4679,12 @@ impl App {
         let action = ConfigTabAction::from_chord(&key);
         match action {
             Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
+                // Navigation, unlike the resolved Cancel action, must not
+                // silently drop a changed selection.
+                if self.has_pending_edits() {
+                    self.pending_confirmation = Some(PendingConfirmation::DiscardKey(key));
+                    return Ok(());
+                }
                 self.deactivate_filter();
                 self.pop_to_field_list().await?;
             }
@@ -7598,6 +7606,62 @@ mod tests {
         let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Esc), answers);
         assert!(matches!(manager.screen, Screen::FieldList { .. }));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_left_out_of_changed_choice_asks_before_discarding() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::Bool);
+        config_key(&mut manager, &mut term, KeyCode::Down).await;
+        assert!(manager.has_pending_edits(), "Down changes the choice");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        assert!(manager.pending_confirmation.is_some());
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.pending_confirmation.is_none());
+        assert!(manager.has_pending_edits(), "Stay keeps the changed choice");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"example"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), answers);
+        assert!(manager.pending_confirmation.is_none());
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err(), "discard never writes");
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_staged_secret_map_key_counts_as_pending() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::SecretMap);
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+        manager.field_draft_loaded.clear();
+        for c in "API_TOKEN".chars() {
+            config_key(&mut manager, &mut term, KeyCode::Char(c)).await;
+        }
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(manager.edit_buf.is_empty());
+        assert!(manager.has_pending_edits(), "the staged key is a draft");
+        manager.discard_drafts();
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(!manager.has_pending_edits());
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
     }
 
     #[tokio::test]
