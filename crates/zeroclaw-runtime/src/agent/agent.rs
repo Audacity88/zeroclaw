@@ -556,7 +556,7 @@ pub struct Agent {
     /// session and reused for every later turn. Re-reading the files every
     /// turn made any `AGENTS.md`/`SOUL.md`/... edit change the system prompt,
     /// which invalidated the provider prompt cache for the whole conversation
-    /// of every live session of the agent (#11696). Cleared by
+    /// of every live session of the agent. Cleared by
     /// [`Agent::reload_personality`].
     identity_snapshot: std::sync::OnceLock<String>,
     /// The shell this agent's runtime adapter will spawn, so the system
@@ -10154,7 +10154,7 @@ mod tests {
             );
         }
 
-        /// #11696: the system prompt heads the provider's cached prefix, so a
+        /// The system prompt heads the provider's cached prefix, so a
         /// personality-file edit between turns must not change it for a live
         /// session. Before the fix every turn re-read `AGENTS.md`, and the
         /// second request below carried the edited text.

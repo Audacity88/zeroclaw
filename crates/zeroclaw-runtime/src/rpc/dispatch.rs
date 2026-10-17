@@ -8215,7 +8215,7 @@ impl RpcDispatcher {
     }
 
     /// Re-read the session agent's personality files and rebuild its system
-    /// prompt (#11696). Refused while a turn holds the agent, so the turn's
+    /// prompt. Refused while a turn holds the agent, so the turn's
     /// cached prefix is never swapped out from under it.
     async fn handle_session_reload_context(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
@@ -45708,7 +45708,7 @@ mod tests {
         assert_eq!(steer["error"]["code"], json!(SESSION_NOT_FOUND), "{steer}");
     }
 
-    /// #11696: `session/reload_context` reaches the live agent, re-reads its
+    /// `session/reload_context` reaches the live agent, re-reads its
     /// personality files, and reports whether the text changed.
     #[tokio::test]
     async fn session_reload_context_rereads_personality_for_live_session() {
