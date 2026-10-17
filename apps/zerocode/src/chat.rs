@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -16428,9 +16428,11 @@ mod tests {
             prior
                 .enqueue_message("keep queue".into(), Vec::new())
                 .unwrap();
-            prior.queue_paused = true;
-            prior.queue_sel = prior.message_queue.front().map(|message| message.id);
-            let selected_queue = prior.queue_sel;
+            prior.toggle_queue_pause();
+            assert!(prior.queue_paused());
+            prior.message_queue.ensure_selection();
+            let selected_queue = prior.message_queue.selected();
+            assert!(selected_queue.is_some());
             prior.git_branch_last_fetch = Some(Instant::now());
             chat.phase = ChatPhase::Active(Box::new(prior));
             let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
@@ -16461,9 +16463,12 @@ mod tests {
             assert_eq!(state.input_bar.input(), "keep draft");
             assert_eq!(state.input_bar.pending_attachments().len(), 1);
             assert!(path.exists());
-            assert_eq!(state.message_queue.front().unwrap().text, "keep queue");
-            assert!(state.queue_paused);
-            assert_eq!(state.queue_sel, selected_queue);
+            assert_eq!(
+                state.message_queue.items().front().unwrap().text,
+                "keep queue"
+            );
+            assert!(state.queue_paused());
+            assert_eq!(state.message_queue.selected(), selected_queue);
             assert_eq!(state.message_count, 5);
             let mut output =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
