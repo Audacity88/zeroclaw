@@ -3365,17 +3365,21 @@ fn filter_help_node(node: &HelpNode, query: &str) -> Option<HelpNode> {
         return Some(node.clone());
     }
 
-    let node_matches = node
+    if node
         .title
         .as_deref()
         .is_some_and(|title| title.to_lowercase().contains(&needle))
-        || node
-            .description
-            .as_deref()
-            .is_some_and(|description| description.to_lowercase().contains(&needle));
-    if node_matches {
+    {
         return Some(node.clone());
     }
+    // A matching description keeps only the prose; sibling entries and
+    // children are still filtered, so the root's field details don't pull
+    // every global shortcut into the results.
+    let description = node
+        .description
+        .as_ref()
+        .filter(|description| description.to_lowercase().contains(&needle))
+        .cloned();
 
     let entries: Vec<HelpEntry> = node
         .entries
@@ -3392,13 +3396,13 @@ fn filter_help_node(node: &HelpNode, query: &str) -> Option<HelpNode> {
         .filter_map(|child| filter_help_node(child, &needle))
         .collect();
 
-    if entries.is_empty() && children.is_empty() {
+    if description.is_none() && entries.is_empty() && children.is_empty() {
         return None;
     }
 
     Some(HelpNode {
         title: node.title.clone(),
-        description: None,
+        description,
         entries,
         children,
     })
@@ -5997,6 +6001,25 @@ mod tests {
         })
         .await
         .expect("aborted connection task should drop its state");
+    }
+
+    #[test]
+    fn help_search_matching_field_details_drops_unrelated_shortcuts() {
+        let pane = HelpNode {
+            description: Some("Path: agents.demo.precheck.timeout_secs".into()),
+            ..Default::default()
+        };
+        let node = help_node_for_pane(Mode::Config, pane);
+        assert!(!node.entries.is_empty(), "root carries global shortcuts");
+        let filtered = filter_help_node(&node, "precheck").expect("details should match");
+        assert!(
+            filtered
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("precheck.timeout_secs"))
+        );
+        assert!(filtered.entries.is_empty());
+        assert!(filtered.children.is_empty());
     }
 
     #[test]
