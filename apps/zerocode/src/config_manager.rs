@@ -111,6 +111,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
 
 // ── Screen stack ─────────────────────────────────────────────────
 
+#[derive(Clone)]
 enum Screen {
     SectionList,
     TypeList {
@@ -157,6 +158,28 @@ enum FilterAction {
     Passthrough,
     /// Enter pressed — caller should act on the currently-selected filtered item.
     Accept,
+    /// Cancel restores the saved section instead of selecting an unfiltered row.
+    Cancel,
+}
+
+struct FilterOrigin {
+    pane: ZeroclawPane,
+    section_cursor: usize,
+    active_tab: usize,
+    /// Detail page open when a sidebar search started. Previewing other
+    /// sections replaces it, so cancel reopens this page rather than the
+    /// section root.
+    detail: Option<DetailOrigin>,
+}
+
+struct DetailOrigin {
+    screen: Screen,
+    loaded_section: Option<usize>,
+    type_cursor: usize,
+    alias_cursor: usize,
+    alias_tab: usize,
+    cost_cursor: usize,
+    field_cursor: usize,
 }
 
 enum FilterEditAction {
@@ -172,7 +195,7 @@ enum FilterEditAction {
 /// Which pane of the zeroclaw split holds keyboard focus. The section list
 /// (left) eagerly loads the highlighted section into the right pane for a live
 /// preview; focus moves to the detail (right) on the inward chord.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZeroclawPane {
     Sections,
     Detail,
@@ -180,7 +203,7 @@ enum ZeroclawPane {
 
 /// Top-level Config sub-tab: the daemon RPC editor (`zeroclaw`) first,
 /// the local client config (`zerocode`) second.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
     Zeroclaw,
     Zerocode,
@@ -466,6 +489,7 @@ pub(crate) struct App {
     // Filter state: None = inactive, Some(buf) = active filter
     filter: Option<String>,
     filter_cursor: usize,
+    filter_origin: Option<FilterOrigin>,
     // Tab state for field list
     active_tab: usize,
     tab_names: Vec<ConfigTab>,
@@ -540,6 +564,7 @@ impl App {
             status_msg: None,
             filter: None,
             filter_cursor: 0,
+            filter_origin: None,
             active_tab: 0,
             tab_names: Vec::new(),
             personality_files: Vec::new(),
@@ -628,6 +653,20 @@ impl App {
         self.draw_sections_pane(frame, left, on_sections);
         self.last_section_pane_area = left;
 
+        if self.section_filter_has_no_matches() {
+            self.last_main_area = Rect::default();
+            self.last_tab_area = None;
+            render_no_matches(frame, right);
+            return;
+        }
+        if self.loaded_section != Some(self.section_cursor) {
+            self.last_main_area = Rect::default();
+            self.last_tab_area = None;
+            self.draw_section_detail_hint(frame, right);
+            self.draw_status(frame, regions(right));
+            return;
+        }
+
         // Clone values out of `screen` so draw methods can take `&mut self`.
         // The right pane renders the loaded section content whether focus is on
         // the sections list (preview) or the detail (active).
@@ -703,7 +742,7 @@ impl App {
             Screen::AliasList { .. }
                 if self.zeroclaw_pane == ZeroclawPane::Detail
                     && self.provider_alias_rename_available()
-                    && self.filter.is_none() =>
+                    && self.detail_filter().is_none() =>
             {
                 format!(
                     " {}={}  ?={}",
@@ -713,7 +752,7 @@ impl App {
                 )
             }
             Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     let help = crate::i18n::t("zc-config-footer-action-help");
                     format!(
                         " {}  {}={}  {}={}  ?={}",
@@ -792,7 +831,7 @@ impl App {
             }
             Screen::FieldEdit { field_idx, .. } => {
                 if self.is_select_edit() {
-                    if self.filter.is_some() {
+                    if self.detail_filter().is_some() {
                         let help = crate::i18n::t("zc-config-footer-action-help");
                         format!(
                             " {}  {}={}  {}={}  ?={}",
@@ -945,6 +984,15 @@ impl App {
             return Ok(false);
         }
 
+        // Search cancellation takes precedence over drill/back navigation.
+        if self.filter.is_some()
+            && crate::keymap::SearchBoxAction::from_chord(&key)
+                == Some(crate::keymap::SearchBoxAction::Cancel)
+        {
+            self.cancel_filter().await?;
+            return Ok(false);
+        }
+
         // Focus on the section list: keys drive the list (which eagerly loads
         // the highlighted section into the right pane for preview). Focus on the
         // detail: keys drive whatever drill screen is loaded.
@@ -961,6 +1009,7 @@ impl App {
                 ConfigTabAction::from_chord(&key),
                 Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
             ) && self.at_section_top_level()
+                && self.filter.is_none()
             {
                 self.zeroclaw_pane = ZeroclawPane::Sections;
                 return Ok(false);
@@ -990,6 +1039,7 @@ impl App {
 
     fn cycle_section(&mut self, delta: isize) {
         self.cancel_alias_rename();
+        self.deactivate_filter();
         let i = CONFIG_SECTIONS
             .iter()
             .position(|s| *s == self.section)
@@ -1027,6 +1077,7 @@ impl App {
                 if self.section != CONFIG_SECTIONS[idx] {
                     self.cancel_alias_rename();
                 }
+                self.deactivate_filter();
                 self.section = CONFIG_SECTIONS[idx];
                 return Ok(());
             }
@@ -1035,6 +1086,13 @@ impl App {
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
             self.sync_zerocode_locales().await;
+            return Ok(());
+        }
+
+        if self.section_filter_has_no_matches()
+            || (self.loaded_section != Some(self.section_cursor)
+                && !mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area))
+        {
             return Ok(());
         }
 
@@ -1121,7 +1179,7 @@ impl App {
                 }
 
                 // Section pane click: select the clicked section, return focus to
-                // the left pane, and return that section to its starting view. Display
+                // the left pane, and reset ordinary navigation to the section root. Display
                 // rows resolve through the draw-time `last_section_rows` map so
                 // group headers are dead zones rather than off-by-N selections.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
@@ -1132,28 +1190,41 @@ impl App {
                         self.last_section_rows.len(),
                     ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
+                        if self.detail_filter().is_some() {
+                            self.deactivate_filter();
+                        }
+                        if self.filter_for(ZeroclawPane::Sections).is_some() {
+                            let labels: Vec<&str> =
+                                self.sections.iter().map(|s| s.label.as_str()).collect();
+                            let visible = self.filtered_section_indices(&labels);
+                            self.filter_cursor =
+                                visible.iter().position(|&i| i == orig).unwrap_or(0);
+                        }
                         self.section_cursor = orig;
                         self.zeroclaw_pane = ZeroclawPane::Sections;
-                        self.deactivate_filter();
-                        // Lists have no field subtabs, even if a previous
-                        // field screen left its tab state behind.
-                        if matches!(
-                            self.screen,
-                            Screen::TypeList { .. } | Screen::AliasList { .. }
-                        ) {
-                            self.active_tab = 0;
-                        }
-                        if self.loaded_section == Some(orig) && !self.at_section_top_level() {
-                            self.load_section_content(orig).await?;
-                        } else {
+                        if self.filter_for(ZeroclawPane::Sections).is_some() {
                             self.preview_section(orig).await?;
+                        } else {
+                            // Search previews retain their origin; ordinary clicks
+                            // discard unsaved input and reopen the section root.
+                            if matches!(
+                                self.screen,
+                                Screen::TypeList { .. } | Screen::AliasList { .. }
+                            ) {
+                                self.active_tab = 0;
+                            }
+                            if self.loaded_section == Some(orig) && !self.at_section_top_level() {
+                                self.load_section_content(orig).await?;
+                            } else {
+                                self.preview_section(orig).await?;
+                            }
+                            self.edit_buf.clear();
+                            self.edit_cursor = 0;
+                            self.active_tab = 0;
+                            self.alias_tab = 0;
+                            self.last_tab_area = None;
+                            self.last_breadcrumb_areas.clear();
                         }
-                        self.edit_buf.clear();
-                        self.edit_cursor = 0;
-                        self.active_tab = 0;
-                        self.alias_tab = 0;
-                        self.last_tab_area = None;
-                        self.last_breadcrumb_areas.clear();
                         self.status_msg = None;
                     }
                     return Ok(());
@@ -1171,6 +1242,9 @@ impl App {
                         self.last_list_offset,
                         count,
                     ) {
+                        if self.filter_for(ZeroclawPane::Sections).is_some() {
+                            self.deactivate_filter();
+                        }
                         self.zeroclaw_pane = ZeroclawPane::Detail;
                         let is_double = self.double_click.click(mouse.column, mouse.row);
                         self.set_visible_cursor(pos);
@@ -1184,23 +1258,22 @@ impl App {
             // Scroll over the pinned section list moves the section highlight and
             // re-previews — works whether focus is on the sections or the detail.
             MouseEventKind::ScrollUp
-                if self.section_cursor > 0
-                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+                if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
             {
-                self.section_cursor -= 1;
-                self.preview_section(self.section_cursor).await?;
+                self.scroll_sections(true).await?;
             }
             MouseEventKind::ScrollDown
-                if self.section_cursor + 1 < self.sections.len()
-                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+                if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
             {
-                self.section_cursor += 1;
-                self.preview_section(self.section_cursor).await?;
+                self.scroll_sections(false).await?;
             }
 
             MouseEventKind::ScrollUp
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
             {
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
+                    self.deactivate_filter();
+                }
                 let cur = self.visible_cursor();
                 let count = self.visible_count();
                 let next = mouse::list_scroll(cur, count, true, 3);
@@ -1210,6 +1283,9 @@ impl App {
             MouseEventKind::ScrollDown
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
             {
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
+                    self.deactivate_filter();
+                }
                 let cur = self.visible_cursor();
                 let count = self.visible_count();
                 let next = mouse::list_scroll(cur, count, false, 3);
@@ -1223,12 +1299,33 @@ impl App {
 
     // ── Mouse helper methods ─────────────────────────────────────
 
+    async fn scroll_sections(&mut self, up: bool) -> Result<()> {
+        let labels: Vec<&str> = self.sections.iter().map(|s| s.label.as_str()).collect();
+        let visible = self.filtered_section_indices(&labels);
+        let cursor = visible
+            .iter()
+            .position(|&i| i == self.section_cursor)
+            .unwrap_or(0);
+        let next = crate::mouse::list_scroll(cursor, visible.len(), up, 1);
+        if let Some(&orig) = visible.get(next) {
+            if self.detail_filter().is_some() {
+                self.deactivate_filter();
+            }
+            if self.filter_for(ZeroclawPane::Sections).is_some() {
+                self.filter_cursor = next;
+            }
+            self.section_cursor = orig;
+            self.preview_section(orig).await?;
+        }
+        Ok(())
+    }
+
     /// Number of visible items for the current screen (respecting filters).
     fn visible_count(&self) -> usize {
         match &self.screen {
             Screen::SectionList => {
                 let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-                self.filtered_indices(&labels).len()
+                self.filtered_section_indices(&labels).len()
             }
             Screen::TypeList { section_idx } => {
                 let names = self.type_list_labels(*section_idx);
@@ -1240,7 +1337,7 @@ impl App {
                 } else {
                     let vis = self.filtered_indices(&self.aliases);
                     // +1 for [+ Add] when not filtering
-                    if self.filter.is_none() {
+                    if self.detail_filter().is_none() {
                         vis.len() + 1
                     } else {
                         vis.len()
@@ -1321,19 +1418,19 @@ impl App {
     fn visible_cursor(&self) -> usize {
         match &self.screen {
             Screen::SectionList => {
-                if self.filter.is_some() {
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
                     self.filter_cursor
                 } else {
                     let labels: Vec<String> =
                         self.sections.iter().map(|s| s.label.clone()).collect();
-                    self.filtered_indices(&labels)
+                    self.filtered_section_indices(&labels)
                         .iter()
                         .position(|&i| i == self.section_cursor)
                         .unwrap_or(0)
                 }
             }
             Screen::TypeList { section_idx } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     self.filter_cursor
                 } else {
                     let names = self.type_list_labels(*section_idx);
@@ -1346,7 +1443,7 @@ impl App {
             Screen::AliasList { .. } => {
                 if self.alias_list_has_tabs() && self.alias_tab == 1 {
                     self.cost_cursor
-                } else if self.filter.is_some() {
+                } else if self.detail_filter().is_some() {
                     self.filter_cursor
                 } else {
                     self.alias_cursor
@@ -1365,7 +1462,7 @@ impl App {
                 }
             }
             Screen::FieldEdit { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     self.filter_cursor
                 } else {
                     self.select_cursor
@@ -1376,7 +1473,7 @@ impl App {
 
     /// Helper: current field cursor in visible coordinates.
     fn visible_field_cursor(&self) -> usize {
-        if self.filter.is_some() {
+        if self.detail_filter().is_some() {
             return self.filter_cursor;
         }
         let tab_indices = self.tab_field_indices();
@@ -1394,8 +1491,8 @@ impl App {
         match &self.screen {
             Screen::SectionList => {
                 let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-                let visible = self.filtered_indices(&labels);
-                if self.filter.is_some() {
+                let visible = self.filtered_section_indices(&labels);
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else if let Some(&orig) = visible.get(pos) {
                     self.section_cursor = orig;
@@ -1404,7 +1501,7 @@ impl App {
             Screen::TypeList { section_idx } => {
                 let names = self.type_list_labels(*section_idx);
                 let visible = self.filtered_indices(&names);
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else if let Some(&orig) = visible.get(pos) {
                     self.type_cursor = orig;
@@ -1414,11 +1511,11 @@ impl App {
                 if self.alias_list_has_tabs() && self.alias_tab == 1 {
                     let total = self.cost_resources.len() + 1; // +1 for [+ Add]
                     self.cost_cursor = pos.min(total.saturating_sub(1));
-                } else if self.filter.is_some() {
+                } else if self.detail_filter().is_some() {
                     let visible = self.filtered_indices(&self.aliases);
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else {
-                    let total = if self.filter.is_none() {
+                    let total = if self.detail_filter().is_none() {
                         self.aliases.len() + 1 // +1 for [+ Add]
                     } else {
                         self.aliases.len()
@@ -1446,7 +1543,7 @@ impl App {
             Screen::FieldEdit { .. } => {
                 if self.is_select_edit() {
                     let visible = self.filtered_indices(&self.select_items);
-                    if self.filter.is_some() {
+                    if self.detail_filter().is_some() {
                         self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                     } else if pos < visible.len() {
                         self.select_cursor = pos;
@@ -1462,7 +1559,7 @@ impl App {
         let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
-        if self.filter.is_some() {
+        if self.detail_filter().is_some() {
             self.filter_cursor = pos.min(filter_vis.len().saturating_sub(1));
         } else if let Some(&orig) = visible.get(pos) {
             self.field_cursor = orig;
@@ -1475,7 +1572,7 @@ impl App {
         };
         let names = self.type_list_labels(*section_idx);
         let visible = self.filtered_indices(&names);
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             visible.iter().position(|&i| i == self.type_cursor)?
@@ -1492,6 +1589,7 @@ impl App {
             }
             Screen::TypeList { .. } => {
                 if let Some(idx) = self.selected_type_row() {
+                    self.deactivate_filter();
                     self.enter_type(idx).await?;
                 }
             }
@@ -1504,19 +1602,28 @@ impl App {
                     // Double-click on personality file or skill opens editor —
                     // that requires async loading which mirrors the Enter key
                     // handler. For now, no-op on composite tabs.
-                } else if self.field_cursor < self.fields.len() {
-                    self.enter_field_edit(self.field_cursor, term).await;
+                } else {
+                    let tab_indices = self.tab_field_indices();
+                    let labels = self.field_labels_for_tab(&tab_indices);
+                    let visible = self.filtered_indices(&labels);
+                    if let Some(&pos) = visible.get(self.visible_field_cursor()) {
+                        let idx = tab_indices[pos];
+                        self.deactivate_filter();
+                        self.field_cursor = idx;
+                        self.enter_field_edit(idx, term).await;
+                    }
                 }
             }
             Screen::FieldEdit { .. } => {
                 if self.is_select_edit() {
                     let visible = self.filtered_indices(&self.select_items);
-                    let cursor = if self.filter.is_some() {
+                    let cursor = if self.detail_filter().is_some() {
                         self.filter_cursor
                     } else {
                         self.select_cursor
                     };
                     if let Some(&orig) = visible.get(cursor) {
+                        self.deactivate_filter();
                         self.commit_select(orig).await?;
                     }
                 }
@@ -1963,7 +2070,7 @@ impl App {
 
     async fn handle_section_list(&mut self, key: KeyEvent) -> Result<bool> {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-        let visible = self.filtered_indices(&labels);
+        let visible = self.filtered_section_indices(&labels);
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => {
@@ -1971,11 +2078,17 @@ impl App {
                 // `filter_cursor`; resolve the highlighted filtered row back to
                 // its underlying section so the right-pane preview matches what
                 // `draw_sections_pane` highlights and what Enter will open.
-                let visible = self.filtered_indices(&labels);
+                let visible = self.filtered_section_indices(&labels);
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.section_cursor = orig;
                 }
-                self.preview_section(self.section_cursor).await?;
+                if !visible.is_empty() {
+                    self.preview_section(self.section_cursor).await?;
+                }
+                return Ok(false);
+            }
+            FilterAction::Cancel => {
+                self.cancel_filter().await?;
                 return Ok(false);
             }
             FilterAction::Accept => {
@@ -2232,6 +2345,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -2334,7 +2448,7 @@ impl App {
 
         let visible = self.filtered_indices(&self.aliases);
         // +1 for [+ Add] (only when not filtering)
-        let has_add = self.filter.is_none();
+        let has_add = self.detail_filter().is_none();
         let visible_total = if has_add {
             visible.len() + 1
         } else {
@@ -2343,6 +2457,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -2426,7 +2541,7 @@ impl App {
         if self.alias_list_has_tabs() && self.alias_tab == 1 {
             self.cost_cursor == self.cost_resources.len()
         } else {
-            self.filter.is_none() && self.alias_cursor == self.aliases.len()
+            self.detail_filter().is_none() && self.alias_cursor == self.aliases.len()
         }
     }
 
@@ -2461,7 +2576,7 @@ impl App {
             }
         } else {
             let visible = self.filtered_indices(&self.aliases);
-            let cursor = if self.filter.is_some() {
+            let cursor = if self.detail_filter().is_some() {
                 self.filter_cursor
             } else {
                 self.alias_cursor
@@ -2940,6 +3055,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -3727,17 +3843,145 @@ impl App {
 
     // ── Filter helpers ───────────────────────────────────────────
 
-    fn activate_filter(&mut self) {
+    fn activate_filter(&mut self, filtered_len: usize) {
+        let cursor = if self.zeroclaw_pane == ZeroclawPane::Sections {
+            self.section_cursor
+        } else {
+            self.visible_cursor()
+        };
+        let detail = (self.zeroclaw_pane == ZeroclawPane::Sections).then(|| DetailOrigin {
+            screen: self.screen.clone(),
+            loaded_section: self.loaded_section,
+            type_cursor: self.type_cursor,
+            alias_cursor: self.alias_cursor,
+            alias_tab: self.alias_tab,
+            cost_cursor: self.cost_cursor,
+            field_cursor: self.field_cursor,
+        });
+        self.filter_origin = Some(FilterOrigin {
+            pane: self.zeroclaw_pane,
+            section_cursor: self.section_cursor,
+            active_tab: self.active_tab,
+            detail,
+        });
         self.filter = Some(String::new());
-        self.filter_cursor = 0;
+        self.filter_cursor = cursor.min(filtered_len.saturating_sub(1));
     }
 
     fn deactivate_filter(&mut self) {
         self.filter = None;
+        self.filter_origin = None;
+    }
+
+    async fn cancel_filter(&mut self) -> Result<()> {
+        let origin = self.filter_origin.take();
+        self.deactivate_filter();
+        if let Some(origin) = origin {
+            self.zeroclaw_pane = origin.pane;
+            self.section_cursor = origin.section_cursor;
+            if origin.pane == ZeroclawPane::Sections {
+                let restored = match origin.detail {
+                    Some(detail) if detail.loaded_section != self.loaded_section => {
+                        self.reopen_detail(detail, origin.active_tab).await
+                    }
+                    _ => self.preview_section(origin.section_cursor).await,
+                };
+                if let Err(err) = restored {
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-load-failed",
+                        &[("err", &err.to_string())],
+                    ));
+                }
+                self.active_tab = origin
+                    .active_tab
+                    .min(self.tab_names.len().saturating_sub(1));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reload the detail page saved when a sidebar search started, with its
+    /// cursors and tab. Pages that hold unsaved input (an open editor or a
+    /// create form) fall back to their section root.
+    async fn reopen_detail(&mut self, detail: DetailOrigin, active_tab: usize) -> Result<()> {
+        let Some(section_idx) = detail.loaded_section else {
+            return Ok(());
+        };
+        match detail.screen {
+            Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            } => {
+                self.load_aliases(&map_path).await?;
+                self.screen = Screen::AliasList {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                };
+                if detail.alias_tab == 1 {
+                    self.alias_tab = 1;
+                    self.load_cost_resources().await?;
+                }
+                self.alias_cursor = detail.alias_cursor.min(self.aliases.len());
+                self.cost_cursor = detail.cost_cursor.min(self.cost_resources.len());
+            }
+            Screen::FieldList {
+                section_idx,
+                prefix,
+                breadcrumb,
+            } => {
+                self.load_fields(&prefix).await?;
+                self.screen = Screen::FieldList {
+                    section_idx,
+                    prefix,
+                    breadcrumb,
+                };
+                self.field_cursor = detail.field_cursor.min(self.fields.len().saturating_sub(1));
+                self.active_tab = active_tab.min(self.tab_names.len().saturating_sub(1));
+            }
+            _ => {
+                self.load_section_content(section_idx).await?;
+                self.type_cursor = detail
+                    .type_cursor
+                    .min(self.type_list_len(section_idx).saturating_sub(1));
+            }
+        }
+        self.loaded_section = Some(section_idx);
+        self.status_msg = None;
+        Ok(())
+    }
+
+    fn filter_for(&self, pane: ZeroclawPane) -> Option<&String> {
+        self.filter_origin
+            .as_ref()
+            .filter(|origin| origin.pane == pane)
+            .and(self.filter.as_ref())
+    }
+
+    fn detail_filter(&self) -> Option<&String> {
+        self.filter_for(ZeroclawPane::Detail)
+    }
+
+    fn filtered_section_indices<S: AsRef<str>>(&self, items: &[S]) -> Vec<usize> {
+        Self::indices_matching(items, self.filter_for(ZeroclawPane::Sections))
+    }
+
+    fn section_filter_has_no_matches(&self) -> bool {
+        self.filter_for(ZeroclawPane::Sections).is_some()
+            && self
+                .filtered_section_indices(
+                    &self.sections.iter().map(|s| &s.label).collect::<Vec<_>>(),
+                )
+                .is_empty()
     }
 
     fn filtered_indices<S: AsRef<str>>(&self, items: &[S]) -> Vec<usize> {
-        match &self.filter {
+        Self::indices_matching(items, self.detail_filter())
+    }
+
+    fn indices_matching<S: AsRef<str>>(items: &[S], query: Option<&String>) -> Vec<usize> {
+        match query {
             None => (0..items.len()).collect(),
             Some(buf) if buf.is_empty() => (0..items.len()).collect(),
             Some(buf) => {
@@ -3756,7 +4000,7 @@ impl App {
         use crate::keymap::{ConfigTabAction, SearchBoxAction};
         if self.filter.is_none() {
             if ConfigTabAction::from_chord(&key) == Some(ConfigTabAction::BeginSearch) {
-                self.activate_filter();
+                self.activate_filter(filtered_len);
                 return FilterAction::Consumed;
             }
             return FilterAction::Passthrough;
@@ -3770,17 +4014,12 @@ impl App {
             None => None,
         };
         match editor_chord {
-            Some(FilterEditAction::Cancel) => {
-                self.deactivate_filter();
-                FilterAction::Consumed
-            }
+            Some(FilterEditAction::Cancel) => FilterAction::Cancel,
             Some(FilterEditAction::Accept) => FilterAction::Accept,
             Some(FilterEditAction::Backspace) => {
                 if let Some(buf) = &mut self.filter {
                     buf.pop();
-                    if self.filter_cursor >= filtered_len {
-                        self.filter_cursor = filtered_len.saturating_sub(1);
-                    }
+                    self.filter_cursor = 0;
                 }
                 FilterAction::Consumed
             }
@@ -4028,6 +4267,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -4154,8 +4394,13 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, rows[0], buf);
+        if let Some(buf) = self.filter_for(ZeroclawPane::Sections) {
+            render_filter_bar(
+                frame,
+                rows[0],
+                buf,
+                &crate::i18n::t("zc-config-filter-sections"),
+            );
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -4168,9 +4413,9 @@ impl App {
         let list_area = rows[1];
 
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-        let visible = self.filtered_indices(&labels);
+        let visible = self.filtered_section_indices(&labels);
 
-        let grouped = self.filter.is_none()
+        let grouped = self.filter_for(ZeroclawPane::Sections).is_none()
             && self
                 .sections
                 .iter()
@@ -4204,7 +4449,7 @@ impl App {
             row_map.push(Some(i));
         }
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.filter_for(ZeroclawPane::Sections).is_some() {
             self.filter_cursor
         } else {
             row_map
@@ -4238,6 +4483,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_section_list_offset = state.offset();
         self.last_tab_area = None;
+        if self.section_filter_has_no_matches() {
+            render_no_matches(frame, list_area);
+        }
     }
 
     /// Right pane shown while focus is on the section list: the highlighted
@@ -4282,8 +4530,8 @@ impl App {
         self.last_breadcrumb_areas =
             render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
 
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+        if let Some(buf) = self.detail_filter() {
+            render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(&section.help, theme::dim_style()))
@@ -4311,7 +4559,7 @@ impl App {
             })
             .collect();
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             visible
@@ -4338,6 +4586,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
 
+        if self.detail_filter().is_some() && visible.is_empty() {
+            render_no_matches(frame, r.main);
+        }
         self.draw_status(frame, r);
     }
 
@@ -4393,8 +4644,8 @@ impl App {
             return;
         }
 
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+        if let Some(buf) = self.detail_filter() {
+            render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(&section.help, theme::dim_style()))
@@ -4420,14 +4671,14 @@ impl App {
             .collect();
 
         // Only show [+ Add] when not filtering
-        if self.filter.is_none() {
+        if self.detail_filter().is_none() {
             items.push(ListItem::new(Line::from(Span::styled(
                 "[+ Add]",
                 theme::accent_style(),
             ))));
         }
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             self.alias_cursor
@@ -4451,6 +4702,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
+        if self.detail_filter().is_some() && visible.is_empty() {
+            render_no_matches(frame, r.main);
+        }
         self.draw_status(frame, r);
     }
 
@@ -4649,8 +4903,8 @@ impl App {
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
 
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+        if let Some(buf) = self.detail_filter() {
+            render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else if let Some(field) = self.fields.get(self.field_cursor) {
             frame.render_widget(
                 Paragraph::new(Span::styled(&field.description, theme::dim_style()))
@@ -4659,7 +4913,7 @@ impl App {
             );
         }
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             visible
@@ -4730,6 +4984,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
+        if self.detail_filter().is_some() && visible.is_empty() {
+            render_no_matches(frame, r.main);
+        }
         self.draw_status(frame, r);
     }
 
@@ -4936,8 +5193,13 @@ impl App {
 
         if self.is_select_edit() {
             // Enum, Bool, or model select — with optional `/` filter.
-            if let Some(buf) = &self.filter {
-                render_filter_bar(frame, r.help, buf);
+            if let Some(buf) = self.detail_filter() {
+                render_filter_bar(
+                    frame,
+                    r.help,
+                    buf,
+                    &crate::i18n::t("zc-config-filter-options"),
+                );
             } else {
                 frame.render_widget(
                     Paragraph::new(Span::styled(&field.description, theme::dim_style()))
@@ -4957,7 +5219,7 @@ impl App {
                 })
                 .collect();
 
-            let cursor = if self.filter.is_some() {
+            let cursor = if self.detail_filter().is_some() {
                 self.filter_cursor
             } else {
                 self.select_cursor
@@ -4986,6 +5248,9 @@ impl App {
             self.last_list_offset = state.offset();
             self.last_tab_area = None;
 
+            if self.detail_filter().is_some() && visible.is_empty() {
+                render_no_matches(frame, r.main);
+            }
             self.draw_status(frame, r);
         } else {
             // Text input (masked for secrets) — help text always visible.
@@ -5092,7 +5357,7 @@ impl App {
     /// text-input surface is currently active (filter, edit buffer, alias
     /// create/rename, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
-    pub(crate) fn handle_paste(&mut self, text: &str) {
+    pub(crate) async fn handle_paste(&mut self, text: &str) {
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -5104,6 +5369,19 @@ impl App {
                     continue;
                 } // filter is single-line
                 buf.push(c);
+            }
+            self.filter_cursor = 0;
+            if self.filter_for(ZeroclawPane::Sections).is_some() {
+                let labels: Vec<&str> = self.sections.iter().map(|s| s.label.as_str()).collect();
+                if let Some(&orig) = self.filtered_section_indices(&labels).first() {
+                    self.section_cursor = orig;
+                    if let Err(err) = self.preview_section(orig).await {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-load-failed",
+                            &[("err", &err.to_string())],
+                        ));
+                    }
+                }
             }
             return;
         }
@@ -5254,9 +5532,21 @@ impl App {
         let back = || k(A::Back, "zc-config-help-back");
         let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
 
+        if self.zeroclaw_pane == ZeroclawPane::Sections {
+            let mut entries = vec![nav(), k(A::Enter, "zc-config-help-open-section")];
+            if self.filter_for(ZeroclawPane::Sections).is_some() {
+                entries.push(clear_filter());
+            } else {
+                entries.push(filter());
+            }
+            entries.push(help());
+            entries.push(mouse_open());
+            return HelpNode::entries(entries);
+        }
+
         match &self.screen {
             Screen::SectionList => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-open-section"),
@@ -5277,7 +5567,7 @@ impl App {
                 }
             }
             Screen::TypeList { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-open-type"),
@@ -5298,7 +5588,7 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-open-alias"),
@@ -5368,7 +5658,7 @@ impl App {
                 help(),
             ]),
             Screen::FieldList { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-edit-field"),
@@ -5448,7 +5738,7 @@ impl App {
                     .map(|f| f.kind == PropKind::StringArray)
                     .unwrap_or(false);
                 if self.is_select_edit() {
-                    if self.filter.is_some() {
+                    if self.detail_filter().is_some() {
                         HelpNode::entries(vec![
                             nav(),
                             k(A::Enter, "zc-config-help-save-selection"),
@@ -5581,10 +5871,19 @@ fn regions(area: Rect) -> Regions {
     }
 }
 
-fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str) {
-    let display = format!("/{buf}█");
+fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str, scope: &str) {
+    let display = format!("{scope}: /{buf}█");
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(display, theme::input_style()))),
+        area,
+    );
+}
+
+fn render_no_matches(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(crate::i18n::t("zc-config-filter-no-matches"))
+            .style(theme::dim_style())
+            .block(theme::panel_block(" ")),
         area,
     );
 }
@@ -6077,6 +6376,461 @@ mod tests {
         App::new(rpc, std::path::Path::new("/tmp"))
     }
 
+    fn filter_test_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap()
+    }
+
+    fn render_config_120(manager: &mut App) -> String {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn filter_fixture(manager: &mut App) {
+        manager.sections = vec![
+            entry_with_cost("Models", ""),
+            entry_with_cost("Agents", ""),
+            entry_with_cost("MCP", ""),
+        ];
+        manager.section_cursor = 1;
+        manager.loaded_section = Some(1);
+        manager.fields = vec![field("a.first"), field("a.second")];
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldList {
+            section_idx: 1,
+            prefix: "Agents".into(),
+            breadcrumb: vec!["Agents".into()],
+        };
+    }
+
+    #[tokio::test]
+    async fn config_filter_cancel_restores_section_preview_cursor_and_focus_after_paste() {
+        let (mut manager, calls) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.fields[0].tab = ConfigTab::Connection;
+        manager.fields[1].tab = ConfigTab::Advanced;
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 1);
+        manager.handle_paste("MCP\r\n").await;
+        assert_eq!(manager.section_cursor, 2);
+        assert_eq!(manager.loaded_section, Some(2));
+        assert_eq!(manager.filter_cursor, 0);
+        let rendered = render_config_120(&mut manager);
+        assert!(rendered.contains("Filter sections: /MCP"));
+        assert!(!rendered.contains("Filter list:"));
+        assert!(rendered.contains("first ="));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.loaded_section, Some(1));
+        assert_eq!(manager.field_cursor, 1);
+        assert_eq!(manager.active_tab, 1);
+        assert!(render_config_120(&mut manager).contains("second ="));
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Sections);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                crate::client::method::CONFIG_LIST,
+                crate::client::method::CONFIG_LIST
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_filter_model_picker_is_local_and_cancel_keeps_original_selection() {
+        let mut manager = test_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 1,
+            prefix: "Agents".into(),
+            breadcrumb: vec!["Agents".into()],
+            field_idx: 0,
+        };
+        manager.select_items = vec!["openai.default".into(), "ollama.local".into()];
+        manager.select_cursor = 1;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("openai").await;
+        let rendered = render_config_120(&mut manager);
+        assert!(rendered.contains("Models"));
+        assert!(rendered.contains("Agents"));
+        assert!(rendered.contains("MCP"));
+        assert!(rendered.contains("Filter options: /openai"));
+        assert!(!rendered.contains("ollama.local"));
+        assert!(!rendered.contains("Filter sections:"));
+        manager.handle_paste(".missing").await;
+        assert!(render_config_120(&mut manager).contains("No matches"));
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.select_cursor, 1);
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(render_config_120(&mut manager).contains("ollama.local"));
+    }
+
+    #[tokio::test]
+    async fn config_filter_empty_sections_disables_stale_preview_and_enter() {
+        let (mut manager, calls) = responding_manager();
+        filter_fixture(&mut manager);
+        let mut term = filter_test_term();
+        render_config_120(&mut manager);
+        let stale_main = manager.last_main_area;
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        for ch in "timeout".chars() {
+            manager
+                .handle_key(key(KeyCode::Char(ch)), &mut term)
+                .await
+                .unwrap();
+        }
+        let rendered = render_config_120(&mut manager);
+        assert_eq!(rendered.matches("No matches").count(), 2);
+        assert!(!rendered.contains("second ="));
+        assert!(manager.last_section_rows.is_empty());
+        assert_eq!(manager.last_main_area, Rect::default());
+        assert!(manager.last_tab_area.is_none());
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        for kind in [
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            manager
+                .handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column: stale_main.x + 2,
+                        row: stale_main.y + 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    Rect::new(0, 0, 120, 40),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.field_cursor, 1);
+        assert!(calls.lock().unwrap().is_empty());
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section_cursor, 1);
+        assert!(render_config_120(&mut manager).contains("second ="));
+    }
+
+    #[tokio::test]
+    async fn config_filter_mouse_accepts_filtered_alias_and_discards_query() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "agents".into(),
+            breadcrumb: vec!["agents".into()],
+        };
+        manager.aliases = vec!["first".into(), "second".into()];
+        manager.alias_cursor = 0;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("second").await;
+        render_config_120(&mut manager);
+        let area = manager.last_main_area;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        manager
+            .handle_mouse(click, Rect::new(0, 0, 120, 40), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_mouse(click, Rect::new(0, 0, 120, 40), &mut term)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix, .. } if prefix == "agents.second")
+        );
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
+    }
+
+    #[tokio::test]
+    async fn config_filter_field_cancel_precedes_top_level_back_and_tab_change_discards_query() {
+        let mut manager = test_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("missing").await;
+        assert!(render_config_120(&mut manager).contains("No matches"));
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
+        assert_eq!(manager.field_cursor, 1);
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_key(key(KeyCode::Tab), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section, ConfigSection::Zerocode);
+        assert!(manager.filter.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_filter_cancel_reopens_the_nested_page_it_started_from() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.screen = Screen::FieldList {
+            section_idx: 1,
+            prefix: "agents.alpha".into(),
+            breadcrumb: vec!["Agents".into(), "alpha".into()],
+        };
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("MCP").await;
+        assert_eq!(manager.loaded_section, Some(2));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.loaded_section, Some(1));
+        assert_eq!(manager.field_cursor, 1);
+        match &manager.screen {
+            Screen::FieldList {
+                prefix, breadcrumb, ..
+            } => {
+                assert_eq!(prefix, "agents.alpha");
+                assert_eq!(breadcrumb.len(), 2);
+            }
+            _ => panic!("cancel should reopen the agent page"),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_filter_cancel_keeps_the_costs_add_row_selected() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.sections[1] = entry_with_cost("Agents", "llm");
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "Agents.anthropic".into(),
+            breadcrumb: vec!["Agents".into(), "anthropic".into()],
+        };
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["first".into(), "second".into()];
+        manager.cost_cursor = 2;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("MCP").await;
+        assert_eq!(manager.loaded_section, Some(2));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.alias_tab, 1);
+        assert_eq!(manager.cost_resources.len(), 2);
+        assert_eq!(manager.cost_cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn config_filter_failed_paste_and_cancel_keep_tui_open_and_detail_inert() {
+        for fail_on_cancel in [false, true] {
+            let (mut manager, _) = responding_manager();
+            filter_fixture(&mut manager);
+            let mut term = filter_test_term();
+            manager
+                .handle_key(key(KeyCode::Char('/')), &mut term)
+                .await
+                .unwrap();
+            if fail_on_cancel {
+                manager.handle_paste("MCP").await;
+            }
+            manager.rpc = test_manager().rpc;
+            if fail_on_cancel {
+                manager
+                    .handle_key(key(KeyCode::Esc), &mut term)
+                    .await
+                    .unwrap();
+                assert_eq!(manager.section_cursor, 1);
+                assert_eq!(manager.loaded_section, Some(2));
+                assert!(manager.filter.is_none());
+            } else {
+                manager.handle_paste("MCP").await;
+                assert_eq!(manager.section_cursor, 2);
+                assert_eq!(manager.loaded_section, Some(1));
+            }
+            assert!(manager.status_msg.is_some());
+            let rendered = render_config_120(&mut manager);
+            assert!(!rendered.contains("first ="));
+            assert!(!rendered.contains("second ="));
+            assert_eq!(manager.last_main_area, Rect::default());
+            assert!(manager.last_tab_area.is_none());
+            manager
+                .handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                        column: 35,
+                        row: 10,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    Rect::new(0, 0, 120, 40),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Sections);
+            assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn config_filter_from_add_row_selects_a_real_alias_on_enter() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "agents".into(),
+            breadcrumb: vec!["agents".into()],
+        };
+        manager.aliases = vec!["first".into(), "second".into()];
+        manager.alias_cursor = 2;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 1);
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix, .. } if prefix == "agents.second")
+        );
+        assert!(manager.filter.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_filter_sidebar_mouse_scroll_and_click_use_matching_rows() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_key(key(KeyCode::Char('M')), &mut term)
+            .await
+            .unwrap();
+        render_config_120(&mut manager);
+        let area = manager.last_section_list_area;
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: area.x + 2,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 120, 40),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 1);
+        assert_eq!(manager.section_cursor, 2);
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: area.x + 2,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 120, 40),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 0);
+        assert_eq!(manager.section_cursor, 0);
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section_cursor, 1);
+    }
+
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
         ConfigSectionEntry {
             key: key.to_string(),
@@ -6216,7 +6970,7 @@ mod tests {
         for _ in 0..manager.edit_buf.chars().count() {
             config_key(manager, term, KeyCode::Backspace).await;
         }
-        manager.handle_paste(to);
+        manager.handle_paste(to).await;
     }
 
     async fn answer_config_request(
@@ -6297,7 +7051,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(rx.try_recv().is_err());
-            manager.handle_paste("ignored");
+            manager.handle_paste("ignored").await;
             config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
             assert_eq!(manager.edit_buf, "new");
 
@@ -6797,6 +7551,7 @@ mod tests {
             manager.templates = vec![ConfigTemplateEntry {
                 path: "providers.models.openai".into(),
             }];
+            manager.activate_filter(manager.visible_count());
             manager.filter = Some("old".into());
             manager.edit_buf = "unsaved".into();
             manager.edit_cursor = manager.edit_buf.len();
@@ -7037,7 +7792,7 @@ mod tests {
                         assert_eq!(breadcrumb.last().unwrap(), ConfigTab::Costs.label());
                     }
                     assert!(manager.edit_buf.is_empty());
-                    manager.handle_paste("unsaved");
+                    manager.handle_paste("unsaved").await;
                     assert!(rx.try_recv().is_err());
                     let replies = async {
                         answer_config_request(
@@ -7074,6 +7829,7 @@ mod tests {
     async fn provider_alias_rename_filtered_mouse_click_opens_the_visible_alias() {
         let (mut manager, outbound, mut rx, mut term) =
             alias_rename_manager("providers.models", "openai");
+        manager.activate_filter(manager.visible_count());
         manager.filter = Some("no-match".into());
         manager.zeroclaw_pane = ZeroclawPane::Sections;
         render_config_for_mouse(&mut manager);
@@ -7151,6 +7907,7 @@ mod tests {
                 assert_eq!(manager.edit_buf, "unsaved");
                 assert!(rx.try_recv().is_err());
             }
+            manager.activate_filter(manager.visible_count());
             manager.filter = Some("old".into());
             let fields = manager.fields.clone();
             let replies = async {
@@ -7490,6 +8247,12 @@ mod tests {
         ];
         mgr.type_cursor = 2;
         mgr.filter = Some("chan".to_string());
+        mgr.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: 0,
+            active_tab: 0,
+            detail: None,
+        });
         mgr.filter_cursor = 0;
 
         assert_eq!(mgr.selected_type_row(), Some(0));
@@ -7604,6 +8367,8 @@ mod tests {
                         req["params"]["value"].clone(),
                     ));
                     serde_json::json!({})
+                } else if method == crate::client::method::CONFIG_MAP_KEYS {
+                    serde_json::json!({ "keys": ["first", "second"] })
                 } else if method == crate::client::method::CONFIG_LIST {
                     let mut first = field("a.first");
                     first.tab = ConfigTab::Connection;
