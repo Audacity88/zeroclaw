@@ -24,8 +24,8 @@ jobs:
     env:
       PYTHONUNBUFFERED: '1'
       PYTHONOPTIMIZE: '0'
-      INPUTS_SHA256: 3ba92a39ab563fafb462c4ea51ec9082b8efbbf3b1eb009bb3ed8fc5e468c0a2
-      DRIVER_SHA256: 03c57fce9ab8ec148fdf81199a94b7c2bebc6ed48a257147497d5dfacb1f4953
+      INPUTS_SHA256: 5627dc2591ada484a156bdce7cb0acffba89aab52871dd4d79f0c0e18161bf83
+      DRIVER_SHA256: c9a351bb46312c79ec1604bed3e12d035e14f56fa6d79539b684846cd60655dc
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:

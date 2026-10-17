@@ -61,36 +61,46 @@ def verify_fixture():
     require(pins == [INPUTS["synapse_image"]])
 
 
-def verify_inputs(host_zip, guest_zip, destination=None):
+def verify_registry(data):
+    guest = INPUTS["guest"]
+    require(len(data) == guest["registry_bytes"] and digest(data) == guest["registry_sha256"])
+    require(guest["registry_url"] == "https://raw.githubusercontent.com/" + guest["repository"] + "/" + guest["source"] + "/registry.json")
+    index = json.loads(data)
+    matches = [entry for entry in index["plugins"] if entry["name"] == "matrix" and entry["version"] == guest["version"]]
+    require(len(matches) == 1)
+    entry = matches[0]
+    require(entry["url"] == guest["url"] and entry.get("sha256") == guest["zip_sha256"])
+    require(re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is not None)
+    require(entry["capabilities"] == ["channel"] and entry["provides"] == "matrix" and entry["sender_match"] == "exact")
+
+
+def verify_inputs(host_zip, guest_zip, registry_json, destination=None):
     host, guest = INPUTS["host"], INPUTS["guest"]
     for path, spec in ((host_zip, host), (guest_zip, guest)):
         require(file_record(path) == {"bytes": spec["zip_bytes"], "sha256": spec["zip_sha256"]})
     verify_fixture()
+    verify_registry(registry_json.read_bytes())
     with zipfile.ZipFile(host_zip) as bundle:
-        names = {host["archive"], "archive-evidence/input-manifest.json", "archive-evidence/qualification.json", "archive-evidence/validation.json"}
-        names.update("archive-evidence/abi/" + name + ".txt" for name in ("zeroclaw", "zerocode", "zerorelay"))
+        # This pinned normal-profile archive has no Ubuntu22 qualification receipt.
+        require(host["profile"] == "normal")
+        names = {host["archive"], "archive-evidence/input-manifest.json", "archive-evidence/validation.json"}
         require(set(bundle.namelist()) == names and len(bundle.infolist()) == len(names))
         manifest_data = bundle.read("archive-evidence/input-manifest.json")
         validation_data = bundle.read("archive-evidence/validation.json")
         manifest, validation = json.loads(manifest_data), json.loads(validation_data)
-        receipt = json.loads(bundle.read("archive-evidence/qualification.json"))
-        require(receipt["binding"] == {"source": host["source"], "tree": host["tree"], "run": host["run"], "attempt": host["attempt"], "profile": "stable-gnu-ubuntu22"})
-        require(receipt["role"] == "build" and receipt["target"] == host["target"])
+        for name, data in (("manifest", manifest_data), ("validation", validation_data)):
+            require(len(data) == host[name + "_bytes"] and digest(data) == host[name + "_sha256"])
+        require(manifest["format"] == "zeroclaw-release-archive-evidence-v1")
+        require(manifest["directories"] == ["web", "web/dist", "web/dist/assets", "web/dist/blog"])
         for document in (manifest, validation):
             require(all(document[key] == host[key] for key in ("source", "run", "attempt", "target")))
-            require(document["main"] == "zeroclaw" and document["features"] == receipt["features"])
-        require("plugins-wasm-cranelift" in receipt["features"].split(","))
+            require(document["main"] == "zeroclaw" and document["features"] == host["features"])
+        require("plugins-wasm-cranelift" in host["features"].split(","))
         require(validation["verdict"] == "PASS" and validation["files"] == manifest["files"])
-        for data, record in ((manifest_data, receipt["manifest"]), (validation_data, receipt["validation"])):
-            require(record == {"bytes": len(data), "sha256": digest(data)})
         require(validation["manifest_sha256"] == digest(manifest_data))
         compressed = bundle.read(host["archive"])
-        require({"bytes": len(compressed), "sha256": digest(compressed)} == receipt["archive"] == {"bytes": host["archive_bytes"], "sha256": host["archive_sha256"]})
+        require({"bytes": len(compressed), "sha256": digest(compressed)} == {"bytes": host["archive_bytes"], "sha256": host["archive_sha256"]})
         require(validation["archive_sha256"] == host["archive_sha256"])
-        for name, observation in receipt["observations"].items():
-            require(observation["input"] == manifest["files"][name])
-            data = bundle.read("archive-evidence/abi/" + name + ".txt")
-            require(observation["output"] == {"bytes": len(data), "sha256": digest(data)})
         if destination is not None:
             (destination / "host").mkdir()
         found = {}
@@ -134,7 +144,7 @@ def verify_inputs(host_zip, guest_zip, destination=None):
         require(found == manifest["files"] and len(found) == host["payloads"])
         require(found["zeroclaw"] == {"bytes": host["binary_bytes"], "sha256": host["binary_sha256"]})
     with zipfile.ZipFile(guest_zip) as bundle:
-        require(len(bundle.infolist()) == 18 and len(set(bundle.namelist())) == 18)
+        require(set(bundle.namelist()) == {"matrix/matrix.wasm", "matrix/manifest.toml"} and len(bundle.infolist()) == 2)
         for member in bundle.infolist():
             require(not member.filename.startswith("/") and ".." not in PurePosixPath(member.filename).parts and member.file_size < 4 * 1024**2)
             require((member.external_attr >> 16) & 0o170000 != 0o120000)
@@ -142,12 +152,7 @@ def verify_inputs(host_zip, guest_zip, destination=None):
         require(len(wasm) == guest["component_bytes"] and digest(wasm) == guest["component_sha256"] and wasm[:8] == b"\x00asm\x0d\x00\x01\x00")
         require(len(manifest_data) == guest["manifest_bytes"] and digest(manifest_data) == guest["manifest_sha256"])
         manifest = tomllib.loads(manifest_data.decode())
-        require(manifest["name"] == "matrix" and manifest["version"] == "0.3.0" and manifest["registry"] is False)
-        if destination is not None:
-            (destination / "package").mkdir()
-            for name, data in (("matrix.wasm", wasm), ("manifest.toml", manifest_data)):
-                with (destination / "package" / name).open("xb") as output:
-                    output.write(data)
+        require(manifest["name"] == "matrix" and manifest["version"] == guest["version"] and manifest.get("registry", True) is True)
 
 
 def matrix(fixture, path, token, body=None, method=None):
@@ -416,11 +421,12 @@ class Runtime:
         (profile / "home").mkdir()
         self.cli(profile, "config", "get", "plugins.enabled", "--json")
         self.setting(profile, "plugins.plugins_dir", str(profile / "plugins"))
-        package = str(self.private / "package")
+        package = "matrix@" + INPUTS["guest"]["version"]
+        registry = INPUTS["guest"]["registry_url"]
         if combined:
-            output = self.cli(profile, "plugin", "install", package, "--channel-alias", "operations", "--egress", "none")
+            output = self.cli(profile, "plugin", "install", package, "--registry", registry, "--channel-alias", "operations", "--egress", "none")
         else:
-            bare = self.cli(profile, "plugin", "install", package)
+            bare = self.cli(profile, "plugin", "install", package, "--registry", registry)
             require(not self.config(profile).get("plugins", {}).get("entries") and "plugin bind" in bare)
             output = self.cli(profile, "plugin", "bind", "matrix", "--channel-alias", "operations", "--egress", "none")
         config = self.config(profile)
@@ -534,27 +540,39 @@ def acquire(runtime):
     print("matrix acceptance phase: acquisition", flush=True)
     runtime.phase_deadline = time.monotonic() + 300
     verify_fixture()
-    paths = []
-    for name in ("host", "guest"):
-        spec = INPUTS[name]
-        api = "repos/" + spec["repository"] + "/actions/artifacts/" + str(spec["artifact"])
-        metadata = json.loads(runtime.command(["gh", "api", api], timeout=20))
-        require(metadata["id"] == spec["artifact"] and metadata["name"] == spec["artifact_name"] and metadata["expired"] is False)
-        require(metadata["size_in_bytes"] == spec["zip_bytes"] and metadata["digest"] == "sha256:" + spec["zip_sha256"])
-        require(metadata["workflow_run"]["id"] == spec["run"] and metadata["workflow_run"]["head_sha"] == spec["source"])
-        path = runtime.private / (name + ".zip")
+    host, guest = INPUTS["host"], INPUTS["guest"]
+    api = "repos/" + host["repository"] + "/actions/artifacts/" + str(host["artifact"])
+    metadata = json.loads(runtime.command(["gh", "api", api], timeout=20))
+    require(metadata["id"] == host["artifact"] and metadata["name"] == host["artifact_name"] and metadata["expired"] is False)
+    require(metadata["size_in_bytes"] == host["zip_bytes"] and metadata["digest"] == "sha256:" + host["zip_sha256"])
+    require(metadata["workflow_run"]["id"] == host["run"] and metadata["workflow_run"]["head_sha"] == host["source"])
+    run_api = "repos/" + host["repository"] + "/actions/runs/" + str(host["run"]) + "/attempts/" + str(host["attempt"])
+    run = json.loads(runtime.command(["gh", "api", run_api], timeout=20))
+    require(run["head_sha"] == host["source"] and run["run_attempt"] == host["attempt"] and run["conclusion"] == "success")
+    require(run["path"] == ".github/workflows/cross-platform-build-manual.yml")
+    commit = json.loads(runtime.command(["gh", "api", "repos/" + host["repository"] + "/git/commits/" + host["source"]], timeout=20))
+    require(commit["sha"] == host["source"] and commit["tree"]["sha"] == host["tree"])
+    host_zip = runtime.private / "host.zip"
+    with host_zip.open("xb") as output:
+        runtime.command(["gh", "api", api + "/zip"], timeout=180, output=output)
+    asset_api = "repos/" + guest["repository"] + "/releases/assets/" + str(guest["asset"])
+    asset = json.loads(runtime.command(["gh", "api", asset_api], timeout=20))
+    require(asset["id"] == guest["asset"] and asset["name"] == guest["asset_name"] and asset["state"] == "uploaded")
+    require(asset["size"] == guest["zip_bytes"] and asset["digest"] == "sha256:" + guest["zip_sha256"] and asset["browser_download_url"] == guest["url"])
+    guest_zip, registry_json = runtime.private / "guest.zip", runtime.private / "registry.json"
+    for path, url in ((guest_zip, guest["url"]), (registry_json, guest["registry_url"])):
         with path.open("xb") as output:
-            runtime.command(["gh", "api", api + "/zip"], timeout=180, output=output)
-        paths.append(path)
+            runtime.command(["curl", "--fail", "--silent", "--show-error", "--location", "--max-time", "60", url], timeout=65, output=output)
+    verify_registry(registry_json.read_bytes())
     runtime.command(["docker", "pull", "--platform", "linux/amd64", INPUTS["synapse_image"]], timeout=240)
     runtime.phase_deadline = runtime.deadline
-    return paths
+    return host_zip, guest_zip, registry_json
 
 
-def prove(runtime, host_zip, guest_zip):
+def prove(runtime, host_zip, guest_zip, registry_json):
     runtime.result["phase"] = "inputs"
     print("matrix acceptance phase: inputs", flush=True)
-    verify_inputs(host_zip, guest_zip, runtime.private)
+    verify_inputs(host_zip, guest_zip, registry_json, runtime.private)
     runtime.case("inputs")
     runtime.result["phase"] = "fixture"
     print("matrix acceptance phase: fixture", flush=True)
@@ -712,8 +730,8 @@ def run(root):
     os.umask(0o077)
     runtime = Runtime(root)
     try:
-        host_zip, guest_zip = acquire(runtime)
-        prove(runtime, host_zip, guest_zip)
+        host_zip, guest_zip, registry_json = acquire(runtime)
+        prove(runtime, host_zip, guest_zip, registry_json)
         runtime.result["status"] = "passed"
     except Exception as error:
         runtime.result["status"] = "failed"
@@ -786,12 +804,13 @@ if __name__ == "__main__":
     mode.add_argument("--run", action="store_true")
     parser.add_argument("--host-zip", type=Path)
     parser.add_argument("--guest-zip", type=Path)
+    parser.add_argument("--registry-json", type=Path)
     args = parser.parse_args()
     try:
         require(not sys_optimized())
         if args.verify_inputs_only:
-            require(args.host_zip is not None and args.guest_zip is not None)
-            verify_inputs(args.host_zip, args.guest_zip)
+            require(args.host_zip is not None and args.guest_zip is not None and args.registry_json is not None)
+            verify_inputs(args.host_zip, args.guest_zip, args.registry_json)
             print("inputs-only verification: PASS; no extraction, network or execution")
         elif args.check_evidence:
             check_evidence(HERE.parent)
