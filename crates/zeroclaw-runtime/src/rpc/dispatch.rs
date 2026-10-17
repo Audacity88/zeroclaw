@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
@@ -2920,11 +2921,7 @@ impl RpcDispatcher {
             return;
         };
         for (name, channel) in factory(self.ctx.config.clone(), agent_alias.to_string()) {
-            agent
-                .channel_handles()
-                .reaction
-                .write()
-                .insert(name, channel);
+            agent.channel_handles().register_channel(name, channel);
         }
     }
 
@@ -7762,7 +7759,16 @@ impl RpcDispatcher {
                 crate::agent::SteeringInput::with_admission(req.content, admit)
             }
             None => crate::agent::SteeringInput::new(req.content),
-        };
+        }
+        .with_ingress(IngressContext {
+            message_id: None,
+            source_class: SourceClass::External,
+            sender: self.owner_principal_id(),
+            transport: Transport::Rpc,
+            trust: TrustClass::Untrusted,
+            origin: TurnOrigin::Interactive,
+            internal_principal: None,
+        });
         match self.ctx.sessions.steer_session_for_generation(
             &req.session_id,
             session_generation,
@@ -9666,6 +9672,42 @@ impl RpcDispatcher {
             let Some(session_generation) = ctx.sessions.get_generation(&session_id).await else {
                 continue;
             };
+
+            // Pre-filter on scope BEFORE taking the per-session lock. A
+            // running turn holds `model_provider_update` for its whole
+            // duration (see `handle_session_prompt`), so locking first would
+            // park this transaction — and the sequential dispatcher loop of
+            // the connection that issued the `config/set` — behind every
+            // busy session on the daemon, including ones this edit cannot
+            // touch (editing agent B's provider while agent A is mid-turn).
+            // The pre-read is authoritative for selection: overrides only
+            // change through `session/configure`, which takes
+            // `config_write_lock` first, and the caller holds that lock for
+            // the whole transaction. Agent alias is fixed for a generation.
+            // The state is re-read under the lock below anyway so the
+            // rebuild uses exactly what the ordering boundary guarantees.
+            {
+                let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                    continue;
+                };
+                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                    continue;
+                };
+                let in_scope = scope
+                    .resolve_provider_ref(config, &agent_alias, &overrides)
+                    .map_err(|error| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!(
+                                "Config update cannot refresh live session `{session_id}`: {error}"
+                            ),
+                        )
+                    })?
+                    .is_some();
+                if !in_scope {
+                    continue;
+                }
+            }
 
             // Acquire the per-session ordering boundary. This serialises
             // with session/configure so the state we read afterwards
@@ -13619,6 +13661,14 @@ fn plan_replay_notification(
     notification_for_turn_event(session_id, &event)
 }
 
+#[cfg(test)]
+pub(crate) fn notification_for_turn_event_for_test(
+    session_id: &str,
+    event: &TurnEvent,
+) -> Option<String> {
+    notification_for_turn_event(session_id, event)
+}
+
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
@@ -14017,6 +14067,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+
+        async fn create_room(
+            &self,
+            _options: &zeroclaw_api::channel::RoomCreationOptions,
+        ) -> anyhow::Result<String> {
+            Ok("test-session-room".to_string())
+        }
     }
 
     fn session_factory_stub() -> super::LocalRpcSessionChannelFactory {
@@ -14029,6 +14086,25 @@ mod tests {
             );
             channels
         })
+    }
+
+    fn assert_local_session_channels(agent: &crate::agent::agent::Agent) {
+        let handles = agent.channel_handles();
+        for (tool, handle) in [
+            ("reaction/git_forge", Some(&handles.reaction)),
+            ("ask_user/send_via", handles.ask_user.as_ref()),
+            ("channel_room", handles.channel_room.as_ref()),
+            ("poll", handles.poll.as_ref()),
+            ("escalate", handles.escalate.as_ref()),
+        ] {
+            let channels = handle.expect("configured tool handle should exist").read();
+            assert_eq!(channels.len(), 2, "{tool} should resolve both channels");
+            assert!(
+                channels.contains_key("git.main"),
+                "{tool} lost live channel"
+            );
+            assert!(channels.contains_key("rpc"), "{tool} lost RPC back-channel");
+        }
     }
 
     #[tokio::test]
@@ -14054,10 +14130,24 @@ mod tests {
             .expect("session should be live");
         {
             let agent = before.lock().await;
-            let reaction = agent.channel_handles().reaction.read();
-            assert_eq!(reaction.len(), 2);
-            assert!(reaction.contains_key("git.main"));
-            assert!(reaction.contains_key("rpc"));
+            assert_local_session_channels(&agent);
+            let result = agent
+                .execute_tool_for_test(
+                    "channel_room",
+                    serde_json::json!({
+                        "action": "create_room",
+                        "channel": "git.main",
+                        "name": "test-room",
+                    }),
+                )
+                .await
+                .expect("fixture exposes channel_room")
+                .expect("channel_room should execute");
+            assert!(
+                result.success,
+                "channel_room must reach live channel: {result:?}"
+            );
+            assert!(result.output.contains("test-session-room"));
         }
 
         dispatcher
@@ -14072,16 +14162,8 @@ mod tests {
             std::sync::Arc::ptr_eq(&before, &after),
             "same-mode resume must rebind the existing session rather than rebuilding it"
         );
-        assert!(
-            after
-                .lock()
-                .await
-                .channel_handles()
-                .reaction
-                .read()
-                .contains_key("git.main"),
-            "same-mode resume must preserve local channel handles"
-        );
+        let agent = after.lock().await;
+        assert_local_session_channels(&agent);
     }
 
     #[tokio::test]
@@ -14354,10 +14436,7 @@ mod tests {
             .expect("rehydration should not fail")
             .expect("restorable ACP session must rehydrate");
         let agent = recovered.lock().await;
-        let reaction = agent.channel_handles().reaction.read();
-        assert_eq!(reaction.len(), 2);
-        assert!(reaction.contains_key("git.main"));
-        assert!(reaction.contains_key("rpc"));
+        assert_local_session_channels(&agent);
     }
 
     /// The personality filename allowlist constrains the name, not its target.
@@ -17713,9 +17792,13 @@ mod tests {
         assert_eq!(result["size_bytes"], json!(payload.len()), "{committed}");
         assert_eq!(result["deduplicated"], json!(false), "{committed}");
         let stored = std::path::PathBuf::from(result["workspace_path"].as_str().unwrap());
+        // Compare resolved paths: the reply carries the canonical path without
+        // the Windows verbatim prefix, while the fixture's temp root can be
+        // spelled through a symlink or an 8.3 short name.
         assert!(
-            stored.starts_with(std::fs::canonicalize(&agent_workspace).unwrap())
-                || stored.starts_with(&agent_workspace),
+            std::fs::canonicalize(&stored)
+                .unwrap()
+                .starts_with(std::fs::canonicalize(&agent_workspace).unwrap()),
             "the upload lands in the agent workspace: {committed}"
         );
         assert_eq!(std::fs::read(&stored).unwrap(), payload);
@@ -22035,6 +22118,71 @@ mod tests {
             .await
             .expect_err("still not bob's");
         assert_eq!(err.code, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_steer_stamps_the_acting_principal_not_the_session_owner() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "a-steer",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her session");
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let session_generation = sessions.get_generation("a-steer").await.unwrap();
+        let turn_generation = sessions.register_cancel_token_for_generation_for_test(
+            "a-steer",
+            session_generation,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        sessions.register_steering("a-steer", turn_generation, sender);
+        let result = carol
+            .handle_session_steer(&json!({"session_id": "a-steer", "content": "admin correction"}))
+            .await
+            .expect("the administrator may steer another owner's session");
+        assert_eq!(result["accepted"], json!(true));
+
+        let message = receiver.try_recv().expect("RPC steering was queued");
+        let ingress = message
+            .ingress()
+            .expect("authorized RPC steering has provenance");
+        assert_eq!(message.text(), "admin correction");
+        assert_eq!(ingress.sender.as_deref(), Some("user:carol"));
+        assert_eq!(ingress.transport, Transport::Rpc);
+        assert_eq!(ingress.source_class, SourceClass::External);
+        assert_eq!(ingress.trust, TrustClass::Untrusted);
+        assert_eq!(
+            sessions.session_owner_principal("a-steer").await,
+            Some(Some("user:alice".into()))
+        );
     }
 
     /// Durable owner identity is separate from the administrator bypass: an
@@ -37979,6 +38127,65 @@ mod tests {
         drop(blocked_guard);
     }
 
+    /// Editing agent B's `model_provider` must not queue behind agent A's
+    /// running turn. `handle_session_prompt` holds the session's
+    /// `model_provider_update` guard for the whole turn; if the refresh
+    /// transaction locked every session before checking scope, a config
+    /// edit for an idle agent would stall until an unrelated busy agent
+    /// finished — and the issuing TUI's `config/list` would time out and
+    /// exit (observed 2026-10-07 on the experiment daemon).
+    #[tokio::test]
+    async fn config_set_for_other_agent_does_not_wait_on_busy_session() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let other = config
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+        config.agents.insert(
+            "other-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let dispatcher = make_config_set_test_dispatcher(config);
+        // Only `test-agent` has a live session; it is "mid-turn".
+        let busy_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&busy_session)
+            .await
+            .expect("session update lock exists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_config_set(&json!({
+                "prop": "agents.other-agent.model_provider",
+                "value": "openai.other-provider"
+            })),
+        )
+        .await
+        .expect("editing another agent's provider must not wait on this session's turn")
+        .expect("config/set must succeed");
+
+        // The busy session was out of scope: its provider is untouched.
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "old-model"
+        );
+        drop(busy_guard);
+    }
+
     #[tokio::test]
     async fn model_provider_update_preserves_newer_session_override() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -45098,7 +45305,14 @@ mod tests {
                     zeroclaw_api::grants::Verb::Execute,
                 ],
             );
-        let workspace = config.agent_workspace_dir("test-agent");
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it; the raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), which a scoped
+        // steer refuses.
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, _handles) = scripted_turn_provider();
         install_state_test_session_owned_at(
