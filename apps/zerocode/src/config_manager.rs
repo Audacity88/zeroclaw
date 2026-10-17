@@ -4756,6 +4756,15 @@ impl App {
                 )
             )
     }
+
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        if self.section == ConfigSection::Zerocode {
+            return self.zerocode.claims_session_shortcut(key);
+        }
+        self.wants_text_input()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
+            || crate::keymap::ConfigEditorAction::from_chord(key).is_some()
+    }
 }
 
 fn scalar_edit_display(text: &str, cursor: usize, secret: bool) -> String {
