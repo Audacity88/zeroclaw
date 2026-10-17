@@ -80,6 +80,9 @@ impl DelegateActivityForwarder {
                 if let Some(map) = arguments.as_object_mut() {
                     map.remove("approved");
                 }
+                // The summary redacts only top-level keys; scrub nested
+                // credential keys and inline secrets first.
+                let arguments = crate::agent::turn::redact::scrub_credentials_value(arguments);
                 (
                     id,
                     tool,
@@ -227,6 +230,22 @@ mod tests {
             panic!("expected a finish");
         };
         assert!(output_preview.chars().count() <= OUTPUT_PREVIEW_CHARS + 3);
+    }
+
+    #[test]
+    fn nested_and_inline_credentials_never_reach_the_summary() {
+        let (fwd, mut rx) = forwarder(8);
+        fwd.record_event(&start(
+            Some("c1"),
+            "http_request",
+            r#"{"url":"https://example.com","headers":{"Authorization":"Bearer sk-live-NESTED"},"body":"token=sk-live-INLINE"}"#,
+        ));
+        let DelegateActivityPhase::Started { arguments_summary } = next(&mut rx).phase else {
+            panic!("expected a start");
+        };
+        assert!(arguments_summary.contains("https://example.com"));
+        assert!(!arguments_summary.contains("NESTED"), "{arguments_summary}");
+        assert!(!arguments_summary.contains("INLINE"), "{arguments_summary}");
     }
 
     #[test]
