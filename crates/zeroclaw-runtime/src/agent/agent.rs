@@ -3436,6 +3436,7 @@ impl Agent {
             &no_tools
         };
         let instructions = dispatcher.prompt_instructions(prompt_tools);
+        let hidden_builtin_names = self.tools.hidden_builtin_names();
         // Prompt policy facts come from the same ApprovalManager the
         // execution gate consults (borrowed, render-time). A builder without
         // a manager retains its legacy autonomy fallback but cannot name
@@ -3449,6 +3450,7 @@ impl Agent {
             agent_workspace_dir: &self.agent_workspace_dir,
             model_name: &self.model_name,
             tools: prompt_tools,
+            hidden_builtin_names: Some(&hidden_builtin_names),
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
@@ -7761,6 +7763,599 @@ mod tests {
 
     struct MockTool;
 
+    type RoundRequests = Arc<
+        Mutex<
+            Vec<(
+                zeroclaw_api::model_provider::ToolRoundPolicy,
+                Vec<ChatMessage>,
+            )>,
+        >,
+    >;
+
+    struct RoundPolicyProvider {
+        responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+        requests: RoundRequests,
+        streaming: bool,
+        capable: bool,
+        fail_stream_after_calls: bool,
+    }
+
+    impl RoundPolicyProvider {
+        fn respond(
+            &self,
+            request: ChatRequest<'_>,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> zeroclaw_providers::ChatResponse {
+            self.requests
+                .lock()
+                .push((policy, request.messages.to_vec()));
+            self.responses.lock().remove(0)
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RoundPolicyProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "custom.rounds"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RoundPolicyProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+            self.capable
+        }
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.streaming
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("fixture uses structured requests")
+        }
+
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(self.respond(request, policy))
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt;
+            use zeroclaw_providers::traits::{StreamChunk, StreamEvent};
+            let response = self.respond(request, policy);
+            let mut events = vec![Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                response.text.unwrap_or_default(),
+            )))];
+            events.extend(
+                response
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| Ok(StreamEvent::ToolCall(call))),
+            );
+            events.push(Ok(StreamEvent::Usage(response.usage.unwrap())));
+            if self.fail_stream_after_calls {
+                events.push(Err(zeroclaw_api::model_provider::StreamError::Http(
+                    "fixture disconnect".into(),
+                )));
+            } else {
+                events.push(Ok(StreamEvent::Final));
+            }
+            futures_util::stream::iter(events).boxed()
+        }
+    }
+
+    struct RoundCountingTool(Arc<AtomicUsize>);
+
+    impl zeroclaw_api::attribution::Attributable for RoundCountingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "echo"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RoundCountingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Returns a counted fixture result"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("result-{n}").into(),
+                error: None,
+            })
+        }
+    }
+
+    fn round_response(
+        text: &str,
+        ids: &[&str],
+        input_tokens: u64,
+    ) -> zeroclaw_providers::ChatResponse {
+        zeroclaw_providers::ChatResponse {
+            text: Some(text.into()),
+            tool_calls: ids
+                .iter()
+                .map(|id| zeroclaw_providers::ToolCall {
+                    id: (*id).into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                })
+                .collect(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(5),
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        }
+    }
+
+    fn round_agent(
+        responses: Vec<zeroclaw_providers::ChatResponse>,
+        streaming: bool,
+        capable: bool,
+        opt_in: Option<bool>,
+    ) -> (Agent, RoundRequests, Arc<AtomicUsize>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider: Box<dyn ModelProvider> = Box::new(RoundPolicyProvider {
+            responses: Mutex::new(responses),
+            requests: Arc::clone(&requests),
+            streaming,
+            capable: true,
+            fail_stream_after_calls: false,
+        });
+        let provider: Box<dyn ModelProvider> = if capable {
+            provider
+        } else {
+            // A capable primary cannot promise the policy for an unsupported fallback.
+            Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "rounds",
+                vec![
+                    ("custom.rounds".into(), provider),
+                    (
+                        "custom.unsupported".into(),
+                        Box::new(RoundPolicyProvider {
+                            responses: Mutex::new(vec![]),
+                            requests: Arc::clone(&requests),
+                            streaming,
+                            capable: false,
+                            fail_stream_after_calls: false,
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            ))
+        };
+        let mut agent = blank_input_agent(provider);
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            RoundCountingTool(Arc::clone(&executions)),
+        )]);
+        agent.agent_alias = "round-agent".into();
+        agent.model_provider_name = "custom.rounds".into();
+        agent.model_name = "round-model".into();
+        // The blank builder's resolver still points at its unconfigured provider.
+        agent.set_model_route_resolver(Arc::new(
+            zeroclaw_providers::router::ModelRouteResolver::new(
+                vec![],
+                agent.model_provider_name.clone(),
+                agent.model_name.clone(),
+            ),
+        ));
+        agent.config.resolved.max_tool_iterations = 3;
+        let mut config = Config::default();
+        config.agents.insert(
+            "round-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "interactive".into(),
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "interactive".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                single_tool_rounds: opt_in,
+                ..Default::default()
+            },
+        );
+        agent.provider_switch_config = Some(ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            live_config: None,
+            live: None,
+        });
+        (agent, requests, executions)
+    }
+
+    fn round_cost_context() -> crate::agent::cost::ToolLoopCostTrackingContext {
+        let mut context = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
+        context.model_provider_pricing = Arc::new(HashMap::from([(
+            "custom.rounds".into(),
+            HashMap::from([
+                ("round-model.input".into(), 1.0),
+                ("round-model.output".into(), 2.0),
+            ]),
+        )]));
+        context
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_full_turn_pairs_results_orders_events_and_accounts_usage() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+        for streaming in [false, true] {
+            let (mut agent, requests, executions) = round_agent(
+                vec![
+                    round_response("before-first", &["call-one"], 10),
+                    round_response("after-first", &["call-two"], 20),
+                    round_response("done", &[], 30),
+                ],
+                streaming,
+                true,
+                Some(true),
+            );
+            let cost = round_cost_context();
+            let usage = Arc::clone(&cost.turn_usage);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let (reply, _) = TOOL_LOOP_TURN_USAGE
+                .scope(
+                    Some(Arc::clone(&usage)),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        Some(cost),
+                        agent.turn_streamed("perform two steps", tx, None),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(reply.ends_with("done"));
+            assert_eq!(executions.load(Ordering::SeqCst), 2);
+            let captured = requests.lock();
+            assert_eq!(captured.len(), 3);
+            assert!(
+                captured
+                    .iter()
+                    .all(|(policy, _)| *policy == ToolRoundPolicy::Single)
+            );
+            for (index, id, output) in [(1, "call-one", "result-1"), (2, "call-two", "result-2")] {
+                let messages = &captured[index].1;
+                let result = messages.iter().rfind(|m| m.role == "tool").unwrap();
+                let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                assert_eq!(result["tool_call_id"], id);
+                assert_eq!(result["content"], output);
+                let assistant = messages.iter().rfind(|m| m.role == "assistant").unwrap();
+                let assistant: serde_json::Value =
+                    serde_json::from_str(&assistant.content).unwrap();
+                assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 1);
+                assert_eq!(assistant["tool_calls"][0]["id"], id);
+            }
+            let mut ordered = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    TurnEvent::Chunk { delta } if !delta.is_empty() => {
+                        ordered.push(format!("text:{delta}"))
+                    }
+                    TurnEvent::ToolCall { id, .. } => ordered.push(format!("call:{id}")),
+                    TurnEvent::ToolResult { id, .. } => ordered.push(format!("result:{id}")),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                ordered,
+                [
+                    "text:before-first",
+                    "call:call-one",
+                    "result:call-one",
+                    "text:after-first",
+                    "call:call-two",
+                    "result:call-two",
+                    "text:done"
+                ]
+            );
+            let usage = *usage.lock();
+            assert_eq!((usage.input_tokens, usage.output_tokens), (60, 15));
+            assert!((usage.cost_usd - 0.00009).abs() < 1e-10);
+            let calls = agent
+                .history()
+                .iter()
+                .filter_map(|message| match message {
+                    ConversationMessage::AssistantToolCalls { tool_calls, .. } => Some(tool_calls),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|batch| batch.len() == 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_rpc_transcript_matches_final_renderer_fixture() {
+        let fixture_text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/single-tool-rounds.json"
+        ));
+        // Each published crate is self-contained; workspace tests also pin their copies.
+        let zerocode = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/zerocode");
+        if zerocode.join("Cargo.toml").is_file() {
+            assert_eq!(
+                std::fs::read_to_string(zerocode.join("tests/fixtures/single-tool-rounds.json"))
+                    .unwrap(),
+                fixture_text
+            );
+        }
+        let fixture: serde_json::Value = serde_json::from_str(fixture_text).unwrap();
+        let notice = crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+        assert_eq!(fixture["unsupported_notice"], notice);
+        for streaming in [false, true] {
+            for capable in [true, false] {
+                let (mut agent, _, executions) = round_agent(
+                    vec![
+                        round_response("before-first", &["call-one"], 10),
+                        round_response("after-first", &["call-two"], 20),
+                        round_response("done", &[], 30),
+                    ],
+                    streaming,
+                    capable,
+                    Some(true),
+                );
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed("perform two steps", tx, None)
+                    .await
+                    .unwrap();
+                assert_eq!(executions.load(Ordering::SeqCst), 2);
+                // Only transcript events affect this fixture; usage has separate coverage.
+                let notifications = std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            TurnEvent::Chunk { .. }
+                                | TurnEvent::ToolCall { .. }
+                                | TurnEvent::ToolResult { .. }
+                        )
+                    })
+                    .map(|event| {
+                        let encoded = crate::rpc::dispatch::notification_for_turn_event_for_test(
+                            "sess-1", &event,
+                        )
+                        .unwrap();
+                        serde_json::from_str::<serde_json::Value>(&encoded).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected = fixture["updates"].as_array().unwrap().clone();
+                if !capable {
+                    expected.insert(0, serde_json::json!({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": format!("{notice}\n\n")}
+                    }));
+                }
+                assert_eq!(
+                    notifications, expected,
+                    "streaming={streaming}, capable={capable}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_round_violation_rejects_native_and_normalized_calls_without_history_or_replay()
+     {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+        for streaming in [false, true] {
+            for kind in ["native", "text", "mixed"] {
+                let response = match kind {
+                    "native" => round_response("before-rejection", &["one", "two"], 10),
+                    "mixed" => round_response(
+                        r#"<tool_call>{"name":"echo","arguments":{}}</tool_call><tool_call>{"name":"unknown","arguments":{}}</tool_call>"#,
+                        &[],
+                        10,
+                    ),
+                    _ => round_response(
+                        r#"<tool_call>{"name":"echo","arguments":{}}</tool_call><tool_call>{"name":"echo","arguments":{}}</tool_call>"#,
+                        &[],
+                        10,
+                    ),
+                };
+                let (mut agent, requests, executions) =
+                    round_agent(vec![response], streaming, true, Some(true));
+                let cost = round_cost_context();
+                let usage = Arc::clone(&cost.turn_usage);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let error = TOOL_LOOP_TURN_USAGE
+                    .scope(
+                        Some(Arc::clone(&usage)),
+                        TOOL_LOOP_COST_TRACKING_CONTEXT
+                            .scope(Some(cost), agent.turn_streamed("perform a step", tx, None)),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("multiple tool calls"), "{error}");
+                assert_eq!(requests.lock().len(), 1);
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                assert!(!agent.history().iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { .. }
+                        | ConversationMessage::ToolResults(_)
+                )));
+                let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. }
+                )));
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    TurnEvent::Usage {
+                        accepted: false,
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        ..
+                    }
+                )));
+                let recorded = *usage.lock();
+                assert_eq!((recorded.input_tokens, recorded.output_tokens), (10, 5));
+                assert!((recorded.cost_usd - 0.00002).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_round_violation_before_stream_failure_is_terminal_and_accounted() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
+        for native in [false, true] {
+            let response = if native {
+                round_response("", &["one", "two"], 10)
+            } else {
+                round_response(
+                    r#"<tool_call>{"name":"echo","arguments":{}}</tool_call><tool_call>{"name":"unknown","arguments":{}}</tool_call>"#,
+                    &[],
+                    10,
+                )
+            };
+            let (mut agent, requests, executions) = round_agent(vec![], true, true, Some(true));
+            agent.model_provider = Box::new(RoundPolicyProvider {
+                responses: Mutex::new(vec![response]),
+                requests: Arc::clone(&requests),
+                streaming: true,
+                capable: true,
+                fail_stream_after_calls: true,
+            });
+            let cost = round_cost_context();
+            let usage = Arc::clone(&cost.turn_usage);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let error = TOOL_LOOP_TURN_USAGE
+                .scope(
+                    Some(Arc::clone(&usage)),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .scope(Some(cost), agent.turn_streamed("perform a step", tx, None)),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("multiple tool calls"), "{error}");
+            assert_eq!(requests.lock().len(), 1);
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            assert!(!agent.history().iter().any(|message| matches!(
+                message,
+                ConversationMessage::AssistantToolCalls { .. }
+                    | ConversationMessage::ToolResults(_)
+            )));
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                TurnEvent::Usage {
+                    accepted: false,
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..
+                }
+            )));
+            let recorded = *usage.lock();
+            assert_eq!((recorded.input_tokens, recorded.output_tokens), (10, 5));
+            assert!((recorded.cost_usd - 0.00002).abs() < 1e-10);
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_unsupported_route_is_visible_and_default_batch_is_unchanged() {
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+        for (capable, opt_in) in [(false, Some(true)), (true, None), (true, Some(false))] {
+            let (mut agent, requests, executions) = round_agent(
+                vec![
+                    round_response("batch", &["one", "two"], 10),
+                    round_response("done", &[], 20),
+                ],
+                false,
+                capable,
+                opt_in,
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let (reply, _) = agent
+                .turn_streamed("perform two steps", tx, None)
+                .await
+                .unwrap();
+            assert_eq!(executions.load(Ordering::SeqCst), 2);
+            assert!(
+                requests
+                    .lock()
+                    .iter()
+                    .all(|(policy, _)| *policy == ToolRoundPolicy::Batch)
+            );
+            let notice =
+                crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+            assert_eq!(reply.contains(&notice), opt_in == Some(true));
+            let visible = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(
+                    |event| matches!(event, TurnEvent::Chunk { delta } if delta.contains(&notice)),
+                )
+                .count();
+            assert_eq!(visible, usize::from(opt_in == Some(true)));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_tool_rounds_keep_the_existing_iteration_cap() {
+        let (mut agent, requests, executions) = round_agent(
+            vec![
+                round_response("first", &["one"], 10),
+                round_response("second", &["two"], 20),
+                round_response("unreachable", &[], 30),
+            ],
+            false,
+            true,
+            Some(true),
+        );
+        agent.config.resolved.max_tool_iterations = 2;
+        assert!(agent.turn("perform steps").await.is_err());
+        assert_eq!(requests.lock().len(), 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+    }
+
     #[async_trait]
     impl Tool for MockTool {
         fn name(&self) -> &str {
@@ -8622,6 +9217,7 @@ mod tests {
             responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
             supports_native: bool,
             captured_messages: CapturedTranscripts,
+            captured_tool_specs: Option<Arc<Mutex<Vec<Vec<crate::tools::ToolSpec>>>>>,
         }
 
         #[async_trait]
@@ -8645,6 +9241,11 @@ mod tests {
                 self.captured_messages
                     .lock()
                     .push(request.messages.to_vec());
+                if let Some(specs) = &self.captured_tool_specs {
+                    specs
+                        .lock()
+                        .push(request.tools.unwrap_or_default().to_vec());
+                }
                 let mut guard = self.responses.lock();
                 if guard.is_empty() {
                     return Ok(zeroclaw_providers::ChatResponse {
@@ -8684,9 +9285,316 @@ mod tests {
                     responses: Mutex::new(vec![]),
                     supports_native,
                     captured_messages: Arc::clone(&captured),
+                    captured_tool_specs: None,
                 }),
                 captured,
             )
+        }
+
+        struct DeferredSchemaProbeTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        zeroclaw_api::mock_tool_attribution!(DeferredSchemaProbeTool);
+
+        #[async_trait]
+        impl Tool for DeferredSchemaProbeTool {
+            fn name(&self) -> &str {
+                "builtin_probe"
+            }
+
+            fn description(&self) -> &str {
+                "Probe an admitted built-in.\nFull deferred description sentinel."
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"probe_argument": {"type": "string"}},
+                    "required": ["probe_argument"]
+                })
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                assert_eq!(args["probe_argument"], "selected value");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "deferred probe executed".into(),
+                    error: None,
+                })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum DeferredBuiltinRequestFlow {
+            SearchFirst,
+            Direct,
+            SearchAndExecute,
+        }
+
+        async fn prove_deferred_builtin_provider_requests(
+            supports_native: bool,
+            flow: DeferredBuiltinRequestFlow,
+        ) {
+            use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+            use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+            let workspace = tempfile::TempDir::new().expect("temp workspace");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = DeferredSchemaProbeTool {
+                calls: Arc::clone(&calls),
+            };
+            let probe_spec = probe.spec();
+            let eager_names = [
+                "shell",
+                "file_read",
+                "file_write",
+                "file_edit",
+                "memory_recall",
+                "memory_store",
+            ];
+            let mut raw_tools: Vec<Box<dyn Tool>> = eager_names
+                .iter()
+                .map(|name| Box::new(NamedMockTool::new(name)) as Box<dyn Tool>)
+                .collect();
+            raw_tools.push(Box::new(probe));
+            raw_tools.push(Box::new(NamedMockTool::new("unselected_builtin")));
+
+            let mut config = Config::default();
+            config.runtime_profiles.insert(
+                "deferred-test".into(),
+                RuntimeProfileConfig {
+                    deferred_builtin_tools: true,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                "default".into(),
+                AliasedAgentConfig {
+                    runtime_profile: "deferred-test".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            let security = Arc::new(crate::security::SecurityPolicy::default());
+            let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+                config: &config,
+                agent_alias: "default",
+                security: &security,
+                built: crate::tools::AllToolsResult::from_prebuilt_tools(raw_tools),
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            })
+            .await;
+            let activated = assembled
+                .activated_handle
+                .clone()
+                .expect("schema selection state");
+            let search = assembled.tool_search_handle.clone();
+            let captured: CapturedTranscripts = Arc::new(Mutex::new(Vec::new()));
+            let captured_specs = Arc::new(Mutex::new(Vec::new()));
+            let tool_response = |name: &str, arguments: serde_json::Value| {
+                zeroclaw_providers::ChatResponse {
+                    text: (!supports_native).then(|| {
+                        format!("<tool_call>{{\"name\":\"{name}\",\"arguments\":{arguments}}}</tool_call>")
+                    }),
+                    tool_calls: if supports_native {
+                        vec![zeroclaw_providers::ToolCall {
+                            id: format!("call-{name}"),
+                            name: name.into(),
+                            arguments: arguments.to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    usage: None,
+                    reasoning_content: None,
+                }
+            };
+            let search_response = tool_response(
+                "tool_search",
+                serde_json::json!({"query": "select:builtin_probe"}),
+            );
+            let execute_response = tool_response(
+                "builtin_probe",
+                serde_json::json!({"probe_argument": "selected value"}),
+            );
+            let responses = match flow {
+                DeferredBuiltinRequestFlow::SearchFirst => {
+                    vec![search_response, execute_response]
+                }
+                DeferredBuiltinRequestFlow::Direct => vec![execute_response],
+                DeferredBuiltinRequestFlow::SearchAndExecute => {
+                    assert!(!supports_native, "mixed batch exercises text parsing");
+                    let mut response = search_response;
+                    response.text = Some(format!(
+                        "{}\n{}",
+                        response.text.as_deref().unwrap(),
+                        execute_response.text.as_deref().unwrap()
+                    ));
+                    vec![response]
+                }
+            };
+            let provider = Box::new(CapturingModelProvider {
+                responses: Mutex::new(responses),
+                supports_native,
+                captured_messages: Arc::clone(&captured),
+                captured_tool_specs: Some(Arc::clone(&captured_specs)),
+            });
+            let mut agent = blank_input_agent(provider);
+            agent.workspace_dir = workspace.path().to_path_buf();
+            agent.agent_workspace_dir = workspace.path().to_path_buf();
+            agent.tools = assembled.registry;
+            agent.activated_tools = Some(Arc::clone(&activated));
+            agent.tool_search = search;
+            assert!(agent.tools.hidden_builtin_names().contains("builtin_probe"));
+
+            assert_eq!(
+                agent
+                    .turn("select and run the built-in probe")
+                    .await
+                    .unwrap(),
+                "done"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let requests = captured.lock();
+            let specs = captured_specs.lock();
+            let search_first = matches!(flow, DeferredBuiltinRequestFlow::SearchFirst);
+            let selected = !matches!(flow, DeferredBuiltinRequestFlow::Direct);
+            assert_eq!(
+                agent.tools.hidden_builtin_names().contains("builtin_probe"),
+                !selected
+            );
+            let expected_requests = if search_first { 3 } else { 2 };
+            assert_eq!(requests.len(), expected_requests);
+            assert_eq!(specs.len(), expected_requests);
+            let initial_prompt = &requests[0]
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("provider receives system prompt")
+                .content;
+            assert!(initial_prompt.contains("builtin_probe - Probe an admitted built-in."));
+            assert!(initial_prompt.contains("unselected_builtin - mock"));
+            assert!(!initial_prompt.contains("probe_argument"));
+            assert!(!initial_prompt.contains("Full deferred description sentinel."));
+
+            if supports_native {
+                for name in eager_names.into_iter().chain(["tool_search"]) {
+                    assert!(
+                        specs[0].iter().any(|spec| spec.name == name),
+                        "eager schema {name}"
+                    );
+                }
+                assert!(specs[0].iter().all(|spec| spec.name != "builtin_probe"));
+                for request_specs in &specs[1..] {
+                    if selected {
+                        let selected = request_specs
+                            .iter()
+                            .find(|spec| spec.name == "builtin_probe")
+                            .expect(
+                                "selection exposes the complete native schema on the next request",
+                            );
+                        assert_eq!(selected.parameters, probe_spec.parameters);
+                        assert_eq!(selected.description, probe_spec.description);
+                    } else {
+                        assert!(
+                            request_specs
+                                .iter()
+                                .all(|spec| spec.name != "builtin_probe")
+                        );
+                    }
+                    assert!(
+                        request_specs
+                            .iter()
+                            .all(|spec| spec.name != "unselected_builtin")
+                    );
+                }
+            } else {
+                assert!(
+                    specs.iter().all(Vec::is_empty),
+                    "text providers receive no native specs"
+                );
+                for name in eager_names.into_iter().chain(["tool_search"]) {
+                    assert!(
+                        initial_prompt.contains(&format!("**{name}**")),
+                        "eager text schema {name}"
+                    );
+                }
+                assert!(!initial_prompt.contains("**builtin_probe**"));
+            }
+
+            let after_first_response = requests[1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(after_first_response.contains("<functions>"), selected);
+            assert_eq!(
+                after_first_response.contains("Full deferred description sentinel."),
+                selected
+            );
+            if selected {
+                assert!(after_first_response.contains("probe_argument"));
+            }
+            assert_eq!(
+                after_first_response.contains("deferred probe executed"),
+                !search_first
+            );
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.content.contains("deferred probe executed"))
+            );
+            assert!(
+                activated.lock().unwrap().get("builtin_probe").is_none(),
+                "built-in selection must not create a second executable owner"
+            );
+        }
+
+        #[tokio::test]
+        async fn native_agent_requests_expose_builtin_schema_only_after_selection() {
+            prove_deferred_builtin_provider_requests(true, DeferredBuiltinRequestFlow::SearchFirst)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn text_agent_requests_receive_selected_builtin_schema_before_execution() {
+            prove_deferred_builtin_provider_requests(
+                false,
+                DeferredBuiltinRequestFlow::SearchFirst,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn admitted_hidden_builtin_executes_before_schema_selection() {
+            for supports_native in [true, false] {
+                prove_deferred_builtin_provider_requests(
+                    supports_native,
+                    DeferredBuiltinRequestFlow::Direct,
+                )
+                .await;
+            }
+        }
+
+        #[tokio::test]
+        async fn text_agent_executes_hidden_builtin_in_tool_search_batch() {
+            prove_deferred_builtin_provider_requests(
+                false,
+                DeferredBuiltinRequestFlow::SearchAndExecute,
+            )
+            .await;
         }
 
         #[test]
