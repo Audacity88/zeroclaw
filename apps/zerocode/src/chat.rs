@@ -860,6 +860,31 @@ fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
 
+/// What a `session/steer` call tells the client about delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerOutcome {
+    /// The daemon took the message into the running turn.
+    Accepted,
+    /// The daemon answered and did not take it (refusal or an error reply,
+    /// including an older daemon without the method). Safe to queue.
+    Refused,
+    /// No answer in time. The daemon may still have taken it.
+    Unknown,
+}
+
+impl SteerOutcome {
+    fn from_reply(reply: anyhow::Result<crate::client::SessionSteerResult>) -> Self {
+        match reply {
+            Ok(result) if result.accepted => Self::Accepted,
+            Ok(_) => Self::Refused,
+            Err(error) if crate::client::DaemonRpcTimeout::from_anyhow(&error).is_some() => {
+                Self::Unknown
+            }
+            Err(_) => Self::Refused,
+        }
+    }
+}
+
 impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
@@ -4400,16 +4425,22 @@ impl Chat {
                     // falls back to the queue unchanged.
                     if state.can_steer_running_turn(&prompt, &attachments) {
                         let session_id = state.session_id.clone();
-                        let steered = self
-                            .rpc
-                            .session_steer(&session_id, &prompt)
-                            .await
-                            .is_ok_and(|result| result.accepted);
+                        let outcome = SteerOutcome::from_reply(
+                            self.rpc.session_steer(&session_id, &prompt).await,
+                        );
+                        let steered = outcome == SteerOutcome::Accepted;
                         if let ChatPhase::Active(ref mut state) = self.phase
                             && state.session_id == session_id
                         {
                             if steered {
                                 state.push_steered_user_message(prompt);
+                                return false;
+                            }
+                            if outcome == SteerOutcome::Unknown {
+                                // The daemon may have taken it; queueing would
+                                // risk sending it twice. Hand it back instead.
+                                state.input_bar.insert_text(&prompt);
+                                state.set_info_notice(crate::i18n::t("zc-steer-unconfirmed"));
                                 return false;
                             }
                             let enq = state.enqueue_message(prompt, attachments);
@@ -11937,7 +11968,9 @@ impl ChatState {
     /// sent; the daemon folds it in at that turn's next round boundary.
     pub(crate) fn push_steered_user_message(&mut self, text: String) {
         self.flush_streaming_thought();
-        self.flush_streaming_text();
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
         if self.first_message.is_none() && !text.trim().is_empty() {
             self.first_message = Some(text.clone());
         }
@@ -17817,6 +17850,52 @@ mod tests {
         // The turn's own completion still settles it.
         s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
         assert!(!s.turn_in_flight);
+    }
+
+    #[test]
+    fn a_steer_on_the_last_output_does_not_repeat_the_answer_at_completion() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "the answer".to_string(),
+        });
+        s.push_steered_user_message("also X".into());
+        // No further chunk: the turn ends with its final text.
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Completed,
+            "the answer",
+        ));
+        let answers = s
+            .entries
+            .iter()
+            .filter(
+                |entry| matches!(entry, ChatEntry::AgentMessage(text) if &**text == "the answer"),
+            )
+            .count();
+        assert_eq!(answers, 1, "streamed text must not be appended again");
+    }
+
+    #[test]
+    fn a_steer_timeout_is_not_treated_as_a_refusal() {
+        let timeout = anyhow::Error::new(crate::client::DaemonRpcTimeout {
+            method: "session/steer".to_string(),
+            timeout: std::time::Duration::from_secs(5),
+        });
+        assert_eq!(
+            SteerOutcome::from_reply(Err(timeout)),
+            SteerOutcome::Unknown
+        );
+        let refusal = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: "Unknown method".to_string(),
+            data: None,
+        });
+        assert_eq!(
+            SteerOutcome::from_reply(Err(refusal)),
+            SteerOutcome::Refused
+        );
     }
 
     #[test]
@@ -32018,6 +32097,49 @@ mod tests {
                 "no session/prompt while the turn is still running"
             );
         }
+    }
+
+    /// A steer that times out may still have reached the turn, so it is not
+    /// queued (that could send it twice); the text goes back to the input.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_steer_returns_the_text_to_the_input_instead_of_queueing() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut active = state();
+        active.push_user_message(Some("first".into()), Vec::new());
+        active.input_bar.insert_text("also do X");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+
+        // Never answers: the client's request timeout decides.
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+        let line = rx.try_recv().expect("Enter must send session/steer");
+        assert!(line.contains("session/steer"));
+
+        let state = active_state(&mut chat);
+        assert_eq!(
+            state.queue_len(),
+            0,
+            "an unconfirmed steer must not be queued"
+        );
+        assert_eq!(state.input_bar.input(), "also do X");
+        assert!(rx.try_recv().is_err(), "no session/prompt either");
     }
 
     // Keymap overrides are process-global; retain the existing test lock across

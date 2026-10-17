@@ -163,6 +163,7 @@ zc-queue-paused-ghost = キューは一時停止中 — { $key } を押すかメ
 zc-queue-missing-completion-ghost = 完了は未確認。{ $key } または送信で再開。
 zc-queue-item-injected = （即時送信）
 zc-queue-resumed = キューを再開しました。
+zc-steer-unconfirmed = ターンへの送信を確認できませんでした。メッセージを入力欄に戻しました。もう一度送るとキューに入ります。
 zc-queue-clear-empty = キューはすでに空です。
 zc-queue-cleared-all = { $count } 件のキュー済みメッセージをクリアしました。
 zc-queue-cleared-one = キュー済みメッセージ { $index } をクリアしました。

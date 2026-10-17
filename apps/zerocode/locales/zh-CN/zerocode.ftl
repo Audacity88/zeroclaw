@@ -163,6 +163,7 @@ zc-queue-paused-ghost = 队列已暂停 — 按 { $key } 或发送消息以恢�
 zc-queue-missing-completion-ghost = 完成未确认。{ $key } 或发送消息恢复队列。
 zc-queue-item-injected = （插入）
 zc-queue-resumed = 队列已恢复。
+zc-steer-unconfirmed = 未确认已送入当前轮次；消息已放回输入框。再次发送即可加入队列。
 zc-queue-clear-empty = 队列已经为空。
 zc-queue-cleared-all = 已清除 { $count } 条排队消息。
 zc-queue-cleared-one = 已清除排队消息 { $index }。
