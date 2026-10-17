@@ -8593,6 +8593,24 @@ fn render_tool_entry_with_diff(
             display_limited |=
                 render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
         }
+    } else if let Some(res) = result
+        && matches!(name, "ask_user" | "poll")
+        && !res.starts_with("Error")
+    {
+        // The outcome of a question stands out like the answer line it
+        // replaced: the pick in yellow, or only the DISMISSED marker.
+        let res = preview(res, 200);
+        let answer = theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod);
+        let dim = theme::dim_style().add_modifier(sel_mod);
+        let (marked, rest) = match res.strip_prefix("DISMISSED") {
+            Some(rest) => ("DISMISSED", rest),
+            None => (res.as_str(), ""),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  result: ", dim),
+            Span::styled(marked.to_string(), answer),
+            Span::styled(rest.to_string(), dim),
+        ]));
     } else if let Some(res) = result {
         let summary = if name == "file_write" {
             file_write_result_summary(res, input_json)
