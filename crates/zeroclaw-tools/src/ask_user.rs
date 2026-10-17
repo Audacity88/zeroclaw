@@ -18,9 +18,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 /// Result when a structured-only channel returns no choice: the user closed
 /// the prompt without picking (or, rarely, the client cannot show choices).
-const DISMISSED_OUTPUT: &str = "DISMISSED: the user closed the question without choosing. \
-     Do not ask the same question again unless the user asks you to. \
-     (If the user says they never saw it, their client cannot show choices.)";
+const DISMISSED_OUTPUT: &str = "DISMISSED: the user closed the question without choosing.";
 
 /// Agent-callable tool for sending a question to a user and waiting for their response.
 pub struct AskUserTool {
@@ -199,9 +197,8 @@ impl Tool for AskUserTool {
         // hangs until timeout or returns a misleading "channel closed" error.
         // There `Ok(None)` is almost always the user dismissing the prompt,
         // which is an answer, not a tool failure: report it as a successful
-        // "no answer" so the card does not show an error and the agent does
-        // not re-ask. A client with no form support lands here too; the
-        // output names that case so the agent can tell the user.
+        // "no answer" so the card does not show an error and the agent is not
+        // told to retry.
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
