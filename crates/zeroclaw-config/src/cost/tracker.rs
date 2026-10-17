@@ -453,14 +453,21 @@ impl CostTracker {
     /// checked in, immediately when it already is. A turn waiting on its
     /// own override prompt races this so an approval in another session
     /// releases it. The watch only wakes the waiter; the decision reads the
-    /// current overrides, so a stale published value cannot strand it.
+    /// current overrides, so a stale published value cannot strand it. The
+    /// read happens with no watch borrow held: a grant holds the state lock
+    /// while it publishes, so reading it from inside a `wait_for` predicate
+    /// (which holds the watch's read lock) could deadlock against it.
     pub async fn wait_for_offer_granted(&self, offer: &OverrideOffer) {
+        // Subscribe before the first read: a grant after the read then
+        // still marks the receiver changed.
         let mut rx = self.overrides.granted.subscribe();
-        // The sender lives as long as the tracker, which this borrow holds,
-        // so `wait_for` cannot fail with a closed channel.
-        let _ = rx
-            .wait_for(|_| self.overrides.get().covers(offer.period, offer.at))
-            .await;
+        while !self.overrides.get().covers(offer.period, offer.at) {
+            // The sender lives as long as the tracker, which this borrow
+            // holds, so `changed` cannot fail with a closed channel.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     fn config_snapshot(&self) -> CostConfig {
@@ -4140,6 +4147,45 @@ mod tests {
         )
         .await
         .expect("an existing grant must release the waiter");
+    }
+
+    /// A grant racing a waiter must not deadlock: the waiter must never
+    /// hold the watch's read lock while taking the override state lock
+    /// that a grant holds while it publishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_grant_racing_a_waiter_does_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = Arc::new(over_daily_limit(tmp.path(), true));
+        let first = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for offset in 0..2000 {
+            let day = first + Duration::days(offset);
+            let at = ReportingPeriod {
+                day,
+                year: day.year(),
+                month: day.month(),
+            };
+            let offer = OverrideOffer {
+                current_usd: 2.0,
+                limit_usd: 1.0,
+                period: UsagePeriod::Day,
+                at,
+            };
+            let waiter = Arc::clone(&tracker);
+            let waiting =
+                ::zeroclaw_spawn::spawn!(
+                    async move { waiter.wait_for_offer_granted(&offer).await }
+                );
+            let granter = Arc::clone(&tracker);
+            let granting = tokio::task::spawn_blocking(move || {
+                granter.grant_override_at_period(UsagePeriod::Day, at)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                assert!(granting.await.unwrap());
+                waiting.await.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("grant and waiter deadlocked at iteration {offset}"));
+        }
     }
 
     /// A delegate's per-hop ceiling tightens the shared daily check and
