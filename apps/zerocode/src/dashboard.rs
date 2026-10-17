@@ -146,6 +146,9 @@ pub(crate) struct Dashboard {
     cron_state: ListState,
     health_scroll: u16,
     cost_scroll: u16,
+    /// First visible row of the Overview status box when it is taller than
+    /// the space it gets; clamped on every draw.
+    overview_scroll: u16,
     // Detail pane
     detail_open: bool,
     detail_scroll: u16,
@@ -161,6 +164,7 @@ pub(crate) struct Dashboard {
     tab_area: Rect,
     list_area: Rect,
     overview_agents_area: Rect,
+    overview_status_area: Rect,
     agent_alias_rename_area: Option<Rect>,
     detail_area: Option<Rect>,
     double_click: mouse::DoubleClickTracker,
@@ -205,6 +209,7 @@ impl Dashboard {
             cron_state: ListState::default(),
             health_scroll: 0,
             cost_scroll: 0,
+            overview_scroll: 0,
             detail_open: false,
             detail_scroll: 0,
             detail_pct: 50,
@@ -217,6 +222,7 @@ impl Dashboard {
             tab_area: Rect::default(),
             list_area: Rect::default(),
             overview_agents_area: Rect::default(),
+            overview_status_area: Rect::default(),
             agent_alias_rename_area: None,
             detail_area: None,
             double_click: mouse::DoubleClickTracker::new(),
@@ -630,15 +636,27 @@ impl Dashboard {
                 &self.agents,
             )
         });
-        let status_height = status_lines.as_ref().map_or(1, Vec::len).saturating_add(2) as u16;
+        let line_count =
+            u16::try_from(status_lines.as_ref().map_or(1, Vec::len)).unwrap_or(u16::MAX);
+        // The status box comes first. On a short terminal it keeps all but
+        // three rows (the Agents box's borders and one agent) and scrolls
+        // instead of pushing its lower rows out of reach.
+        let status_height = line_count
+            .saturating_add(2)
+            .min(area.height.saturating_sub(3).max(3));
+        let agents_height =
+            (4 + self.agents.len() as u16).min(area.height.saturating_sub(status_height));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(status_height),                // status box
-                Constraint::Length(4 + self.agents.len() as u16), // agents
-                Constraint::Min(0),                               // connected TUIs
+                Constraint::Length(status_height), // status box
+                Constraint::Length(agents_height), // agents
+                Constraint::Min(0),                // connected TUIs
             ])
             .split(area);
+        let max_scroll = line_count.saturating_sub(status_height.saturating_sub(2));
+        self.overview_scroll = self.overview_scroll.min(max_scroll);
+        self.overview_status_area = chunks[0];
 
         // Status box
         let status_block = Block::default()
@@ -649,7 +667,10 @@ impl Dashboard {
         frame.render_widget(status_block, chunks[0]);
 
         if let Some(lines) = status_lines {
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(
+                Paragraph::new(lines).scroll((self.overview_scroll, 0)),
+                inner,
+            );
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -2084,6 +2105,15 @@ impl Dashboard {
                 }
                 _ => {}
             },
+            Tab::Overview => match action {
+                Some(DashboardTabAction::Down) => {
+                    self.overview_scroll = self.overview_scroll.saturating_add(1);
+                }
+                Some(DashboardTabAction::Up) => {
+                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                }
+                _ => {}
+            },
             _ => {}
         }
 
@@ -2454,7 +2484,14 @@ impl Dashboard {
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(evt.kind, MouseEventKind::ScrollUp);
-                if mouse::in_rect(col, row, self.list_area) {
+                if self.tab == Tab::Overview && mouse::in_rect(col, row, self.overview_status_area)
+                {
+                    self.overview_scroll = if up {
+                        self.overview_scroll.saturating_sub(3)
+                    } else {
+                        self.overview_scroll.saturating_add(3)
+                    };
+                } else if mouse::in_rect(col, row, self.list_area) {
                     let count = self.active_list_count();
                     let state = self.active_list_state_mut();
                     let i = state.selected().unwrap_or(0);
@@ -2499,6 +2536,7 @@ impl Dashboard {
         self.detail_scroll = 0;
         self.health_scroll = 0;
         self.cost_scroll = 0;
+        self.overview_scroll = 0;
         self.cron_runs.clear();
         self.cron_runs_job_id = None;
         self.cron_runs_error = None;
@@ -2676,7 +2714,10 @@ impl crate::widgets::HelpContext for Dashboard {
         let mut entries = tab_nav;
         match self.tab {
             Tab::Overview | Tab::Health | Tab::Cost => {
-                // Read-only display tabs — no list, no detail, no search.
+                // Read-only display tabs — no list, no detail, no search;
+                // Up/Down scroll the content.
+                entries.push(E::spacer());
+                entries.extend(entries_for(vec![D::Up, D::Down]));
             }
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron => {
                 entries.push(E::spacer());
@@ -3649,6 +3690,101 @@ mod tests {
         assert!(dashboard.agents.is_empty());
         assert!(!dashboard.sessions_loaded);
         assert!(!dashboard.detail_open);
+    }
+
+    #[tokio::test]
+    async fn overview_status_scrolls_to_its_last_row_on_a_short_terminal() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        for alias in ["coder", "support", "reviewer"] {
+            dashboard.agents.push(AgentStatusEntry {
+                alias: alias.to_string(),
+                enabled: true,
+                live_sessions: 1,
+                persisted_sessions: 1,
+                channels: Vec::new(),
+                runtime_profile: Some("fast".to_string()),
+            });
+        }
+        let status = status_fixture();
+        let health = serde_json::json!({"components": {"a": {"status": "ok"}}});
+        let code = FocusedRuntimeContext {
+            agent_alias: "coder",
+            model_provider_ref: Some("anthropic.code"),
+            model: Some("claude-code"),
+            queued_messages: 2,
+            queue_paused: false,
+        };
+        let chat = FocusedRuntimeContext {
+            agent_alias: "support",
+            model_provider_ref: Some("openai.chat"),
+            model: Some("gpt-chat"),
+            queued_messages: 1,
+            queue_paused: true,
+        };
+        let sessions = vec![
+            (TurnStatus::Working, "coder".to_string()),
+            (TurnStatus::Idle, "support".to_string()),
+            (TurnStatus::Idle, "reviewer".to_string()),
+        ];
+        // 80x24 terminal: the mode bar, status bar and the dashboard's own
+        // tab, status and footer rows leave 19 rows for Overview.
+        let mut terminal = Terminal::new(TestBackend::new(80, 19)).unwrap();
+        let health_label = crate::i18n::t("zc-dashboard-label-health");
+        let mut draw = |dashboard: &mut Dashboard| {
+            terminal
+                .draw(|frame| {
+                    dashboard.draw_overview(
+                        frame,
+                        frame.area(),
+                        Some(&status),
+                        Some(&health),
+                        Some("/work/code"),
+                        Some("/work/chat"),
+                        Some(code),
+                        Some(chat),
+                        &sessions,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let first = draw(&mut dashboard);
+        assert!(
+            !first.contains(&health_label),
+            "fixture must overflow the status box: {first}"
+        );
+        assert!(
+            first.contains(" Agents "),
+            "agents box keeps a row: {first}"
+        );
+
+        for _ in 0..40 {
+            dashboard.overview_scroll = dashboard.overview_scroll.saturating_add(1);
+        }
+        let scrolled = draw(&mut dashboard);
+        assert!(
+            scrolled.contains(&health_label),
+            "scrolling reaches the last status rows: {scrolled}"
+        );
+        assert!(
+            dashboard.overview_scroll < 40,
+            "scroll is clamped to the content"
+        );
     }
 
     fn lines_text(lines: &[Line<'static>]) -> String {
