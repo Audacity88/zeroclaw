@@ -14,6 +14,7 @@ use zeroclaw_api::attribution::{Attributable, ToolProvenance};
 use zeroclaw_api::local_file_diff::{
     LOCAL_FILE_DIFF_CAPTURE, LOCAL_FILE_DIFFS_ALLOWED, LocalFileDiffCapture,
 };
+use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -325,19 +326,10 @@ pub(crate) async fn execute_one_tool(
 
     let local_file_diff_capture = may_capture_local_file_diff(tool, dispatch, event_tx.is_some())
         .then(LocalFileDiffCapture::new);
-    let tool_future = tool
-        .execute(call_arguments.clone())
+    let context = ToolExecutionContext::new(cancellation_token.cloned());
+    let execute = context
+        .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());
-    let execute = async {
-        if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
-            }
-        } else {
-            Ok(tool_future.await)
-        }
-    };
     let tool_result = LOCAL_FILE_DIFF_CAPTURE
         .scope(local_file_diff_capture.clone(), async {
             if let Some(model_switch_callback) = dispatch.model_switch_callback {
@@ -346,7 +338,13 @@ pub(crate) async fn execute_one_tool(
                 execute.await
             }
         })
-        .await?;
+        .await;
+    if tool_result
+        .as_ref()
+        .is_err_and(|error| error.is::<ToolExecutionCancelled>())
+    {
+        return Err(ToolLoopCancelled.into());
+    }
 
     let outcome = {
         let _result_guard = tool_span.entered();
@@ -722,15 +720,19 @@ pub(crate) async fn execute_tools_sequential(
 #[cfg(test)]
 mod tests {
     use super::{
-        Observer, ObserverEvent, ToolDispatchContext, execute_one_tool, resolved_tool_provenance,
+        Observer, ObserverEvent, ToolDispatchContext, ToolExecutionOutcome, TurnMeta,
+        execute_one_tool, is_tool_loop_cancelled, resolved_tool_provenance,
     };
     use crate::observability::noop::NoopObserver;
     use crate::observability::traits::ObserverMetric;
     use crate::tools::ActivatedToolSet;
+    use anyhow::Result;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use zeroclaw_api::tool::Tool;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::tool::{Tool, ToolExecutionContext};
 
     #[tokio::test]
     async fn local_file_diff_executor_requires_live_native_read_admission() {
@@ -2902,5 +2904,300 @@ mod tests {
                 _ => panic!("expected an empty Plan event (clear)"),
             }
         }
+    }
+
+    struct TurnTokenProbe {
+        saw_turn_token: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnTokenProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-turn-token-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TurnTokenProbe {
+        fn name(&self) -> &str {
+            "turn_token_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the running turn's cancellation token is visible"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.saw_turn_token.lock().unwrap() = Some(
+                ToolExecutionContext::current()
+                    .and_then(|context| context.cancellation_token().cloned())
+                    .is_some(),
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_turn_token(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
+        let saw = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(TurnTokenProbe {
+            saw_turn_token: Arc::clone(&saw),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let outcome = execute_one_tool(
+            "turn_token_probe",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            token,
+            None,
+            None,
+        )
+        .await
+        .expect("probe executes");
+        assert!(outcome.success);
+        let seen = saw.lock().unwrap();
+        seen.expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_running_turn_token_only_while_the_turn_runs_with_one() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(probe_turn_token(Some(&token)).await);
+        assert!(!probe_turn_token(None).await);
+        assert!(
+            ToolExecutionContext::current().is_none(),
+            "the token must not leak past the tool execution"
+        );
+    }
+
+    async fn execute_context_test_tool(
+        name: &str,
+        args: serde_json::Value,
+        tools: Vec<Box<dyn Tool>>,
+        token: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome> {
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+            channel_name: "test",
+        };
+        execute_one_tool(
+            name,
+            args,
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            Some(token),
+            None,
+            None,
+        )
+        .await
+    }
+
+    struct ContextChildProbe {
+        started: Arc<tokio::sync::Notify>,
+        child: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextChildProbe);
+
+    #[async_trait]
+    impl Tool for ContextChildProbe {
+        fn name(&self) -> &str {
+            "context_child_probe"
+        }
+        fn description(&self) -> &str {
+            "Starts token-bound child work"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            anyhow::bail!("context-aware entrypoint required")
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            assert_eq!(args["scope"], "fixed");
+            let token = context
+                .cancellation_token()
+                .expect("turn token")
+                .child_token();
+            *self.child.lock().unwrap() = Some(zeroclaw_spawn::spawn!(async move {
+                token.cancelled().await;
+            }));
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_context_dispatch_cancels_child_after_wrapper_future_is_dropped() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let child = Arc::new(Mutex::new(None));
+        let probe: Arc<dyn Tool> = Arc::new(ContextChildProbe {
+            started: Arc::clone(&started),
+            child: Arc::clone(&child),
+        });
+        let skill = crate::skills::SkillTool {
+            name: "child".into(),
+            description: "Context child".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: Default::default(),
+            target: Some("context_child_probe".into()),
+            locked_args: Default::default(),
+            timeout_secs: None,
+        };
+        let wrapped: Arc<dyn Tool> = Arc::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+            "context",
+            &skill,
+            probe,
+            std::collections::HashMap::from([("scope".into(), "fixed".into())]),
+        ));
+        let name = wrapped.name().to_string();
+        let token = CancellationToken::new();
+        let turn = token.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            execute_context_test_tool(
+                &name,
+                serde_json::json!({"scope": "model override"}),
+                vec![Box::new(crate::tools::ArcToolRef(wrapped))],
+                &turn,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(is_tool_loop_cancelled(
+            &outcome.err().expect("cancelled dispatch")
+        ));
+        let child = child.lock().unwrap().take().expect("child was started");
+        tokio::time::timeout(Duration::from_secs(3), child)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_context_dispatch_cancellation_stops_shell_process_group() {
+        use crate::platform::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let shell = crate::tools::shell::ShellTool::new(security, Arc::new(NativeRuntime::new()));
+        let token = CancellationToken::new();
+        let turn = token.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            execute_context_test_tool(
+                "shell",
+                serde_json::json!({"command": "sleep 30 & echo $! > child.pid; wait"}),
+                vec![Box::new(shell)],
+                &turn,
+            )
+            .await
+        });
+        let pid_path = workspace.path().join("child.pid");
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_path).await
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell child started");
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(is_tool_loop_cancelled(
+            &outcome.err().expect("cancelled dispatch")
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // SAFETY: signal zero probes this fixture's child PID without sending a signal.
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                #[cfg(target_os = "linux")]
+                if tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .await
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(") ")
+                            .map(|(_, tail)| tail.starts_with('Z'))
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled shell child stopped");
     }
 }
