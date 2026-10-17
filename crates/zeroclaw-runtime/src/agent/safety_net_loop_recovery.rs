@@ -9,7 +9,8 @@ type Requests = Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>;
 struct RecordingProvider {
     scripted: ScriptedProvider,
     requests: Requests,
-    steering: Option<mpsc::Sender<crate::agent::SteeringInput>>,
+    /// Queues one steering message while serving this 1-based request.
+    steering: Option<(mpsc::Sender<crate::agent::SteeringInput>, usize)>,
 }
 
 impl zeroclaw_api::attribution::Attributable for RecordingProvider {
@@ -41,12 +42,14 @@ impl ModelProvider for RecordingProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        let first_request = {
+        let request_number = {
             let mut requests = self.requests.lock();
             requests.push(request.messages.to_vec());
-            requests.len() == 1
+            requests.len()
         };
-        if first_request && let Some(steering) = &self.steering {
+        if let Some((steering, steer_at)) = &self.steering
+            && request_number == *steer_at
+        {
             steering
                 .send("continue working".into())
                 .await
@@ -116,7 +119,7 @@ fn agent_for_with_steering(
     responses: Vec<ChatResponse>,
     tool: OutcomeTool,
     pacing: Option<zeroclaw_config::schema::PacingConfig>,
-    steering: Option<mpsc::Sender<crate::agent::SteeringInput>>,
+    steering: Option<(mpsc::Sender<crate::agent::SteeringInput>, usize)>,
 ) -> (TestAgent, Requests) {
     let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let mut agent = build_agent(
@@ -520,11 +523,13 @@ async fn hook_approval_and_unavailable_results_do_not_count_as_executed_failures
 async fn streaming_exhaustion_is_terminal_despite_queued_steering() {
     let calls = Arc::new(AtomicUsize::new(0));
     let (steer_tx, mut steer_rx) = mpsc::channel(4);
+    // Queued while the final identical retry is in flight, so it is
+    // pending when that retry exhausts recovery.
     let (mut agent, requests) = agent_for_with_steering(
         script(8),
         failing(&calls),
         Some(Default::default()),
-        Some(steer_tx),
+        Some((steer_tx, 4)),
     );
     let (tx, _rx) = mpsc::channel(256);
     let result = agent
@@ -551,20 +556,31 @@ async fn streaming_exhaustion_is_terminal_despite_queued_steering() {
 async fn steering_reentry_preserves_advisory_and_failed_recovery_evidence() {
     for success in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut responses = script(3);
-        responses.push(text_response("first round complete"));
-        responses.extend(script(3));
-        responses.push(text_response("second round complete"));
+        let mut responses = script(6);
+        responses.push(text_response("done"));
         let mut tool = failing(&calls);
         tool.success = success;
+        // Queued during the third identical call: the loop yields after that
+        // round with the advisory or correction already issued, and the
+        // Agent reenters the loop with the steering message.
         let (steer_tx, mut steer_rx) = mpsc::channel(4);
-        let (mut agent, requests) =
-            agent_for_with_steering(responses, tool, Some(Default::default()), Some(steer_tx));
+        let (mut agent, requests) = agent_for_with_steering(
+            responses,
+            tool,
+            Some(Default::default()),
+            Some((steer_tx, 3)),
+        );
         let (tx, _rx) = mpsc::channel(256);
         let result = agent
             .turn_streamed_with_steering_state("fetch it", tx, None, Some(&mut steer_rx))
             .await
             .expect("steered turn completes");
+        assert!(
+            requests.lock()[3]
+                .iter()
+                .any(|message| message.content.contains("continue working")),
+            "steering reentered before the fourth request"
+        );
         if success {
             assert_eq!(calls.load(Ordering::SeqCst), 6);
             let advisory = crate::i18n::get_required_cli_string("turn-repeated-success-advisory");
@@ -573,7 +589,7 @@ async fn steering_reentry_preserves_advisory_and_failed_recovery_evidence() {
                 1,
                 "one advisory for the API turn"
             );
-            assert_eq!(requests.lock().len(), 8);
+            assert_eq!(requests.lock().len(), 7);
         } else {
             assert_eq!(
                 calls.load(Ordering::SeqCst),
@@ -587,7 +603,7 @@ async fn steering_reentry_preserves_advisory_and_failed_recovery_evidence() {
                         "turn-repeated-failure-exhausted"
                     ))
             );
-            assert_eq!(requests.lock().len(), 5);
+            assert_eq!(requests.lock().len(), 4);
         }
     }
 }
