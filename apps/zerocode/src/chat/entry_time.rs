@@ -2,6 +2,8 @@
 //! follows a gap or a day change, and a footer after a turn that ran long.
 //! Individual messages carry no time on screen.
 
+use std::ops::Range;
+
 use chrono::{DateTime, Local, NaiveDate, TimeDelta};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -45,22 +47,63 @@ pub(super) struct TimeMarks {
     pub footer: Option<(DateTime<Local>, DateTime<Local>)>,
 }
 
-/// Decide dividers and footers for a transcript. `is_user[i]` marks the
-/// entries that start a turn.
+/// Decide dividers and footers for a whole transcript. `is_user[i]` marks
+/// the entries that start a turn.
+#[cfg(test)]
 pub(super) fn time_marks(is_user: &[bool], stamps: &[EntryStamp]) -> Vec<TimeMarks> {
+    time_marks_in(
+        |index| is_user[index],
+        is_user.len(),
+        stamps,
+        0..is_user.len(),
+    )
+}
+
+/// Decide dividers and footers for the entries in `window` only; the result
+/// is indexed from `window.start`. `is_user(i)` marks the entries that start
+/// a turn. Reads outside the window only as far as the window's marks need:
+/// back to the start of the turn before the window's first turn (the previous
+/// activity a divider compares against), and forward to the end of the
+/// window's last turn (where its footer lands). The cost follows the window,
+/// not the transcript.
+pub(super) fn time_marks_in(
+    is_user: impl Fn(usize) -> bool,
+    len: usize,
+    stamps: &[EntryStamp],
+    window: Range<usize>,
+) -> Vec<TimeMarks> {
     let stamp = |index: usize| stamps.get(index).copied().unwrap_or_default();
-    let mut marks = vec![TimeMarks::default(); is_user.len()];
+    let window_end = window.end.min(len);
+    let window_start = window.start.min(window_end);
+    let mut marks = vec![TimeMarks::default(); window_end - window_start];
+    let mark_at = |index: usize| {
+        (window_start..window_end)
+            .contains(&index)
+            .then(|| index - window_start)
+    };
+    let turn_before = |index: usize| (0..index).rev().find(|&i| is_user(i));
+
+    // The turn the window opens in, and the one before it.
+    let scan_start = if window_start < len && is_user(window_start) {
+        window_start
+    } else {
+        turn_before(window_start).unwrap_or(0)
+    };
+    let seed_start = turn_before(scan_start).unwrap_or(0);
 
     let mut latest: Option<DateTime<Local>> = None;
-    for (index, &user) in is_user.iter().enumerate() {
+    for index in seed_start..window_end {
         let at = stamp(index).at;
-        if user && let Some(at) = at {
+        if index >= scan_start
+            && is_user(index)
+            && let Some(at) = at
+        {
             let show = latest.is_none_or(|previous| {
                 previous.date_naive() != at.date_naive()
                     || (at - previous).num_seconds() >= DIVIDER_GAP_SECS
             });
-            if show {
-                marks[index].divider = Some(at);
+            if show && let Some(slot) = mark_at(index) {
+                marks[slot].divider = Some(at);
             }
         }
         if let Some(at) = at {
@@ -68,15 +111,15 @@ pub(super) fn time_marks(is_user: &[bool], stamps: &[EntryStamp]) -> Vec<TimeMar
         }
     }
 
-    let mut start_index = 0;
-    while start_index < is_user.len() {
-        if !is_user[start_index] {
+    let mut start_index = scan_start;
+    while start_index < window_end {
+        if !is_user(start_index) {
             start_index += 1;
             continue;
         }
         let mut next = start_index + 1;
         let mut end_index = None;
-        while next < is_user.len() && !is_user[next] {
+        while next < len && !is_user(next) {
             if stamp(next).ends_turn != TurnEnd::No {
                 end_index = Some(next);
             }
@@ -85,8 +128,9 @@ pub(super) fn time_marks(is_user: &[bool], stamps: &[EntryStamp]) -> Vec<TimeMar
         if let (Some(start), Some(end_index)) = (stamp(start_index).at, end_index)
             && let Some(end) = stamp(end_index).at
             && shows_footer(start, end)
+            && let Some(slot) = mark_at(end_index)
         {
-            marks[end_index].footer = Some((start, end));
+            marks[slot].footer = Some((start, end));
         }
         start_index = next;
     }
@@ -283,6 +327,39 @@ mod tests {
         assert_eq!(footers[4], None, "a 30-second turn gets no footer");
         assert_eq!(footers[6], None, "a running turn gets no footer");
         assert_eq!(footers.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn windowed_marks_match_the_whole_transcript() {
+        // Gap dividers, a day change and footers, some turns with tool rows,
+        // so windows open and close mid-turn.
+        let is_user = [
+            true, false, false, true, false, true, false, false, false, true, false, true, false,
+        ];
+        let stamps = [
+            stamp(local(8, 22, 0, 0)),
+            stamp(local(8, 22, 10, 0)),
+            ending(local(8, 22, 30, 0)),
+            stamp(local(8, 22, 32, 0)),
+            ending(local(8, 22, 32, 20)),
+            stamp(local(8, 23, 10, 0)),
+            stamp(local(8, 23, 11, 0)),
+            stamp(local(8, 23, 20, 0)),
+            ending(local(8, 23, 40, 0)),
+            stamp(local(8, 23, 50, 0)),
+            ending(local(8, 23, 52, 0)),
+            stamp(local(9, 0, 1, 0)),
+            ending(local(9, 0, 1, 10)),
+        ];
+        let whole = time_marks(&is_user, &stamps);
+        assert!(whole.iter().any(|mark| mark.divider.is_some()));
+        assert!(whole.iter().any(|mark| mark.footer.is_some()));
+        for start in 0..=is_user.len() {
+            for end in start..=is_user.len() {
+                let window = time_marks_in(|i| is_user[i], is_user.len(), &stamps, start..end);
+                assert_eq!(window, whole[start..end], "window {start}..{end}");
+            }
+        }
     }
 
     #[test]

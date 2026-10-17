@@ -7835,6 +7835,8 @@ fn render_conversation(
     // depend on it, and a width change invalidates cached layouts.
     let inner_width = area.width.saturating_sub(2);
 
+    state.refresh_labels_day(chrono::Local::now().date_naive());
+
     // ── Rebuild cached lines only when entries changed ────────
     if state.transcript_layout.view().dirty != LinesDirty::Clean
         || state.transcript_layout.view().cached_render_width != inner_width
@@ -9698,6 +9700,9 @@ pub struct ChatState {
     /// "no time" for the tail. Kept in step by `push_entry*`, `remove_entry`
     /// and `clear_entries`.
     entry_times: Vec<entry_time::EntryStamp>,
+    /// The local date the cached divider and footer labels were rendered
+    /// against ("Today", "Yesterday"); a new day forces a full rebuild.
+    labels_day: Option<chrono::NaiveDate>,
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
@@ -9869,6 +9874,7 @@ impl ChatState {
             active_turn_attachments: Vec::new(),
             entries: Vec::new(),
             entry_times: Vec::new(),
+            labels_day: None,
             streaming_text: String::new(),
             streaming_thought: String::new(),
             pending_approval: None,
@@ -10808,7 +10814,20 @@ impl ChatState {
         out
     }
 
+    /// Cached time labels say "Today" or "Yesterday" relative to the day they
+    /// were rendered; once the local date moves on, rebuild them all.
+    fn refresh_labels_day(&mut self, today: chrono::NaiveDate) {
+        if self.labels_day.is_some_and(|day| day != today) {
+            self.mark_dirty_full();
+        }
+    }
+
     fn rebuild_lines(&mut self, width: u16) {
+        self.rebuild_lines_on(width, chrono::Local::now().date_naive());
+    }
+
+    fn rebuild_lines_on(&mut self, width: u16, today: chrono::NaiveDate) {
+        self.labels_day = Some(today);
         if self.transcript_layout.view().cached_render_width != width {
             self.pending_url_activation = None;
         }
@@ -10822,13 +10841,13 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
-        let today = chrono::Local::now().date_naive();
-        let is_user: Vec<bool> = self
-            .entries
-            .iter()
-            .map(|entry| matches!(entry, ChatEntry::UserMessage { .. }))
-            .collect();
-        let marks = entry_time::time_marks(&is_user, &self.entry_times);
+        let entries = &self.entries;
+        let marks = entry_time::time_marks_in(
+            |index| matches!(entries[index], ChatEntry::UserMessage { .. }),
+            entries.len(),
+            &self.entry_times,
+            range.clone(),
+        );
         let inputs =
             self.entries[range.clone()]
                 .iter()
@@ -10853,10 +10872,10 @@ impl ChatState {
                     EntryLayoutInput {
                         index,
                         entry,
-                        divider: marks[index]
+                        divider: marks[relative_index]
                             .divider
                             .map(|at| entry_time::divider_label(&at, today)),
-                        footer: marks[index]
+                        footer: marks[relative_index]
                             .footer
                             .map(|(start, end)| entry_time::footer_label(&start, &end, today)),
                         highlighted,
@@ -12864,6 +12883,49 @@ mod tests {
             created_at: Some(at),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn day_labels_rebuild_when_the_local_date_changes() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "evening ask", today_at(1, 0, 0)),
+                timed("assistant", "answer", today_at(1, 0, 5)),
+            ],
+            true,
+        );
+        let today = chrono::Local::now().date_naive();
+        s.rebuild_lines_on(80, today);
+        assert!(
+            transcript_text(&s)
+                .iter()
+                .any(|line| line.trim() == "── Today 01:00 ──")
+        );
+        assert_eq!(s.transcript_layout.view().dirty, LinesDirty::Clean);
+
+        s.refresh_labels_day(today);
+        assert_eq!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::Clean,
+            "same day: the cache stands"
+        );
+
+        let tomorrow = today.succ_opt().unwrap();
+        s.refresh_labels_day(tomorrow);
+        assert_ne!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::Clean,
+            "a new day must invalidate cached Today/Yesterday labels"
+        );
+        s.rebuild_lines_on(80, tomorrow);
+        assert!(
+            transcript_text(&s)
+                .iter()
+                .any(|line| line.trim() == "── Yesterday 01:00 ──"),
+            "{:#?}",
+            transcript_text(&s)
+        );
     }
 
     #[test]
