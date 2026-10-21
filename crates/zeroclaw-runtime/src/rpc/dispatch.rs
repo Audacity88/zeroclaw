@@ -8222,6 +8222,7 @@ impl RpcDispatcher {
         let authorized = self
             .authorize_session_owner(&req.session_id, Method::SessionReloadContext)
             .await?;
+        self.ctx.sessions.wait_test_control_pause().await;
         let expected_generation = self.capture_session_access(&req.session_id).await?;
         // Fence on the incarnation that was authorized, as `session/configure`
         // does: a same-ID replacement installed between the ownership check
@@ -8242,8 +8243,16 @@ impl RpcDispatcher {
         };
         self.ensure_session_incarnation(&req.session_id, expected_generation)
             .await?;
-        self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
+        let admitted = self
+            .revalidate_admitted_session(&req.session_id, authorized.as_ref())
             .await?;
+        // The lookups above awaited, and the gate decided on the grants
+        // stamped at admission. Re-resolve the caller against the policy in
+        // force now: a revoked `sessions:update` refuses the reload, and an
+        // administrator demoted meanwhile is held to ownership again. Nothing
+        // below awaits, so this decision covers the mutation.
+        let grants = self.recheck_authority_after_admission(Method::SessionReloadContext)?;
+        self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
         let changed = {
             let mut agent = agent.try_lock().map_err(|_| {
                 rpc_err(
@@ -45741,6 +45750,104 @@ mod tests {
             .await
             .expect("second reload");
         assert_eq!(again["changed"], json!(false), "{again}");
+    }
+
+    /// Alice's `session/reload_context` on `sid`, paused after its gate
+    /// while `change` runs. `AGENTS.md` changes between the first snapshot
+    /// and the reload, so a reload that goes through reports `changed`.
+    /// Returns the reload's result and whether the agent still holds the
+    /// first snapshot afterwards.
+    async fn reload_after_paused_change(
+        ctx: &Arc<RpcContext>,
+        sid: &str,
+        change: impl FnOnce(&Arc<RpcContext>),
+    ) -> (RpcResult, bool) {
+        let workspace = ctx.config.read().agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agents_md = workspace.join("AGENTS.md");
+        std::fs::write(&agents_md, "RELOAD_GATE_V1").unwrap();
+        let agent = ctx.sessions.get_agent(sid).await.expect("live agent");
+        assert!(!agent.lock().await.reload_personality().unwrap());
+        std::fs::write(&agents_md, "RELOAD_GATE_V2").unwrap();
+
+        let (alice, _rx) = roster_peer(ctx, 4242).await;
+        let (entered, release) = ctx.sessions.set_test_control_pause();
+        let params = json!({"session_id": sid});
+        let task =
+            zeroclaw_spawn::spawn!(
+                async move { alice.handle_session_reload_context(&params).await }
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the reload reaches its pause after the gate");
+        change(ctx);
+        release.notify_one();
+        let result = task.await.expect("the reload task does not panic");
+        // A reload that went through left V2 in the snapshot, so re-reading
+        // now finds nothing new.
+        let still_first = agent.lock().await.reload_personality().unwrap();
+        (result, still_first)
+    }
+
+    #[tokio::test]
+    async fn a_reload_is_refused_when_its_grant_is_revoked_while_it_waits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reload-revoked";
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+
+        let (result, still_first) = reload_after_paused_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| {
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                );
+            });
+        })
+        .await;
+
+        assert_eq!(result.expect_err("revoked while waiting").code, FORBIDDEN);
+        assert!(still_first, "the agent was not reloaded");
+    }
+
+    #[tokio::test]
+    async fn a_reload_by_a_demoted_administrator_is_held_to_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reload-demoted";
+        // Alice reloads Bob's session as an administrator and loses admin,
+        // but not sessions:update, while the reload waits.
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:bob", true).await;
+
+        let (result, still_first) = reload_after_paused_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| profile.admin = false);
+        })
+        .await;
+
+        assert_eq!(result.expect_err("demoted while waiting").code, FORBIDDEN);
+        assert!(still_first, "Bob's agent was not reloaded");
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_own_session_survives_an_unrelated_policy_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reload-own";
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+
+        // An unrelated grant moves the policy generation; the recheck must
+        // re-resolve rather than refuse on any change.
+        let (result, still_first) = reload_after_paused_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| {
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Memory,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                );
+            });
+        })
+        .await;
+
+        let result = result.expect("the owner still reloads");
+        assert_eq!(result["live"], json!(true), "{result}");
+        assert_eq!(result["changed"], json!(true), "{result}");
+        assert!(!still_first, "the agent holds the new text");
     }
 
     #[test]

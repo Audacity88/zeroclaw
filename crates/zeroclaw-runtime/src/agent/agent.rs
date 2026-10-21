@@ -1759,8 +1759,8 @@ impl Agent {
     /// and rebuild the system prompt from them. A session otherwise keeps the
     /// text it captured on its first build, so edits reach new sessions only.
     /// Returns whether the rendered text replaced a different one; a change
-    /// costs one uncached request, because the system prompt heads the cached
-    /// prefix.
+    /// alters the system prompt, which heads the cached prefix, so the next
+    /// request may reuse less of the provider's cache.
     pub fn reload_personality(&mut self) -> Result<bool> {
         let previous = self.identity_snapshot.take();
         let fresh = crate::agent::prompt::render_identity_section(
