@@ -7844,6 +7844,19 @@ impl ScopedTypingController {
 
     async fn resume(&self) {
         let mut task = self.task.lock().await;
+        self.start_if_idle(&mut task);
+    }
+
+    /// Resume without awaiting the lock, for drop paths. The lock is only
+    /// held across synchronous work, so contention means another pause or
+    /// resume is running and owns the outcome.
+    fn try_resume(&self) {
+        if let Ok(mut task) = self.task.try_lock() {
+            self.start_if_idle(&mut task);
+        }
+    }
+
+    fn start_if_idle(&self, task: &mut Option<ScopedTypingTask>) {
         if task.is_some() {
             return;
         }
@@ -7872,11 +7885,37 @@ impl ScopedTypingController {
 struct ApprovalTypingChannel {
     inner: Arc<dyn Channel>,
     typing: Arc<ScopedTypingController>,
+    turn_cancelled: CancellationToken,
+}
+
+/// Resumes typing if an approval wait is dropped unanswered while its turn
+/// keeps running: the budget override prompt is released that way when
+/// another session grants the override. A cancelled turn stays quiet.
+struct ResumeTypingIfAbandoned<'a> {
+    typing: &'a ScopedTypingController,
+    turn_cancelled: &'a CancellationToken,
+    armed: bool,
+}
+
+impl Drop for ResumeTypingIfAbandoned<'_> {
+    fn drop(&mut self) {
+        if self.armed && !self.turn_cancelled.is_cancelled() {
+            self.typing.try_resume();
+        }
+    }
 }
 
 impl ApprovalTypingChannel {
-    fn new(inner: Arc<dyn Channel>, typing: Arc<ScopedTypingController>) -> Self {
-        Self { inner, typing }
+    fn new(
+        inner: Arc<dyn Channel>,
+        typing: Arc<ScopedTypingController>,
+        turn_cancelled: CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            typing,
+            turn_cancelled,
+        }
     }
 
     /// Pause typing for the approval wait; resume only when the turn will
@@ -7888,7 +7927,13 @@ impl ApprovalTypingChannel {
         >,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         self.typing.pause().await;
+        let mut abandoned = ResumeTypingIfAbandoned {
+            typing: &self.typing,
+            turn_cancelled: &self.turn_cancelled,
+            armed: true,
+        };
         let response = ask.await;
+        abandoned.armed = false;
         if response.as_ref().is_ok_and(|response| {
             // Unsupported approval is not a denial: the runtime may continue
             // under ordinary shell policy without granting approval.
@@ -10117,6 +10162,7 @@ async fn process_channel_message_body(
             (Some(channel), Some(typing)) => Some(Arc::new(ApprovalTypingChannel::new(
                 Arc::clone(channel),
                 Arc::clone(typing),
+                cancellation_token.clone(),
             ))),
             (Some(channel), None) => Some(Arc::clone(channel)),
             (None, _) => None,
@@ -36027,7 +36073,8 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::clone(&channel),
             "chat".to_string(),
         ));
-        let wrapped = ApprovalTypingChannel::new(Arc::clone(&channel), typing);
+        let wrapped =
+            ApprovalTypingChannel::new(Arc::clone(&channel), typing, CancellationToken::new());
 
         assert!(
             wrapped.supports_turn_flush_narration(),
@@ -36120,7 +36167,8 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::clone(&channel),
             "chat".to_string(),
         ));
-        let wrapped = ApprovalTypingChannel::new(Arc::clone(&channel), typing);
+        let wrapped =
+            ApprovalTypingChannel::new(Arc::clone(&channel), typing, CancellationToken::new());
         let wait = Duration::from_secs(600);
         let answer = wrapped
             .request_approval_attributed_with_timeout(
@@ -36203,6 +36251,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let wrapped = Arc::new(ApprovalTypingChannel::new(
                 Arc::clone(&channel),
                 Arc::clone(&typing),
+                CancellationToken::new(),
             ));
             let approval_task = zeroclaw_spawn::spawn!(async move {
                 wrapped
@@ -36256,6 +36305,83 @@ BTC is currently around $65,000 based on latest tool output."#
                 );
             }
 
+            typing.pause().await;
+        }
+    }
+
+    /// A budget override prompt released by another session's grant is
+    /// dropped unanswered while the turn continues; typing must come back.
+    /// A cancelled turn must stay quiet.
+    #[tokio::test]
+    async fn abandoned_approval_resumes_typing_unless_the_turn_was_cancelled() {
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+
+        for cancel_turn in [false, true] {
+            let channel_impl = Arc::new(PendingApprovalChannel::new(
+                PendingApprovalOutcome::Response(None),
+            ));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let typing = Arc::new(ScopedTypingController::new(
+                Arc::clone(&channel),
+                "approval-chat".to_string(),
+            ));
+            typing.resume().await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while channel_impl.start_typing_calls.load(Ordering::SeqCst) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("initial typing should start");
+
+            let turn_cancelled = CancellationToken::new();
+            let wrapped = Arc::new(ApprovalTypingChannel::new(
+                Arc::clone(&channel),
+                Arc::clone(&typing),
+                turn_cancelled.clone(),
+            ));
+            let approval_task = zeroclaw_spawn::spawn!(async move {
+                wrapped
+                    .request_approval_attributed(
+                        "approval-chat",
+                        &ChannelApprovalRequest {
+                            tool_name: "cost_limit_override".to_string(),
+                            arguments_summary: "over the daily limit".to_string(),
+                            raw_arguments: None,
+                            position: None,
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                channel_impl.approval_started.notified(),
+            )
+            .await
+            .expect("approval request should start");
+
+            if cancel_turn {
+                turn_cancelled.cancel();
+            }
+            approval_task.abort();
+            assert!(approval_task.await.unwrap_err().is_cancelled());
+
+            if cancel_turn {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    channel_impl.start_typing_calls.load(Ordering::SeqCst),
+                    1,
+                    "a cancelled turn must not resume typing"
+                );
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while channel_impl.start_typing_calls.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("a turn that continues past a dropped prompt should resume typing");
+            }
             typing.pause().await;
         }
     }

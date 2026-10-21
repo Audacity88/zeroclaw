@@ -254,7 +254,8 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 /// How long the budget-override prompt waits for an answer before the turn
 /// stops as it would without one. Longer than a tool approval: the turn is
 /// paused, nothing is spent while it waits, and long tasks are often left
-/// running unattended.
+/// running unattended. Channels that don't forward a caller's timeout
+/// (most chat channels) still stop at their own `approval_timeout_secs`.
 pub(crate) const BUDGET_OVERRIDE_WAIT: Duration = Duration::from_secs(600);
 
 /// Budget gate for the main tool loop. Like [`enforce_tool_loop_budget`],

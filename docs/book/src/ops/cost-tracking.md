@@ -200,7 +200,9 @@ buttons), the turn pauses and asks. Approving lifts that limit for the
 rest of the UTC day or month, for every session of the daemon: a prompt
 waiting in another session closes on its own and that turn continues.
 Denying, or no answer within 10 minutes, stops only that turn with a
-budget error as before. The override is saved in
+budget error as before. Chat channels other than Telegram keep their own
+`approval_timeout_secs` (300 seconds by default), so there the shorter
+of the two applies. The override is saved in
 `state/cost-overrides.json` beside the ledger, so it survives a daemon
 restart and ends at the period rollover; setting `allow_override = false`
 restores the limit at once. Per-agent delegation ceilings are never
