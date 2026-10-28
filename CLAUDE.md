@@ -5,6 +5,8 @@
 
 ## Claude Code Settings
 
+@AGENTS.md
+
 Claude Code should read and follow all instructions in `AGENTS.md` at the repository root for project conventions, commands, risk tiers, workflow rules, and anti-patterns.
 
 ## Hooks
