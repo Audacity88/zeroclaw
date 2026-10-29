@@ -1382,6 +1382,54 @@ pub(crate) fn draw_app_frame(
     }
 }
 
+/// Evidence frames use the production chrome and Code renderer with the
+/// optional dock panels closed. No replacement widgets or screen text.
+#[cfg(test)]
+pub(crate) fn draw_code_evidence_frame(
+    frame: &mut ratatui::Frame,
+    chat_pane: &mut chat::Chat,
+    acp_pane: &mut acp::Acp,
+    rpc: &RpcClient,
+) {
+    let config = config::ZerocodeConfig::default();
+    let mut dock = ConversationDock {
+        config_dir: std::path::PathBuf::new(),
+        sessions_visible: false,
+        queue_visible: false,
+        plan_visible: false,
+        side: config.effective_sidebar_side(),
+        width: config.effective_sidebar_width(),
+        sessions_percent: config.effective_sidebar_sessions_percent(),
+        queue_percent: config.effective_sidebar_queue_percent(),
+        capture: None,
+        layout: DockLayout::default(),
+    };
+    draw_app_frame(
+        frame,
+        Mode::Acp,
+        chat_pane,
+        acp_pane,
+        |frame, chunks, _chat, code| {
+            draw_mode_bar(frame, chunks[0], Mode::Acp, None);
+            let layout = dock.layout(chunks[1], Mode::Acp, code.plan_visible());
+            dock.draw_shell(frame);
+            code.draw_with_dock(frame, layout.conversation, layout.queue, layout.plan);
+            dock.draw_resize_handles(frame);
+            code.draw_dock_overlay(frame);
+            let (input, source, max, window) = code.ctx_tokens();
+            draw_status_bar(
+                frame,
+                chunks[2],
+                &rpc.connection_state(),
+                rpc.tui_id(),
+                CtxBar::new(input, source, max, window),
+                false,
+                code.in_browse_mode(),
+            );
+        },
+    );
+}
+
 #[derive(Debug, Clone)]
 struct ModeBarEntry {
     mode: Mode,
