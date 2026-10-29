@@ -182,9 +182,12 @@ as a `delegate_activity` event against the parent's `delegate` call:
 ```
 
 `phase` is `started` (with `arguments_summary`, secret-redacted) or `finished`
-(with `success` and a bounded `output_preview`). `depth` counts nested
-delegates below the parent's call. These events are live only: session history
-does not record them, and background delegates do not send them.
+(with `success` and `output_preview`). `output_preview` carries child tool
+output, scrubbed for credentials and truncated at 400 characters with an
+ellipsis when longer. RPC clients receive it even though ZeroCode does not
+render it. `depth` counts nested delegates below the parent's call. These
+events are live only: session history and turn checkpoints do not record them,
+and background delegates do not send them.
 
 ### ACP durable lifecycle
 

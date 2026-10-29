@@ -31332,6 +31332,30 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_projection_never_records_delegate_activity() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        for phase in [
+            DelegateActivityPhase::Started {
+                arguments_summary: "command: pwd".into(),
+            },
+            DelegateActivityPhase::Finished {
+                success: false,
+                output_preview: "failed".into(),
+            },
+        ] {
+            let event = TurnEvent::DelegateActivity(DelegateActivity {
+                parent_tool_call_id: "parent".into(),
+                agent: "researcher".into(),
+                depth: 0,
+                tool_call_id: "call_1".into(),
+                tool_name: "shell".into(),
+                phase,
+            });
+            assert!(checkpoint_fragment_for_event(&event).is_none());
+        }
+    }
+
+    #[test]
     fn checkpoint_projection_bounds_tool_output() {
         let output = "x".repeat(16 * 1024 + 10);
         let fragment = checkpoint_fragment_for_event(&TurnEvent::ToolResult {
