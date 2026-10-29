@@ -374,26 +374,50 @@ impl EvidenceWindow {
         assert_eq!(event, Some(SidebarEvent::OpenPicker));
         self.sidebar
             .open_picker(PaneKind::Chat, Default::default(), &self.client);
+        let picker_title = crate::i18n::t("zc-sidebar-picker-title");
+        let loading = crate::i18n::t("zc-sidebar-picker-loading");
+        let initial = self.draw();
+        assert!(
+            initial.rows.iter().any(|row| row.contains(&loading)),
+            "the real modal starts loading before its RPC response"
+        );
         rpc.drive(async {
             loop {
                 self.sidebar.drain_picker_fetch();
-                if self.draw().rows.iter().any(|row| row.contains("window-d")) {
+                let frame = self.draw();
+                // The background Chat agent picker already contains window-d.
+                // Wait for the overlay's own loading row to disappear instead.
+                if frame.rows.iter().any(|row| row.contains(&picker_title))
+                    && !frame.rows.iter().any(|row| row.contains(&loading))
+                    && frame.rows.iter().any(|row| row.contains("window-d"))
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await;
-        for _ in 0..3 {
-            assert_eq!(
-                self.sidebar
-                    .handle_picker_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-                None
-            );
-        }
-        let event = self
-            .sidebar
-            .handle_picker_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let event = {
+            // Sibling tests replace the process-wide keymap. Read and dispatch
+            // under their guard, without changing their override table.
+            let _keys = crate::keymap::overrides::TEST_GUARD
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let key_for = |action| {
+                ModalAction::resolved_bindings()
+                    .into_iter()
+                    .filter(|(_, candidate)| *candidate == action)
+                    .map(|(chord, _)| KeyEvent::new(chord.code, chord.effective_modifiers()))
+                    .find(|key| ModalAction::from_chord(key) == Some(action))
+                    .expect("modal action has a dispatchable resolved binding")
+            };
+            let down = key_for(ModalAction::Down);
+            let confirm = key_for(ModalAction::Confirm);
+            for _ in 0..3 {
+                assert_eq!(self.sidebar.handle_picker_key(&down), None);
+            }
+            self.sidebar.handle_picker_key(&confirm)
+        };
         let Some(SidebarEvent::PickAgent { pane, alias }) = event else {
             panic!("Enter selects a real picker row");
         };
