@@ -6,6 +6,44 @@ use super::*;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
 
+// The pane's normal transport tick also polls session/git_branch. Answer only
+// that known background RPC; every foreground method remains strictly checked.
+async fn next_evidence_request(
+    rx: &mut mpsc::Receiver<String>,
+    rpc: &RpcOutbound,
+    expected: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let request = next_rpc_request(rx, "evidence RPC must arrive").await;
+            if request["method"] == method::SESSION_GIT_BRANCH {
+                assert_eq!(request["params"]["session_id"], "sess-1");
+                respond_ok(
+                    rpc,
+                    &request,
+                    serde_json::json!({"branch": null, "hash": null}),
+                );
+                continue;
+            }
+            assert_eq!(request["method"], expected, "unexpected foreground RPC");
+            if expected != method::CONFIG_LIST {
+                assert_eq!(request["params"]["session_id"], "sess-1");
+            }
+            return request;
+        }
+    })
+    .await
+    .expect("the expected evidence RPC must arrive despite background polls")
+}
+
+fn evidence_keymap_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::keymap::overrides::TEST_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    crate::keymap::overrides::reset();
+    guard
+}
+
 struct DelegateFrame {
     chat: Chat,
     code: crate::acp::Acp,
@@ -43,7 +81,8 @@ impl DelegateFrame {
             width: 100,
             height: 30,
         };
-        fixture.prompt = next_rpc_request(&mut fixture.rx, "Enter must send the prompt").await;
+        fixture.prompt =
+            next_evidence_request(&mut fixture.rx, &fixture.rpc, method::SESSION_PROMPT).await;
         assert_eq!(fixture.prompt["method"], method::SESSION_PROMPT);
         assert_eq!(fixture.prompt["params"]["prompt"], prompt_text);
         assert_eq!(fixture.prompt["params"]["session_id"], "sess-1");
@@ -209,8 +248,10 @@ impl DelegateFrame {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_collapsed_running() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.capture(
         "delegate-collapsed-running",
@@ -226,8 +267,10 @@ async fn evidence_frame_delegate_collapsed_running() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_expanded_running() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.expand().await;
     f.capture(
@@ -244,8 +287,10 @@ async fn evidence_frame_delegate_expanded_running() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_expanded_finished() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.expand().await;
     f.finish_child("call_1", 0, true);
@@ -263,8 +308,10 @@ async fn evidence_frame_delegate_expanded_finished() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_reverse_finishes_keep_failure_with_arguments() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.start("call_2", 0, "command: inspect-tests");
     f.finish_child("call_2", 0, false);
@@ -284,8 +331,10 @@ async fn evidence_frame_delegate_reverse_finishes_keep_failure_with_arguments() 
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_reused_ids_and_nested_depth() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.start("call_1", 1, "command: nested-check");
     f.finish_child("call_1", 0, false);
@@ -310,13 +359,15 @@ async fn evidence_frame_delegate_reused_ids_and_nested_depth() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_cancelled_without_child_finish() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.expand().await;
     let mut term = key_term();
     let answer = async {
-        let request = next_rpc_request(&mut f.rx, "Escape must request cancellation").await;
+        let request = next_evidence_request(&mut f.rx, &f.rpc, method::SESSION_CANCEL).await;
         assert_eq!(request["method"], method::SESSION_CANCEL);
         assert_eq!(request["params"]["session_id"], "sess-1");
         respond_ok(
@@ -347,8 +398,10 @@ async fn evidence_frame_delegate_cancelled_without_child_finish() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_failed_turn_without_child_finish() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.finish_turn("failed").await;
     f.expand().await;
@@ -364,8 +417,10 @@ async fn evidence_frame_delegate_failed_turn_without_child_finish() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_completed_without_child_finish() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.parent_result();
     f.finish_turn("completed").await;
@@ -382,8 +437,10 @@ async fn evidence_frame_delegate_completed_without_child_finish() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn evidence_frame_delegate_restored_history_has_no_live_activity() {
     let _lock = env_test_lock_async().await;
+    let _keys = evidence_keymap_guard();
     let mut f = DelegateFrame::running().await;
     f.finish_turn("cancelled").await;
     // Re-enter through session/new and session/messages, rather than building
@@ -397,8 +454,7 @@ async fn evidence_frame_delegate_restored_history_has_no_live_activity() {
             method::CONFIG_LIST,
             method::SESSION_MESSAGES,
         ] {
-            let request =
-                next_rpc_request(&mut f.rx, "resume must load its retained history").await;
+            let request = next_evidence_request(&mut f.rx, &f.rpc, method_name).await;
             assert_eq!(request["method"], method_name);
             let result = match method_name {
                 method::SESSION_NEW => {
