@@ -813,14 +813,16 @@ impl DiscordChannel {
     ) -> Option<crate::util::PendingApprovalResolution> {
         let (token, response) = crate::util::parse_approval_reply(content)?;
         Some(
-            crate::util::resolve_pending_approval(
+            crate::util::resolve_pending_approval_attributed_with_tool(
                 &self.pending_approvals,
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(responder.to_string())),
                 self.is_user_allowed(responder),
                 &Self::canonical_approval_destination(destination),
             )
-            .await,
+            .await
+            .0,
         )
     }
 
@@ -2937,16 +2939,16 @@ impl Channel for DiscordChannel {
                                         ).await;
                                         let prompt = match intent {
                                             Some(ComponentIntent::Approval { token, decision }) => {
-                                                let resolution = crate::util::resolve_pending_approval(
+                                                let resolution = crate::util::resolve_pending_approval_attributed_with_tool(
                                                     &pending_approvals,
                                                     &token,
-                                                    decision.response(),
+                                                    zeroclaw_api::channel::AttributedApprovalResponse::operator(decision.response()).with_user(Some(user_id.clone())),
                                                     true,
                                                     &Self::canonical_approval_destination(
                                                         &interaction_channel,
                                                     ),
                                                 )
-                                                .await;
+                                                .await.0;
                                                 let key = if matches!(
                                                     resolution,
                                                     crate::util::PendingApprovalResolution::Resolved
@@ -4059,7 +4061,7 @@ impl Channel for DiscordChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => {
                     guard.disarm();
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                    resp
                 }
                 Ok(Err(_)) => {
                     // Sender dropped: the gateway task went away without a click.
@@ -7920,7 +7922,7 @@ mod tests {
         )
         .await;
         assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Deny);
     }
 
     /// Compose the production component take and resolver after the ingress gate.
@@ -7990,7 +7992,7 @@ mod tests {
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1")
                 .await;
         assert!(resolved, "authorized click resolves the oneshot");
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
     }
 
     #[tokio::test]
@@ -8082,7 +8084,7 @@ mod tests {
                 .await,
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert_eq!(
             ch.resolve_approval_reply("tok123 no", "u1", "c1").await,
             Some(crate::util::PendingApprovalResolution::NotFound)
@@ -8145,7 +8147,7 @@ mod tests {
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
                 .await
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
         assert!(reg.lock().take(&wire).is_none());
         assert!(
             !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
@@ -8183,7 +8185,7 @@ mod tests {
             dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
                 .await
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Deny);
         // The component entry is gone (single-use take), so a replay of the same
         // custom_id resolves nothing even from an authorized user.
         assert!(

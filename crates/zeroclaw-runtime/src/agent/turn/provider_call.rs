@@ -289,7 +289,7 @@ pub(crate) async fn gate_tool_loop_budget(ctx: &TurnCtx<'_>) -> Result<()> {
             OverrideGrant::Refused => break,
         }
         // Session attribution comes from the turn's canonical session scope.
-        // `decided_by` identifies the answering back-channel, not a human identity.
+        // The responder identity comes from the channel callback, not the session owner.
         // Only the atomic new-grant result emits this audit event, even if two
         // operators answer concurrently. Released waiters never reach it.
         ::zeroclaw_log::scope!(
@@ -304,6 +304,7 @@ pub(crate) async fn gate_tool_loop_budget(ctx: &TurnCtx<'_>) -> Result<()> {
                         .with_category(::zeroclaw_log::EventCategory::Provider)
                         .with_outcome(::zeroclaw_log::EventOutcome::Success)
                         .with_attrs(::serde_json::json!({
+                            "decided_by_user": attributed.user_or_channel(channel.name()),
                             "current_usd": offer.current_usd,
                             "limit_usd": offer.limit_usd,
                             "period": format!("{:?}", offer.period),
@@ -4647,7 +4648,8 @@ mod budget_override_tests {
         // The other session's operator approves through the real gate.
         let approver = ScriptedChannel::answering(
             AttributedApprovalResponse::operator(ChannelApprovalResponse::Approve)
-                .with_decider("approval-surface"),
+                .with_decider("approval-surface")
+                .with_user(Some("user-42".to_string())),
         );
         let mut approver_ctx = ctx(&observer, &pacing, Some(&approver));
         approver_ctx.turn_id = "budget-override-audit-release";
@@ -4684,6 +4686,7 @@ mod budget_override_tests {
         assert_eq!(grant["zeroclaw"]["session_key"], "approving-session");
         assert_eq!(grant["zeroclaw"]["channel_type"], "test");
         assert_eq!(grant["attributes"]["decided_by"], "approval-surface");
+        assert_eq!(grant["attributes"]["decided_by_user"], "user-42");
         assert_eq!(grant["attributes"]["approval_source"], "operator");
         assert_eq!(grant["attributes"]["period"], "Day");
         assert_eq!(grant["attributes"]["current_usd"], 3.0);

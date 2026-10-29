@@ -4067,14 +4067,16 @@ impl SlackChannel {
         if let Some((token, response, responder, channel)) =
             Self::try_parse_approval_block_action(envelope)
         {
-            crate::util::resolve_pending_approval(
+            crate::util::resolve_pending_approval_attributed_with_tool(
                 &self.pending_approvals,
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(responder.to_string())),
                 self.is_user_allowed(&responder),
                 &channel,
             )
-            .await;
+            .await
+            .0;
             return true;
         }
 
@@ -4587,14 +4589,16 @@ impl SlackChannel {
                 if !sender_is_bot
                     && let Some((token, response)) =
                         crate::util::parse_approval_reply(&normalized_text)
-                    && crate::util::resolve_pending_approval(
+                    && crate::util::resolve_pending_approval_attributed_with_tool(
                         &self.pending_approvals,
                         &token,
-                        response,
+                        zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                            .with_user(Some(user.to_string())),
                         self.is_user_allowed(user),
                         &channel_id,
                     )
                     .await
+                    .0
                     .suppresses_message()
                 {
                     continue;
@@ -6037,14 +6041,18 @@ impl Channel for SlackChannel {
                         if !sender_is_bot
                             && let Some((token, response)) =
                                 crate::util::parse_approval_reply(&normalized_text)
-                            && crate::util::resolve_pending_approval(
+                            && crate::util::resolve_pending_approval_attributed_with_tool(
                                 &self.pending_approvals,
                                 &token,
-                                response,
+                                zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                                    response,
+                                )
+                                .with_user(Some(user.to_string())),
                                 self.is_user_allowed(user),
                                 &channel_id,
                             )
                             .await
+                            .0
                             .suppresses_message()
                         {
                             continue;
@@ -6156,14 +6164,16 @@ impl Channel for SlackChannel {
                     if !sender_is_bot
                         && let Some((token, response)) =
                             crate::util::parse_approval_reply(&normalized_text)
-                        && crate::util::resolve_pending_approval(
+                        && crate::util::resolve_pending_approval_attributed_with_tool(
                             &self.pending_approvals,
                             &token,
-                            response,
+                            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                                .with_user(Some(user.to_string())),
                             self.is_user_allowed(user),
                             &thread_channel_id,
                         )
                         .await
+                        .0
                         .suppresses_message()
                     {
                         continue;
@@ -6304,7 +6314,7 @@ impl Channel for SlackChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => {
                     guard.disarm();
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                    resp
                 }
                 Ok(Err(_)) => {
                     guard.remove().await;
@@ -9563,7 +9573,10 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
 
         let (approve_tx, approve_rx) = oneshot::channel();
         ch.pending_approvals.lock().await.insert(
@@ -9585,7 +9598,10 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approve_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[tokio::test]
@@ -10111,7 +10127,10 @@ mod tests {
             );
         }
 
-        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approved_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(50), inbound_rx.recv())
                 .await

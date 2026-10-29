@@ -1125,6 +1125,53 @@ async fn refresh_live_channel_handles_between_configs_detached(
     }
 }
 
+/// Check the actual process tree at decision time. A reparented process may no
+/// longer expose its former ancestry; this is a bounded check, not OS isolation.
+fn cost_override_peer_is_independent(peer: Option<u32>) -> bool {
+    let Some(peer) = peer.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return false;
+    }
+    let mut system = sysinfo::System::new();
+    independent_operator_process(peer, std::process::id(), |pid| {
+        let pid = sysinfo::Pid::from_u32(pid);
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        system
+            .process(pid)
+            .and_then(|process| process.parent().map(|parent| parent.as_u32()))
+    })
+}
+
+fn independent_operator_process(
+    mut peer: u32,
+    daemon: u32,
+    mut parent: impl FnMut(u32) -> Option<u32>,
+) -> bool {
+    for _ in 0..128 {
+        if peer == daemon || peer == 0 {
+            return false;
+        }
+        // PID 1 is the root of the visible process tree.
+        if peer == 1 {
+            return true;
+        }
+        let Some(next) = parent(peer) else {
+            return false;
+        };
+        if next == 0 {
+            return false;
+        }
+        peer = next;
+    }
+    false
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -1149,6 +1196,8 @@ pub struct RpcDispatcher {
     tui_epoch: Option<super::tui_identity::TuiEpoch>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
+    /// Kernel-reported local client PID. Unknown transports cannot lift cost caps.
+    peer_process_id: Option<u32>,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
     /// Generation token for the transport connection that accepted work.
     /// Every detached prompt is linked to it and drained before teardown.
@@ -1304,6 +1353,7 @@ impl RpcDispatcher {
             tui_id: None,
             tui_epoch: None,
             peer_label,
+            peer_process_id: None,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
             connection_cancel,
             owns_connection: true,
@@ -1334,6 +1384,11 @@ impl RpcDispatcher {
     #[must_use]
     pub(crate) fn with_initialize_deadline(mut self, deadline: tokio::time::Instant) -> Self {
         self.initialize_deadline = Some(deadline);
+        self
+    }
+
+    pub(crate) fn with_peer_process_id(mut self, pid: Option<u32>) -> Self {
+        self.peer_process_id = pid;
         self
     }
 
@@ -3075,6 +3130,7 @@ impl RpcDispatcher {
             // teardown; only the owning transport loop does.
             tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
+            peer_process_id: self.peer_process_id,
             client_elicitation_caps: self.client_elicitation_caps,
             connection_cancel: self.connection_cancel.clone(),
             owns_connection: false,
@@ -8846,10 +8902,77 @@ impl RpcDispatcher {
             }
         };
 
-        let acknowledged =
-            self.ctx
-                .approval_pending
-                .resolve(&p.request_id, &p.session_id, response);
+        let user = self
+            .auth
+            .as_ref()
+            .and_then(|auth| {
+                (auth.principal.id.0 != zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR)
+                    .then(|| auth.principal.id.0.clone())
+            })
+            .or_else(|| match &self.transport_credential {
+                crate::security::auth_provider::Credential::Peercred { uid } => {
+                    Some(format!("uid:{uid}"))
+                }
+                _ => None,
+            });
+        let cost_override = self
+            .ctx
+            .approval_pending
+            .is_cost_override(&p.request_id, &p.session_id);
+        if cost_override {
+            let peer_pid = self.peer_process_id;
+            let independent = self.transport_kind == super::transport::TransportKind::Local
+                && tokio::task::spawn_blocking(move || cost_override_peer_is_independent(peer_pid))
+                    .await
+                    .unwrap_or(false);
+            if !independent {
+                // Stop only if this is the connection the prompt was sent to.
+                // A foreign connection cannot consume someone else's prompt.
+                self.ctx.approval_pending.resolve_from_operator(
+                    &p.request_id,
+                    &p.session_id,
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    )
+                    .with_user(user),
+                    &self.rpc,
+                );
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            json!({"request_id": p.request_id, "session_id": p.session_id,
+                            "peer_pid": peer_pid, "reason": "cost_override_untrusted_process"})
+                        ),
+                    "RPC cost override refused: independent operator process required"
+                );
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    crate::i18n::get_required_cli_string("rpc-cost-override-independent-operator"),
+                ));
+            }
+        }
+        let acknowledged = self.ctx.approval_pending.resolve_from_operator(
+            &p.request_id,
+            &p.session_id,
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(response).with_user(user),
+            &self.rpc,
+        );
+
+        if cost_override && !acknowledged {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        json!({"request_id": p.request_id, "session_id": p.session_id,
+                        "reason": "cost_override_wrong_operator_connection"})
+                    ),
+                "RPC cost override refused: request was not delivered to this connection"
+            );
+        }
 
         to_result(SessionApproveResult {
             session_id: p.session_id,
@@ -22748,7 +22871,7 @@ mod tests {
             .expect("alice creates her session");
 
         let (tx, mut rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         ctx.approval_pending
             .insert("req-appr".to_string(), "alice-appr".to_string(), tx);
 
@@ -22775,7 +22898,7 @@ mod tests {
             .await
             .expect("the owner resolves her own approval");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().response,
             zeroclaw_api::channel::ChannelApprovalResponse::Approve
         );
     }
@@ -27108,11 +27231,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cost_override_rejects_daemon_descendants_and_unknown_ancestry() {
+        let parent = |pid| match pid {
+            40 => Some(30),
+            30 => Some(20),
+            20 => Some(1),
+            50 => Some(1),
+            _ => None,
+        };
+        assert!(!independent_operator_process(20, 20, parent));
+        assert!(!independent_operator_process(30, 20, parent));
+        assert!(!independent_operator_process(40, 20, parent));
+        assert!(independent_operator_process(50, 20, parent));
+        assert!(!independent_operator_process(99, 20, parent));
+        assert!(!independent_operator_process(99, 20, |pid| Some(pid)));
+        assert!(!cost_override_peer_is_independent(None));
+        assert!(!cost_override_peer_is_independent(Some(std::process::id())));
+    }
+
+    #[tokio::test]
+    async fn session_approve_cost_override_refuses_own_process_and_stops_the_request() {
+        let dispatcher =
+            make_approval_test_dispatcher().with_peer_process_id(Some(std::process::id()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _guard = dispatcher.ctx.approval_pending.register_attributed(
+            "self-cost".into(),
+            "sess-1".into(),
+            tx,
+            Some(dispatcher.rpc.clone()),
+        );
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1", "request_id": "self-cost", "decision": "allow_once",
+            }))
+            .await;
+        assert_eq!(result.unwrap_err().code, FORBIDDEN);
+        let answer = rx.await.unwrap();
+        assert_eq!(
+            answer.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Deny
+        );
+        assert!(answer.source.is_runtime_fail_closed());
+    }
+
     #[tokio::test]
     async fn session_approve_resolves_pending_request() {
         let dispatcher = make_approval_test_dispatcher();
         let (tx, mut rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         dispatcher
             .ctx
             .approval_pending
@@ -27131,7 +27298,7 @@ mod tests {
         assert_eq!(result["request_id"], "req-allow");
         assert_eq!(result["acknowledged"], true);
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().response,
             zeroclaw_api::channel::ChannelApprovalResponse::Approve
         );
         assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
@@ -27160,7 +27327,7 @@ mod tests {
     async fn session_approve_cannot_resolve_another_sessions_request() {
         let dispatcher = make_approval_test_dispatcher();
         let (tx, mut rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         dispatcher.ctx.approval_pending.insert(
             "req-owner".to_string(),
             "sess-owner".to_string(),
@@ -27190,7 +27357,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner_result["acknowledged"], true);
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().response,
             zeroclaw_api::channel::ChannelApprovalResponse::Deny
         );
     }

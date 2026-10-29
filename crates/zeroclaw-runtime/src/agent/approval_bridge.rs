@@ -99,10 +99,12 @@ impl AskUserApprovalBridge {
                     response,
                     decider,
                     source,
+                    decided_by_user,
                 } => {
                     return Ok(Some(
                         AttributedApprovalResponse::from_runtime(response, source)
-                            .with_decider_opt(decider),
+                            .with_decider_opt(decider)
+                            .with_user(decided_by_user),
                     ));
                 }
                 RoutedApproval::Fallthrough => {

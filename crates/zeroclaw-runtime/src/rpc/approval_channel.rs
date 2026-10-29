@@ -224,12 +224,18 @@ impl RpcApprovalChannel {
         timeout: Duration,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         // Bind the approval to this channel's session so session/approve is
         // authorized against the session's owner.
-        let mut pending_request =
-            self.pending
-                .register(request_id.clone(), self.session_id.clone(), tx);
+        let cost_override =
+            request.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL;
+        let mut pending_request = self.pending.register_attributed(
+            request_id.clone(),
+            self.session_id.clone(),
+            tx,
+            cost_override.then(|| Arc::clone(&self.rpc)),
+        );
 
         self.rpc
             .notify(
@@ -261,9 +267,7 @@ impl RpcApprovalChannel {
             Ok(Ok(response)) => {
                 pending_request.disarm();
                 withdraw.armed = false;
-                Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
-                ))
+                Ok(Some(response))
             }
             Ok(Err(_)) => Ok(Some(
                 zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
@@ -464,7 +468,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["params"]["timeout_secs"], 600);
         let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
-        assert!(pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve));
+        assert!(pending.resolve_from_operator(
+            &request_id,
+            "sess-1",
+            ChannelApprovalResponse::Approve.into(),
+            &rpc
+        ));
         let result = task.await.unwrap().unwrap().expect("an operator answer");
         assert_eq!(result.response, ChannelApprovalResponse::Approve);
     }

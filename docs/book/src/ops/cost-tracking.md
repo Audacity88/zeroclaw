@@ -220,17 +220,35 @@ limit, period, UTC `granted_at`, channel, deciding back-channel
 (`decided_by`), approval source, and the turn's session attribution. Waiting
 sessions released by that grant do not emit another operator-grant event.
 The normal runtime log persistence and retention settings control whether
-this event survives a restart. `decided_by` names an approval channel, not a
-verified person: the current approval response does not carry the responder's
-identity. In Telegram groups, any allowed responder in that chat can approve
-a grant for the whole daemon.
+this event survives a restart. `decided_by_user` records the responding user's
+channel-native ID when the approval transport provides one. It falls back to
+the answering back-channel when no user identity is available. This is the
+identity observed by the channel, not an independent verification of a person.
+Telegram group overrides require the responder's numeric user ID in
+`channels.telegram.<alias>.cost_override_operators` as well as normal peer
+admission. The list defaults to empty and accepts no wildcard or username.
+An allowed group responder outside this list stops the pending turn when
+attempting an override, with a `cost_override_operator_required` refusal audit.
+The role is read from live config at reply time. Private chats keep normal
+peer-authorized approval behavior.
 
-Local RPC clients are operator clients. Socket permissions and session-owner
-checks do not distinguish a human client from an unsandboxed agent-launched
-process running as the daemon's trusted OS user. Such a process can request
-and approve an override through its own session. Keep `allow_override` off
-unless that local-process trust is acceptable or enforced isolation prevents
-agent processes from reaching operator RPC.
+RPC cost overrides are bound to the exact connection that received the prompt,
+in addition to session ownership. A second connection cannot approve it using
+the request ID, even under the same OS user or session owner. The approving
+connection must have a kernel-reported local peer PID whose visible ancestry
+does not include the daemon process that executes agent turns. The daemon,
+its children and their descendants are refused and the pending turn stops.
+Unknown or incomplete process ancestry also stops the override. Transports
+without this evidence, including WSS and Windows named pipes, cannot grant
+RPC cost overrides. Ordinary tool approvals keep their existing behavior.
+
+This check is not OS isolation. A process reparented before approval can lose
+its visible link to the daemon. An unrelated same-UID process, a compromised
+operator client, a transferred socket, or reuse of a departed peer's PID can
+also escape this ancestry check. Audit identity uses the authenticated
+principal, or the kernel UID when no individual principal is configured.
+These identify an OS account, not necessarily the person at its keyboard.
+Use process and IPC isolation when same-UID hostile code is in scope.
 
 Setting `cost.allow_override = false` through an accepted live RPC
 `config/set` change restores enforcement at the next budget check without a

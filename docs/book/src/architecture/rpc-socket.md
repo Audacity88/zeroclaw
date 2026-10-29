@@ -179,6 +179,15 @@ Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 timed out, or the same decision was made in another session. Clients take
 that prompt down; answering it afterwards is a no-op.
 
+Cost-limit overrides additionally bind the request to the connection that
+received its prompt. `session/approve` cannot grant them from another
+connection. A grant also requires a kernel-reported local peer PID with
+complete visible ancestry independent of the daemon. The daemon's own
+process and descendants, unknown ancestry, WSS and named-pipe clients fail
+closed for cost overrides. Reparenting, PID reuse and a compromised or
+transferred operator connection remain limitations. This does not replace
+OS process isolation. See [Cost tracking](../ops/cost-tracking.md).
+
 ### ACP durable lifecycle
 
 Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.

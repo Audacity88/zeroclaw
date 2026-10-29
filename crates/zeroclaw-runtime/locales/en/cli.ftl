@@ -1691,3 +1691,6 @@ skill-http-request-timeout = HTTP request timed out
 # Cost overrides are explicit one-time decisions, never remembered permissions.
 channel-cost-override-reply-instruction-yesno = Reply: "{ $yes_command }" or "{ $no_command }"
 channel-cost-override-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }`.
+
+# A global spending override requires a separate local operator process.
+rpc-cost-override-independent-operator = Cost override requires an independent local operator process.

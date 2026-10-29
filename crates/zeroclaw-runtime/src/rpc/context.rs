@@ -7,7 +7,8 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_api::channel::{AttributedApprovalResponse, ChannelApprovalResponse};
+use zeroclaw_api::jsonrpc::RpcOutbound;
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
@@ -32,7 +33,9 @@ pub struct ApprovalPendingMap {
 
 struct PendingApprovalEntry {
     session_id: String,
-    tx: oneshot::Sender<ChannelApprovalResponse>,
+    tx: oneshot::Sender<AttributedApprovalResponse>,
+    /// Created when the cost prompt is delivered, not supplied by the approver.
+    operator_surface: Option<Arc<RpcOutbound>>,
 }
 
 pub struct PendingApproval {
@@ -60,7 +63,7 @@ impl ApprovalPendingMap {
         self: &Arc<Self>,
         request_id: String,
         session_id: String,
-        tx: oneshot::Sender<ChannelApprovalResponse>,
+        tx: oneshot::Sender<AttributedApprovalResponse>,
     ) -> PendingApproval {
         self.insert(request_id.clone(), session_id, tx);
         PendingApproval {
@@ -74,12 +77,47 @@ impl ApprovalPendingMap {
         &self,
         request_id: String,
         session_id: String,
-        tx: oneshot::Sender<ChannelApprovalResponse>,
+        tx: oneshot::Sender<AttributedApprovalResponse>,
     ) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            request_id,
+            PendingApprovalEntry {
+                session_id,
+                tx,
+                operator_surface: None,
+            },
+        );
+    }
+
+    /// Register a channel response with the connection that receives a cost prompt.
+    pub fn register_attributed(
+        self: &Arc<Self>,
+        request_id: String,
+        session_id: String,
+        tx: oneshot::Sender<AttributedApprovalResponse>,
+        operator_surface: Option<Arc<RpcOutbound>>,
+    ) -> PendingApproval {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            request_id.clone(),
+            PendingApprovalEntry {
+                session_id,
+                tx,
+                operator_surface,
+            },
+        );
+        PendingApproval {
+            map: Arc::clone(self),
+            request_id,
+            active: true,
+        }
+    }
+
+    pub fn is_cost_override(&self, request_id: &str, session_id: &str) -> bool {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, PendingApprovalEntry { session_id, tx });
+            .get(request_id)
+            .is_some_and(|entry| entry.session_id == session_id && entry.operator_surface.is_some())
     }
 
     pub fn resolve(
@@ -88,11 +126,33 @@ impl ApprovalPendingMap {
         session_id: &str,
         response: ChannelApprovalResponse,
     ) -> bool {
+        self.resolve_attributed(request_id, session_id, response.into(), None)
+    }
+
+    pub fn resolve_from_operator(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        response: AttributedApprovalResponse,
+        surface: &Arc<RpcOutbound>,
+    ) -> bool {
+        self.resolve_attributed(request_id, session_id, response, Some(surface))
+    }
+
+    fn resolve_attributed(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        response: AttributedApprovalResponse,
+        surface: Option<&Arc<RpcOutbound>>,
+    ) -> bool {
         let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if pending
-            .get(request_id)
-            .is_none_or(|entry| entry.session_id != session_id)
-        {
+        if pending.get(request_id).is_none_or(|entry| {
+            entry.session_id != session_id
+                || entry.operator_surface.as_ref().is_some_and(|expected| {
+                    surface.is_none_or(|actual| !Arc::ptr_eq(expected, actual))
+                })
+        }) {
             return false;
         }
         if let Some(entry) = pending.remove(request_id) {
@@ -725,7 +785,40 @@ impl RpcContext {
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
-    use zeroclaw_api::channel::ChannelApprovalResponse;
+    use zeroclaw_api::channel::{AttributedApprovalResponse, ChannelApprovalResponse};
+    use zeroclaw_api::jsonrpc::RpcOutbound;
+
+    #[tokio::test]
+    async fn cost_override_is_bound_to_the_operator_connection_that_received_it() {
+        let map = Arc::new(ApprovalPendingMap::default());
+        let (writer, _rx) = tokio::sync::mpsc::channel(4);
+        let intended = Arc::new(RpcOutbound::new(writer.clone()));
+        let other = Arc::new(RpcOutbound::new(writer));
+        let (tx, rx) = oneshot::channel();
+        let _guard =
+            map.register_attributed("cost".into(), "session".into(), tx, Some(intended.clone()));
+        assert!(!map.resolve("cost", "session", ChannelApprovalResponse::Approve));
+        assert!(!map.resolve_from_operator(
+            "cost",
+            "session",
+            ChannelApprovalResponse::Approve.into(),
+            &other
+        ));
+        assert!(!map.resolve_from_operator(
+            "cost",
+            "foreign",
+            ChannelApprovalResponse::Approve.into(),
+            &intended
+        ));
+        assert!(map.contains("cost"));
+        let answer = AttributedApprovalResponse::operator(ChannelApprovalResponse::Approve)
+            .with_user(Some("operator-42".into()));
+        assert!(map.resolve_from_operator("cost", "session", answer, &intended));
+        assert_eq!(
+            rx.await.unwrap().decided_by_user.as_deref(),
+            Some("operator-42")
+        );
+    }
 
     #[test]
     fn context_for_authority_shares_the_publication_domain() {
@@ -775,7 +868,10 @@ mod tests {
         map.insert("req-1".to_string(), "sess-1".to_string(), tx);
         assert!(map.resolve("req-1", "sess-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
-        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.try_recv().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[test]
@@ -851,6 +947,9 @@ mod tests {
         assert!(map.contains("req-6"));
         assert!(rx.try_recv().is_err());
         assert!(map.resolve("req-6", "sess-owner", ChannelApprovalResponse::Deny));
-        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(
+            rx.try_recv().unwrap().response,
+            ChannelApprovalResponse::Deny
+        );
     }
 }
