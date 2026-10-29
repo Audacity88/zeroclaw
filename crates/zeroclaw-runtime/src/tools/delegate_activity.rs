@@ -39,8 +39,9 @@ pub(crate) struct DelegateActivityForwarder {
     parent: ParentTurnEvents,
     agent: String,
     /// Ids handed to text-protocol calls, which carry no provider id, so a
-    /// finish matches its start. Matched by tool name, oldest first.
-    pending_unnamed: Mutex<Vec<(String, String)>>,
+    /// finish matches its start. Matched by tool name and original arguments,
+    /// oldest first when identical calls overlap.
+    pending_unnamed: Mutex<Vec<(String, Option<String>, String)>>,
 }
 
 impl DelegateActivityForwarder {
@@ -65,7 +66,7 @@ impl DelegateActivityForwarder {
                     None => {
                         let id = uuid::Uuid::new_v4().to_string();
                         let mut pending = self.pending_unnamed.lock();
-                        pending.push((tool.clone(), id.clone()));
+                        pending.push((tool.clone(), arguments.clone(), id.clone()));
                         let excess = pending.len().saturating_sub(PENDING_UNNAMED_LIMIT);
                         pending.drain(..excess);
                         id
@@ -94,6 +95,7 @@ impl DelegateActivityForwarder {
             ObserverEvent::ToolCall {
                 tool,
                 tool_call_id,
+                arguments,
                 success,
                 result,
                 ..
@@ -102,8 +104,10 @@ impl DelegateActivityForwarder {
                     Some(id) => id.clone(),
                     None => {
                         let mut pending = self.pending_unnamed.lock();
-                        let at = pending.iter().position(|(name, _)| name == tool)?;
-                        pending.remove(at).1
+                        let at = pending
+                            .iter()
+                            .position(|(name, args, _)| name == tool && args == arguments)?;
+                        pending.remove(at).2
                     }
                 };
                 // The loop scrubs credentials from `result` before it records it.
@@ -182,13 +186,19 @@ mod tests {
         }
     }
 
-    fn finish(id: Option<&str>, tool: &str, result: &str) -> ObserverEvent {
+    fn finish(
+        id: Option<&str>,
+        tool: &str,
+        arguments: &str,
+        result: &str,
+        success: bool,
+    ) -> ObserverEvent {
         ObserverEvent::ToolCall {
             tool: tool.into(),
             tool_call_id: id.map(Into::into),
             duration: Duration::ZERO,
-            success: true,
-            arguments: None,
+            success,
+            arguments: Some(arguments.into()),
             result: Some(result.into()),
             channel: None,
             agent_alias: None,
@@ -212,7 +222,13 @@ mod tests {
             "http_request",
             r#"{"url":"https://example.com","api_key":"sk-live-SECRET"}"#,
         ));
-        fwd.record_event(&finish(Some("c1"), "http_request", &"x".repeat(10_000)));
+        fwd.record_event(&finish(
+            Some("c1"),
+            "http_request",
+            r#"{"url":"https://example.com","api_key":"sk-live-SECRET"}"#,
+            &"x".repeat(10_000),
+            true,
+        ));
 
         let started = next(&mut rx);
         assert_eq!(started.parent_tool_call_id, "parent-call");
@@ -252,11 +268,44 @@ mod tests {
     fn id_less_calls_get_one_id_shared_by_start_and_finish() {
         let (fwd, mut rx) = forwarder(8);
         fwd.record_event(&start(None, "shell", "{}"));
-        fwd.record_event(&finish(None, "shell", "ok"));
+        fwd.record_event(&finish(None, "shell", "{}", "ok", true));
         let started = next(&mut rx);
         let finished = next(&mut rx);
         assert!(!started.tool_call_id.is_empty());
         assert_eq!(started.tool_call_id, finished.tool_call_id);
+    }
+
+    #[test]
+    fn id_less_parallel_calls_keep_their_results_when_finishes_arrive_in_reverse_order() {
+        let (fwd, mut rx) = forwarder(8);
+        let first_args = r#"{"command":"echo first"}"#;
+        let second_args = r#"{"command":"echo second"}"#;
+        fwd.record_event(&start(None, "shell", first_args));
+        fwd.record_event(&start(None, "shell", second_args));
+        fwd.record_event(&finish(None, "shell", second_args, "failed second", false));
+        fwd.record_event(&finish(None, "shell", first_args, "first", true));
+
+        let first_start = next(&mut rx);
+        let second_start = next(&mut rx);
+        let second_finish = next(&mut rx);
+        let first_finish = next(&mut rx);
+        assert_ne!(first_start.tool_call_id, second_start.tool_call_id);
+        assert_eq!(first_start.tool_call_id, first_finish.tool_call_id);
+        assert_eq!(second_start.tool_call_id, second_finish.tool_call_id);
+        assert_eq!(
+            first_finish.phase,
+            DelegateActivityPhase::Finished {
+                success: true,
+                output_preview: "first".into(),
+            }
+        );
+        assert_eq!(
+            second_finish.phase,
+            DelegateActivityPhase::Finished {
+                success: false,
+                output_preview: "failed second".into(),
+            }
+        );
     }
 
     #[test]
