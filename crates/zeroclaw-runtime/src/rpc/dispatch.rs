@@ -27245,7 +27245,7 @@ mod tests {
         assert!(!independent_operator_process(40, 20, parent));
         assert!(independent_operator_process(50, 20, parent));
         assert!(!independent_operator_process(99, 20, parent));
-        assert!(!independent_operator_process(99, 20, |pid| Some(pid)));
+        assert!(!independent_operator_process(99, 20, Some));
         assert!(!cost_override_peer_is_independent(None));
         assert!(!cost_override_peer_is_independent(Some(std::process::id())));
     }
