@@ -744,19 +744,12 @@ impl ZerocodePane {
             )),
             rows[0],
         );
-        let action_width = self
-            .rows
-            .iter()
-            .map(|row| row.action_key.len())
-            .max()
-            .unwrap_or(0)
-            .max(28)
-            + 2;
-        let items: Vec<ListItem> = visible
+        let available = rows[1].width.saturating_sub(4) as usize;
+        let chord_texts: Vec<String> = visible
             .iter()
             .map(|index| {
                 let row = &self.rows[*index];
-                let chords = if row.chords.is_empty() {
+                if row.chords.is_empty() {
                     crate::i18n::t("zc-zerocode-binding-unbound")
                 } else {
                     row.chords
@@ -764,14 +757,51 @@ impl ZerocodePane {
                         .map(Chord::display)
                         .collect::<Vec<_>>()
                         .join("  ")
-                };
+                }
+            })
+            .collect();
+        // Borders and the selection gutter consume four cells. Reserve space
+        // for effective keys before sizing the descriptive columns.
+        let chord_width = chord_texts
+            .iter()
+            .map(|text| crate::display_width::display_width(text))
+            .max()
+            .unwrap_or(0)
+            .min(available / 2);
+        let text_width = available.saturating_sub(chord_width);
+        let action_width = self
+            .rows
+            .iter()
+            .map(|row| row.action_key.len())
+            .max()
+            .unwrap_or(0)
+            .max(28)
+            .saturating_add(2)
+            .min(text_width * 3 / 5);
+        let label_width = visible
+            .iter()
+            .map(|index| crate::display_width::display_width(&self.rows[*index].label))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(2)
+            .min(text_width.saturating_sub(action_width));
+        let column = |text: &str, width: usize| {
+            let text = truncate_to_width(text, width.saturating_sub(2) as u16);
+            let padding = width.saturating_sub(crate::display_width::display_width(&text));
+            format!("{text}{}", " ".repeat(padding))
+        };
+        let items: Vec<ListItem> = visible
+            .iter()
+            .zip(chord_texts.iter())
+            .map(|(index, chords)| {
+                let row = &self.rows[*index];
                 ListItem::new(Line::from(vec![
+                    Span::styled(column(&row.action_key, action_width), theme::dim_style()),
+                    Span::styled(column(&row.label, label_width), theme::body_style()),
                     Span::styled(
-                        format!("{:<action_width$}", row.action_key),
-                        theme::dim_style(),
+                        truncate_to_width(chords, chord_width as u16),
+                        theme::accent_style(),
                     ),
-                    Span::styled(format!("{:<22}", row.label), theme::body_style()),
-                    Span::styled(chords, theme::accent_style()),
                 ]))
             })
             .collect();
@@ -2662,7 +2692,11 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
         let mut label_columns = Vec::new();
-        for action in ["input_bar.delete_previous_word", "input_bar.clear_input"] {
+        for action in [
+            "input_bar.delete_previous_word",
+            "input_bar.clear_input",
+            "input_bar.delete_forward",
+        ] {
             let binding = pane
                 .rows
                 .iter()
@@ -2676,6 +2710,22 @@ mod tests {
             label_columns.push(crate::display_width::display_width(&line[..label_start]));
         }
         assert_eq!(label_columns[0], label_columns[1]);
+
+        let selected = focus_binding(&mut pane, "input_bar.delete_previous_word");
+        pane.rows[selected].label = "删除上一个单词".into();
+        pane.rows[selected].chords = vec![Chord::ctrl('z')];
+        pane.binding_query = "input_bar.delete_previous_word".into();
+        for width in [60, 80, 120] {
+            let lines = render_rows(&mut pane, width, 12);
+            let line = lines
+                .iter()
+                .find(|line| line.contains("Ctrl+z"))
+                .unwrap_or_else(|| {
+                    panic!("effective binding missing at {width} columns: {lines:?}")
+                });
+            assert!(line.contains("input"), "{line}");
+            assert!(line.contains("删"), "{line}");
+        }
         overrides::reset();
     }
 
