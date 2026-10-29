@@ -1382,6 +1382,41 @@ pub(crate) fn draw_app_frame(
     }
 }
 
+/// Draw the production Chat pane and chrome with the optional docks closed.
+/// Evidence tests use the same frame, navigation and status renderers as `run`.
+#[cfg(test)]
+pub(crate) fn draw_chat_evidence_frame(
+    frame: &mut ratatui::Frame,
+    chat_pane: &mut chat::Chat,
+    acp_pane: &mut acp::Acp,
+    connection: &ConnectionState,
+) -> Rect {
+    let mut content = Rect::default();
+    draw_app_frame(
+        frame,
+        Mode::Chat,
+        chat_pane,
+        acp_pane,
+        |frame, chunks, chat_pane, _| {
+            draw_mode_bar(frame, chunks[0], Mode::Chat, None);
+            content = chunks[1];
+            chat_pane.draw_with_dock(frame, content, None, None);
+            chat_pane.draw_dock_overlay(frame);
+            let (input, source, max, window) = chat_pane.ctx_tokens();
+            draw_status_bar(
+                frame,
+                chunks[2],
+                connection,
+                None,
+                CtxBar::new(input, source, max, window),
+                false,
+                chat_pane.in_browse_mode(),
+            );
+        },
+    );
+    content
+}
+
 #[derive(Debug, Clone)]
 struct ModeBarEntry {
     mode: Mode,
