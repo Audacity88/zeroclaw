@@ -3821,6 +3821,9 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     );
 }
 #[cfg(test)]
+mod evidence_frames;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
