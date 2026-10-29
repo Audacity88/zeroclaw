@@ -1851,6 +1851,8 @@ impl App {
             .collect()
     }
 
+    /// Label/help override keys are screen-relative and shared by sections
+    /// exposing the same relative path.
     fn relative_field_path<'a>(&self, field: &'a ConfigFieldEntry) -> &'a str {
         let prefix = match &self.screen {
             Screen::FieldList { prefix, .. } | Screen::FieldEdit { prefix, .. } => prefix,
@@ -7812,6 +7814,34 @@ mod tests {
             group_key: String::new(),
             shape: None,
             cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn field_label_overrides_use_screen_relative_paths() {
+        let mut manager = test_manager();
+        for (prefix, path, relative, label) in [
+            (
+                "agents.demo",
+                "agents.demo.precheck.timeout_secs",
+                "precheck.timeout_secs",
+                "Precheck timeout (seconds)",
+            ),
+            (
+                "runtime_profiles.demo",
+                "runtime_profiles.demo.max_cost_per_day_cents",
+                "max_cost_per_day_cents",
+                "Maximum cost per day (cents)",
+            ),
+        ] {
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: prefix.into(),
+                breadcrumb: Vec::new(),
+            };
+            let field = field(path);
+            assert_eq!(manager.relative_field_path(&field), relative);
+            assert_eq!(readable_field_label(relative), label);
         }
     }
 
