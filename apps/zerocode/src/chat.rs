@@ -2817,6 +2817,9 @@ impl Chat {
             } else {
                 None
             };
+            // Removing the prompt also removes its turn boundary. Any output
+            // left behind must not acquire the previous loaded prompt's start.
+            let record_turn_end = refused_text.is_none();
             // A busy refusal never started the turn: return the message to
             // the queue before settling, so settling neither cleans up its
             // attachments nor loses its text. The text comes from the
@@ -2842,7 +2845,7 @@ impl Chat {
             } else {
                 QueuePauseReason::MissingCompletion
             };
-            state.settle_turn_from_prompt_response(pause_reason);
+            state.settle_turn_from_prompt_response(pause_reason, record_turn_end);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
                 let key = if requeued {
@@ -11823,8 +11826,7 @@ impl ChatState {
                     ],
                 );
                 self.freeze_prompt_settled_stream();
-                self.entries
-                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
             }
             SessionUpdate::TurnComplete {
@@ -11898,10 +11900,14 @@ impl ChatState {
         // A terminal notification resolves the earlier uncertainty, but the
         // queued backlog still waits for the user's deliberate resume.
         self.message_queue.acknowledge_terminal_notification();
-        self.settle_turn_lifecycle(clean, QueuePauseReason::Generic);
+        self.settle_turn_lifecycle(clean, QueuePauseReason::Generic, true);
     }
 
-    fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
+    fn settle_turn_from_prompt_response(
+        &mut self,
+        pause_reason: QueuePauseReason,
+        record_turn_end: bool,
+    ) {
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
@@ -11921,16 +11927,24 @@ impl ChatState {
         // Preserve per-turn provenance for a delayed terminal notification;
         // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
-        self.settle_turn_lifecycle(false, pause_reason);
+        self.settle_turn_lifecycle(false, pause_reason, record_turn_end);
     }
 
-    fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
+    fn settle_turn_lifecycle(
+        &mut self,
+        clean: bool,
+        pause_reason: QueuePauseReason,
+        record_turn_end: bool,
+    ) {
         // A new footer lands under the last cached entry: re-render that
-        // tail; a footer that moved needs every index.
-        match self.mark_turn_end(chrono::Local::now()) {
-            TurnEndChange::None => {}
-            TurnEndChange::Tail(entry_index) => self.mark_dirty_tail(entry_index),
-            TurnEndChange::Full => self.mark_dirty_full(),
+        // tail; a footer that moved needs every index. A refused prompt's
+        // optimistic row was removed, so the tail can belong to older history.
+        if record_turn_end {
+            match self.mark_turn_end(chrono::Local::now()) {
+                TurnEndChange::None => {}
+                TurnEndChange::Tail(entry_index) => self.mark_dirty_tail(entry_index),
+                TurnEndChange::Full => self.mark_dirty_full(),
+            }
         }
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
@@ -13197,14 +13211,16 @@ mod tests {
     #[test]
     fn a_footer_on_a_divided_entry_keeps_one_divider() {
         let mut s = state();
+        let at = entry_time::parse_created_at(&today_at(1, 0, 0)).unwrap();
+        let today = at.date_naive();
         // A tool-only turn: its single output entry may be the one re-rendered.
         s.push_user_message(Some("long task".to_string()), Vec::new());
-        s.entry_times[0].at = Some(chrono::Local::now() - chrono::TimeDelta::minutes(5));
+        s.entry_times[0].at = Some(at);
         s.mark_dirty_full();
-        s.rebuild_lines(80);
+        s.rebuild_lines_on(80, today);
         // Re-render the divided user entry itself as a tail change.
         s.mark_dirty_tail(0);
-        s.rebuild_lines(80);
+        s.rebuild_lines_on(80, today);
         let text = transcript_text(&s);
         assert_eq!(
             text.iter()
@@ -13214,7 +13230,7 @@ mod tests {
             "{text:#?}"
         );
         s.mark_dirty_full();
-        s.rebuild_lines(80);
+        s.rebuild_lines_on(80, today);
         assert_eq!(transcript_text(&s), text);
     }
 
@@ -26330,6 +26346,7 @@ mod tests {
     fn budget_warning_shows_one_notice_per_period_and_limit() {
         let mut s = state();
         s.apply_update(budget_warning(8.25, 10.0, "day"));
+        assert!(s.entry_time(0).is_some(), "the live notice has a time");
         // The daemon repeats it every turn while spend stays over the line.
         s.apply_update(budget_warning(9.10, 10.0, "day"));
         let notices = system_messages(&s);
@@ -26344,6 +26361,8 @@ mod tests {
         s.apply_update(budget_warning(850.0, 1000.0, "month"));
         let notices = system_messages(&s);
         assert_eq!(notices.len(), 3, "{notices:?}");
+        assert_eq!(s.entry_times.len(), s.entries().len());
+        assert!(s.entry_times.iter().all(|stamp| stamp.at.is_some()));
         assert!(notices[2].contains("monthly"), "{}", notices[2]);
 
         // Coming back to a pair already shown stays quiet, even after others.
@@ -32418,6 +32437,62 @@ mod tests {
 
         assert!(!active_state(&mut chat).turn_in_flight);
         assert_eq!(active_state(&mut chat).message_count, 7);
+    }
+
+    #[tokio::test]
+    async fn refused_prompt_preserves_loaded_turn_times() {
+        for (error_code, partial_output) in [
+            (crate::jsonrpc::error_codes::SESSION_BUSY, false),
+            (crate::jsonrpc::error_codes::INVALID_PARAMS, false),
+            (crate::jsonrpc::error_codes::INVALID_PARAMS, true),
+        ] {
+            let (mut chat, mut writer_rx) = test_chat();
+            let mut active = state();
+            active.load_history(
+                vec![
+                    timed("user", "old prompt", "2026-10-08T17:00:00Z".into()),
+                    timed("assistant", "old answer", "2026-10-08T17:00:05Z".into()),
+                ],
+                true,
+            );
+            let render_day = chrono::Local::now().date_naive();
+            active.rebuild_lines_on(80, render_day);
+            let original_times = active.entry_times.clone();
+            let original_text = transcript_text(&active);
+            active
+                .enqueue_message("refused prompt".to_string(), Vec::new())
+                .unwrap();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.pump_all_queues();
+            let request = next_rpc_request(&mut writer_rx, "prompt should be sent").await;
+            if partial_output {
+                active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
+                    session_id: "sess-1".to_string(),
+                    text: "partial reply before the error".to_string(),
+                });
+            }
+            respond_err(&chat.rpc_out, &request, error_code, "prompt refused");
+            tokio::task::yield_now().await;
+            chat.drain_prompt_completions();
+
+            let active = active_state(&mut chat);
+            assert!(!active.turn_in_flight);
+            assert_eq!(active.entries().len(), 2 + usize::from(partial_output));
+            assert_eq!(
+                active.entry_times[..2],
+                original_times[..],
+                "error code {error_code}"
+            );
+            active.rebuild_lines_on(80, render_day);
+            let text = transcript_text(active);
+            assert_eq!(text[..original_text.len()], original_text[..]);
+            assert!(
+                !transcript_text(active)
+                    .iter()
+                    .any(|line| line.starts_with("─── ")),
+                "a refused prompt cannot add a footer to an old five-second turn"
+            );
+        }
     }
 
     #[tokio::test]
