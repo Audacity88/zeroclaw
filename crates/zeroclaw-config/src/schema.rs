@@ -7453,8 +7453,9 @@ pub struct CostConfig {
 
     /// When a shared daily or monthly limit is exceeded, pause the turn and
     /// ask the operator (on channels that answer approvals) whether to
-    /// override it for the rest of the period, instead of stopping
-    /// (default: false)
+    /// lift that shared cap daemon-wide, including unattended jobs, until
+    /// UTC rollover or daemon restart. Other limits remain enforced
+    /// (default: false).
     #[tab(Limits)]
     #[serde(default)]
     pub allow_override: bool,

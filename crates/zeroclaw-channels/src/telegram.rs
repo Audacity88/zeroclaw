@@ -8677,13 +8677,14 @@ impl TelegramChannel {
              {tap_instruction}",
         );
 
-        let reply_markup = serde_json::json!({
-            "inline_keyboard": [[
-                { "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) },
-                { "text": format!("❌ {btn_deny}"),     "callback_data": format!("approval:{}:deny", approval_id) },
-                { "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) },
-            ]]
-        });
+        let mut buttons = vec![
+            serde_json::json!({ "text": format!("✅ {btn_approve}"), "callback_data": format!("approval:{}:approve", approval_id) }),
+            serde_json::json!({ "text": format!("❌ {btn_deny}"), "callback_data": format!("approval:{}:deny", approval_id) }),
+        ];
+        if request.tool_name != zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL {
+            buttons.push(serde_json::json!({ "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) }));
+        }
+        let reply_markup = serde_json::json!({ "inline_keyboard": [buttons] });
 
         let mut body = serde_json::json!({
             "chat_id": chat_id,
@@ -24136,6 +24137,53 @@ mod tests {
         })
         .await
         .expect("cancelled approval must not leave a live pending token");
+    }
+
+    #[tokio::test]
+    async fn cost_override_keyboard_has_no_always_button() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(server.uri())
+        .with_approval_timeout_secs(1);
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            arguments_summary: "shared limit reached".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let _ = ch.request_approval("12345", &request).await;
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let buttons = body["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert!(
+            buttons[0]["callback_data"]
+                .as_str()
+                .unwrap()
+                .ends_with(":approve")
+        );
+        assert!(
+            buttons[1]["callback_data"]
+                .as_str()
+                .unwrap()
+                .ends_with(":deny")
+        );
     }
 
     #[tokio::test]

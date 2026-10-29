@@ -275,7 +275,7 @@ fn build_approval_card(
         })
     };
 
-    serde_json::json!({
+    let mut card = serde_json::json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
         "header": {
@@ -308,7 +308,13 @@ fn build_approval_card(
                 }
             ]
         }
-    })
+    });
+    if tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+        && let Some(columns) = card["body"]["elements"][1]["columns"].as_array_mut()
+    {
+        columns.truncate(2);
+    }
+    card
 }
 
 fn build_resolved_approval_card(
@@ -6196,6 +6202,26 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
     // Card 2.0 approval card tests
     // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cost_override_card_has_no_always_button() {
+        let card = build_approval_card(
+            "test-id",
+            zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL,
+            "limit reached",
+            None,
+        );
+        let columns = card["body"]["elements"][1]["columns"].as_array().unwrap();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(
+            columns[0]["elements"][0]["behaviors"][0]["value"]["decision"],
+            "approve"
+        );
+        assert_eq!(
+            columns[1]["elements"][0]["behaviors"][0]["value"]["decision"],
+            "deny"
+        );
+    }
 
     #[test]
     fn build_approval_card_contains_all_three_buttons() {

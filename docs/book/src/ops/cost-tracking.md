@@ -192,22 +192,52 @@ limit:
   alternative) for the original model. The substitution happens before
   the request is dispatched.
 
-`allow_override = true` (default `false`) gives the operator a way past
-an exceeded shared limit without a restart. When a turn's next model
-call would exceed the shared daily or monthly limit and the turn's
-channel can answer approvals (ZeroCode, ACP editors, Telegram inline
-buttons), the turn pauses and asks. Approving lifts that limit for the
-rest of the UTC day or month, for every session of the daemon: a prompt
-waiting in another session closes on its own and that turn continues.
-Denying, or no answer within 10 minutes, stops only that turn with a
-budget error as before. Chat channels other than Telegram keep their own
-`approval_timeout_secs` (300 seconds by default), so there the shorter
-of the two applies. The override is saved in
-`state/cost-overrides.json` beside the ledger, so it survives a daemon
-restart and ends at the period rollover; setting `allow_override = false`
-restores the limit at once. Per-agent delegation ceilings are never
-overridable, and channels that cannot answer approvals keep the hard
-stop. `warn_at_percent` sets the warning threshold; defaults to 80%.
+`allow_override = true` (default `false`) lets the operator lift an exceeded
+shared daily or monthly limit without a restart. Before the next model call,
+a turn on an approval-capable channel pauses and asks. A one-time approval
+removes the named shared cap **daemon-wide**, for every user, session,
+delegation, and unattended scheduled or cron job using that tracker. A waiting
+prompt for the same period closes and its turn continues. A channel that
+cannot ask still stops at an enforced limit, but benefits from a grant made
+elsewhere. Other shared limits and per-agent or per-hop ceilings still apply;
+if both daily and monthly limits are exceeded, each needs its own approval.
+
+Grants exist only in memory and end at the next UTC day or month rollover,
+or when the daemon restarts. The tracker neither reads nor writes
+`state/cost-overrides.json`; files left by earlier builds have no authority.
+No persisted grant can restore an override after a restart.
+
+ZeroCode requires **Ctrl+O** to override, or a click on Override. Enter and
+Esc select Stop; the ordinary tool-approval `a` shortcut has no effect.
+ACP and chat prompts offer one-time approval and rejection only. Denial,
+an unavailable channel, or no answer stops only the waiting turn with a
+budget error. The maximum wait is 10 minutes. ACP uses the shorter of that
+and `acp.session_timeout_secs`. Chat channels other than Telegram use the
+shorter of that and their `approval_timeout_secs` (300 seconds by default).
+
+Each new grant emits one structured `Approve` audit event, with spend,
+limit, period, UTC `granted_at`, channel, deciding back-channel
+(`decided_by`), approval source, and the turn's session attribution. Waiting
+sessions released by that grant do not emit another operator-grant event.
+The normal runtime log persistence and retention settings control whether
+this event survives a restart. `decided_by` names an approval channel, not a
+verified person: the current approval response does not carry the responder's
+identity. In Telegram groups, any allowed responder in that chat can approve
+a grant for the whole daemon.
+
+Local RPC clients are operator clients. Socket permissions and session-owner
+checks do not distinguish a human client from an unsandboxed agent-launched
+process running as the daemon's trusted OS user. Such a process can request
+and approve an override through its own session. Keep `allow_override` off
+unless that local-process trust is acceptable or enforced isolation prevents
+agent processes from reaching operator RPC.
+
+Setting `cost.allow_override = false` through an accepted live RPC
+`config/set` change restores enforcement at the next budget check without a
+restart. Editing `config.toml` alone requires a reload or restart. Disabling
+overrides does not erase the in-memory grant: re-enabling them before rollover
+can reactivate it. Restart the daemon to clear grants immediately.
+`warn_at_percent` sets the warning threshold; defaults to 80%.
 
 Budget comparisons use recorded `cost_usd`, so they cannot account for the
 `unpriced_tokens` subset. A daily or monthly total below its cap is not a safety

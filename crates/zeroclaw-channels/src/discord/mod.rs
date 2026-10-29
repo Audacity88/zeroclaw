@@ -886,7 +886,10 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let (row, bindings) = approval::build_approval_row(token);
+        let (row, bindings) = approval::build_approval_row(
+            token,
+            request.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL,
+        );
         // Register every button's intent first. Single-use is enforced by the
         // registry's `take`; the per-click `interaction_gate` is enforced by the
         // type-3 dispatch before any `take`.
@@ -8205,7 +8208,7 @@ mod tests {
         // Register exactly what send_buttoned_approval registers, then confirm
         // every button id resolves to its bound decision (and only its own).
         let token = "abc123";
-        let (_, bindings) = approval::build_approval_row(token);
+        let (_, bindings) = approval::build_approval_row(token, false);
         {
             let mut reg = ch.pending_components.lock();
             for (cid, decision) in &bindings {
