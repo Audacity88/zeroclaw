@@ -150,6 +150,8 @@ pub(super) fn parse_created_at(value: &str) -> Option<DateTime<Local>> {
         .map(|at| at.with_timezone(&Local))
 }
 
+// Deliberately use 24-hour clocks and ISO dates in every locale to keep
+// transcript times unambiguous. Fluent localizes labels and durations.
 fn clock(at: &DateTime<Local>) -> String {
     at.format("%H:%M").to_string()
 }

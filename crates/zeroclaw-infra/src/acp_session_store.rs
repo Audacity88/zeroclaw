@@ -1679,6 +1679,8 @@ impl AcpSessionStore {
     ) -> Result<i64> {
         // The first user row of a checkpointed turn is its prompt; it keeps
         // the time the turn began instead of the finalization time.
+        // The checkpoint records no arrival times for later user rows, so
+        // those deliberately keep the finalization time.
         let mut prompt_at = prompt_at;
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
@@ -4102,6 +4104,8 @@ mod tests {
                 content: "ok".into(),
                 tool_name: "shell".into(),
             }]),
+            // A later visible user row has no separately recorded arrival.
+            ConversationMessage::Chat(ChatMessage::user("steering")),
             ConversationMessage::Chat(ChatMessage::assistant("done")),
         ];
         store
