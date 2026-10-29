@@ -4263,8 +4263,14 @@ impl Chat {
             ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
         }
 
+        // Refresh must preserve transcript selection, but cannot take a chord
+        // owned by the focused composer's live input bindings.
+        let refresh_yields_to_composer = matches!(&self.phase, ChatPhase::Active(state)
+            if state.composer_owns_text_input()
+                && crate::keymap::InputBarAction::from_chord(&key).is_some());
         if crate::keymap::ChatTabAction::from_chord(&key)
             == Some(crate::keymap::ChatTabAction::RefreshSession)
+            && !refresh_yields_to_composer
         {
             self.begin_session_refresh();
             return false;
@@ -4566,6 +4572,7 @@ impl Chat {
         let chat_action = ChatTabAction::from_chord(&key);
         let chat_action_bypasses_text_input = chat_action.is_some_and(|action| {
             !matches!(action, ChatTabAction::ApprovalApprove)
+                && !(action == ChatTabAction::RefreshSession && refresh_yields_to_composer)
                 && crate::keymap::action_bypasses_text_input(action, &key)
         });
 
