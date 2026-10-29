@@ -6827,3 +6827,7 @@ mod transport_leg_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "app/evidence_tests.rs"]
+mod evidence_tests;
