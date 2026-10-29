@@ -7340,7 +7340,8 @@ fn render_delegate_activity(
     }
     for call in &log.calls {
         let mark = match call.success {
-            None => "…",
+            None if in_flight => "…",
+            None => "·",
             Some(true) => "✓",
             Some(false) => "✗",
         };
@@ -7352,6 +7353,10 @@ fn render_delegate_activity(
         );
         if !call.arguments_summary.is_empty() {
             text.push_str(&format!(" ({})", safe(&call.arguments_summary, 100)));
+        }
+        if call.success.is_none() && !in_flight {
+            text.push_str(" · ");
+            text.push_str(&crate::i18n::t("zc-chat-tool-result-not-recorded"));
         }
         lines.push(Line::from(Span::styled(
             text,
@@ -9715,7 +9720,10 @@ impl DelegateActivityLog {
             }
             DelegateActivityPhase::Finished { success, .. } => {
                 if let Some(call) = self.calls.iter_mut().rev().find(|call| {
-                    call.tool_call_id == activity.tool_call_id && call.agent == activity.agent
+                    call.tool_call_id == activity.tool_call_id
+                        && call.agent == activity.agent
+                        && call.depth == activity.depth
+                        && call.success.is_none()
                 }) {
                     call.success = Some(success);
                 }
@@ -26488,6 +26496,77 @@ mod tests {
     }
 
     #[test]
+    fn delegate_activity_finishes_match_agent_and_depth_for_reused_provider_ids() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut log = DelegateActivityLog::default();
+        let activity = |agent: &str, depth, phase| DelegateActivity {
+            parent_tool_call_id: "parent".into(),
+            agent: agent.into(),
+            depth,
+            tool_call_id: "call_1".into(),
+            tool_name: "shell".into(),
+            phase,
+        };
+        for (agent, depth) in [("researcher", 0), ("researcher", 1), ("helper", 0)] {
+            log.apply(activity(
+                agent,
+                depth,
+                DelegateActivityPhase::Started {
+                    arguments_summary: String::new(),
+                },
+            ));
+        }
+        log.apply(activity(
+            "researcher",
+            0,
+            DelegateActivityPhase::Finished {
+                success: false,
+                output_preview: String::new(),
+            },
+        ));
+        assert_eq!(log.calls[0].success, Some(false));
+        assert_eq!(log.calls[1].success, None);
+        assert_eq!(log.calls[2].success, None);
+        log.apply(activity(
+            "researcher",
+            1,
+            DelegateActivityPhase::Finished {
+                success: true,
+                output_preview: String::new(),
+            },
+        ));
+        assert_eq!(log.calls[1].success, Some(true));
+        assert_eq!(log.calls[2].success, None);
+    }
+
+    #[test]
+    fn delegate_activity_finishes_skip_settled_calls_with_reused_provider_ids() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut log = DelegateActivityLog::default();
+        let activity = |phase| DelegateActivity {
+            parent_tool_call_id: "parent".into(),
+            agent: "researcher".into(),
+            depth: 0,
+            tool_call_id: "call_1".into(),
+            tool_name: "shell".into(),
+            phase,
+        };
+        for _ in 0..2 {
+            log.apply(activity(DelegateActivityPhase::Started {
+                arguments_summary: String::new(),
+            }));
+        }
+        for success in [false, true, false] {
+            log.apply(activity(DelegateActivityPhase::Finished {
+                success,
+                output_preview: String::new(),
+            }));
+        }
+        assert_eq!(log.calls[0].success, Some(true));
+        assert_eq!(log.calls[1].success, Some(false));
+    }
+
+    #[test]
     fn delegate_card_shows_child_activity_while_running_and_keeps_it_after() {
         use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
         let mut s = state();
@@ -26587,17 +26666,26 @@ mod tests {
                 },
             },
         });
+        s.tool_disclosures
+            .insert(Arc::from("parent"), ToolDisclosure::Full);
         let render = |s: &mut ChatState| {
             s.rebuild_lines(120);
             rendered_text(&s.transcript_layout.view().cached_lines)
         };
-        assert!(render(&mut s).contains("now: web_fetch"));
+        let running = render(&mut s);
+        assert!(running.contains("now: web_fetch"), "{running}");
+        assert!(running.contains("… researcher: web_fetch"), "{running}");
 
         // Cancelled: no parent result, no child finish.
         s.settle_turn_lifecycle(false, QueuePauseReason::Generic);
         let settled = render(&mut s);
         assert!(settled.contains("1 child tool calls"), "{settled}");
         assert!(!settled.contains("now:"), "{settled}");
+        assert!(
+            settled.contains("· researcher: web_fetch · Result not recorded"),
+            "{settled}"
+        );
+        assert!(!settled.contains("… researcher: web_fetch"), "{settled}");
     }
 
     #[test]
