@@ -744,6 +744,14 @@ impl ZerocodePane {
             )),
             rows[0],
         );
+        let action_width = self
+            .rows
+            .iter()
+            .map(|row| row.action_key.len())
+            .max()
+            .unwrap_or(0)
+            .max(28)
+            + 2;
         let items: Vec<ListItem> = visible
             .iter()
             .map(|index| {
@@ -758,7 +766,10 @@ impl ZerocodePane {
                         .join("  ")
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<28}", row.action_key), theme::dim_style()),
+                    Span::styled(
+                        format!("{:<action_width$}", row.action_key),
+                        theme::dim_style(),
+                    ),
                     Span::styled(format!("{:<22}", row.label), theme::body_style()),
                     Span::styled(chords, theme::accent_style()),
                 ]))
@@ -1811,6 +1822,11 @@ impl ZerocodePane {
         if let Some((tag, variant)) = action_key.split_once('.') {
             overrides::set_row(tag, variant, vec![chord.clone()]);
         }
+        // A chord edit can remove this row from the matches. Keep the saved
+        // action selected so a subsequent reset cannot target a different row.
+        self.binding_query.clear();
+        self.binding_query_anchor = None;
+        self.finish_binding_query_edit();
         self.rebuild_rows();
         self.status = Some(format!("{action_key} -> {}", chord.display()));
     }
@@ -2530,6 +2546,42 @@ mod tests {
     }
 
     #[test]
+    fn filtered_rebind_keeps_saved_action_selected_for_the_next_reset() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        let quit = focus_binding(&mut pane, "global.quit");
+        let quit_chords = pane.rows[quit].chords.clone();
+        pane.handle_key(key(KeyCode::Char('/')));
+        pane.handle_paste("ctrl");
+        pane.handle_key(key(KeyCode::Enter));
+        let undo = focus_binding(&mut pane, "input_bar.undo");
+        assert!(pane.visible_binding_indices().contains(&undo));
+        assert_eq!(pane.binding_query_anchor.as_deref(), Some("global.quit"));
+
+        pane.handle_key(key(KeyCode::Enter));
+        pane.handle_key(KeyEvent::new(KeyCode::F(11), KeyModifiers::ALT));
+        assert!(pane.capture.is_none());
+        assert_eq!(
+            pane.rows[undo].chords,
+            vec![Chord::with(KeyCode::F(11), KeyModifiers::ALT)]
+        );
+        assert!(pane.binding_query.is_empty());
+        assert!(pane.binding_query_anchor.is_none());
+        assert_eq!(pane.binding_cursor, undo);
+        assert!(pane.visible_binding_indices().contains(&undo));
+
+        pane.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(pane.binding_cursor, undo);
+        assert_eq!(pane.rows[undo].chords, default_chords_for("input_bar.undo"));
+        assert_eq!(pane.rows[quit].chords, quit_chords);
+        overrides::reset();
+    }
+
+    #[test]
     fn binding_query_empty_results_and_layered_cancel_preserve_selection() {
         let _g = overrides::TEST_GUARD
             .lock()
@@ -2585,6 +2637,45 @@ mod tests {
             pane.binding_query = query.into();
             assert!(pane.visible_binding_indices().contains(&index), "{query}");
         }
+        overrides::reset();
+    }
+
+    #[test]
+    fn binding_columns_leave_a_gap_after_long_action_keys() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        focus_binding(&mut pane, "input_bar.delete_previous_word");
+        pane.binding_query = "input_bar.".into();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 60)).unwrap();
+        terminal
+            .draw(|frame| pane.draw_bindings(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = buffer
+            .content
+            .chunks(180)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let mut label_columns = Vec::new();
+        for action in ["input_bar.delete_previous_word", "input_bar.clear_input"] {
+            let binding = pane
+                .rows
+                .iter()
+                .find(|row| row.action_key == action)
+                .unwrap();
+            let line = lines.iter().find(|line| line.contains(action)).unwrap();
+            let action_end = line.find(action).unwrap() + action.len();
+            let label_start = line.find(binding.label.as_str()).unwrap();
+            assert!(label_start >= action_end + 2, "{line}");
+            assert!(line[action_end..label_start].chars().all(|c| c == ' '));
+            label_columns.push(crate::display_width::display_width(&line[..label_start]));
+        }
+        assert_eq!(label_columns[0], label_columns[1]);
         overrides::reset();
     }
 
