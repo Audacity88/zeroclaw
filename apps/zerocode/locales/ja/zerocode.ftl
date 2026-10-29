@@ -582,7 +582,6 @@ zc-config-help-save-array = 配列を保存
 zc-config-help-save-value = 値を保存
 zc-config-help-reset-default = デフォルトにリセット
 zc-config-status-alias-empty = エイリアス名は空にできません
-zc-config-status-alias-deleted = { $alias } を削除しました
 zc-config-status-alias-create-failed = 作成に失敗しました: { $err }
 zc-config-status-delete-failed = 削除に失敗しました: { $err }
 zc-config-status-field-reset = { $prop } をリセットしました

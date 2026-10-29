@@ -582,7 +582,6 @@ zc-config-help-save-array = Guardar matriz
 zc-config-help-save-value = Guardar valor
 zc-config-help-reset-default = Restablecer a predeterminado
 zc-config-status-alias-empty = El nombre del alias no puede estar vacío
-zc-config-status-alias-deleted = Eliminado { $alias }
 zc-config-status-alias-create-failed = Error al crear: { $err }
 zc-config-status-delete-failed = Error al eliminar: { $err }
 zc-config-status-field-reset = Restablecer { $prop }

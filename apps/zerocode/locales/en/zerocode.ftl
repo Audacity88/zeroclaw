@@ -735,7 +735,6 @@ zc-config-alias-rename-input-title = New alias name
 zc-config-alias-rename-confirm-hint = Confirm this rename. The daemon updates existing references to the alias.
 zc-config-alias-rename-confirm-title = Confirm provider alias rename
 zc-config-alias-rename-confirm-target = { $path }: { $from } → { $to }
-zc-config-status-alias-deleted = Deleted { $alias }
 zc-config-status-alias-create-failed = Create failed: { $err }
 zc-config-status-delete-failed = Delete failed: { $err }
 zc-config-status-field-reset = Reset { $prop }

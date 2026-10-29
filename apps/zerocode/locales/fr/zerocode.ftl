@@ -582,7 +582,6 @@ zc-config-help-save-array = Enregistrer le tableau
 zc-config-help-save-value = Enregistrer la valeur
 zc-config-help-reset-default = Réinitialiser par défaut
 zc-config-status-alias-empty = Le nom de l'alias ne peut pas être vide
-zc-config-status-alias-deleted = { $alias } supprimé
 zc-config-status-alias-create-failed = Échec de la création : { $err }
 zc-config-status-delete-failed = Échec de la suppression : { $err }
 zc-config-status-field-reset = { $prop } réinitialisé

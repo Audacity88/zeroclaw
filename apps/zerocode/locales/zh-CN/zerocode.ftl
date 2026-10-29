@@ -582,7 +582,6 @@ zc-config-help-save-array = 保存数组
 zc-config-help-save-value = 保存值
 zc-config-help-reset-default = 重置为默认
 zc-config-status-alias-empty = 别名不能为空
-zc-config-status-alias-deleted = 已删除 { $alias }
 zc-config-status-alias-create-failed = 创建失败：{ $err }
 zc-config-status-delete-failed = 删除失败：{ $err }
 zc-config-status-field-reset = 已重置 { $prop }
