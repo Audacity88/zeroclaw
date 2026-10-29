@@ -210,6 +210,13 @@ struct PendingConfigMutation {
     scroll: u16,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutationDialogInput {
+    AwaitingDraw,
+    AwaitingDrain,
+    Armed,
+}
+
 enum ConfigMutationDialog {
     Confirm(PendingConfigMutation),
     Outcome { message: String, scroll: u16 },
@@ -536,6 +543,9 @@ pub(crate) struct App {
     select_items: Vec<String>,
     status_msg: Option<String>,
     mutation_dialog: Option<ConfigMutationDialog>,
+    /// Created by each new dialog; only the renderer and outer input drain
+    /// advance this readiness state. A key handler cannot arm its own dialog.
+    mutation_input: std::cell::Cell<MutationDialogInput>,
     /// Furthest the dialog text can scroll, measured at the last draw.
     mutation_scroll_max: std::cell::Cell<u16>,
     application_feedback: crate::config_application::ApplicationFeedback,
@@ -619,6 +629,7 @@ impl App {
             select_items: Vec::new(),
             status_msg: None,
             mutation_dialog: None,
+            mutation_input: std::cell::Cell::new(MutationDialogInput::AwaitingDraw),
             mutation_scroll_max: std::cell::Cell::new(0),
             application_feedback: crate::config_application::ApplicationFeedback::new(),
             filter: None,
@@ -1452,11 +1463,11 @@ impl App {
         }
 
         if self.has_mutation_dialog() {
-            if matches!(
-                mouse.kind,
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            ) {
-                self.cancel_mutation_dialog();
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_mutation_dialog(false),
+                MouseEventKind::ScrollDown => self.scroll_mutation_dialog(true),
+                MouseEventKind::Down(_) => self.cancel_mutation_dialog(),
+                _ => {}
             }
             return Ok(());
         }
@@ -3622,8 +3633,8 @@ impl App {
                     let prop = field.path.clone();
                     if let Screen::FieldList { prefix, .. } = &self.screen {
                         let prefix = prefix.clone();
-                        self.mutation_dialog =
-                            Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+                        self.show_mutation_dialog(ConfigMutationDialog::Confirm(
+                            PendingConfigMutation {
                                 action: ConfigMutation::Reset {
                                     prop,
                                     prefix,
@@ -3631,7 +3642,8 @@ impl App {
                                 },
                                 preview: None,
                                 scroll: 0,
-                            }));
+                            },
+                        ));
                     }
                 }
             }
@@ -3680,8 +3692,43 @@ impl App {
         }
     }
 
+    fn show_mutation_dialog(&mut self, dialog: ConfigMutationDialog) {
+        self.mutation_dialog = Some(dialog);
+        self.mutation_input.set(MutationDialogInput::AwaitingDraw);
+        self.mutation_scroll_max.set(0);
+    }
+
     fn show_mutation_outcome(&mut self, message: String) {
-        self.mutation_dialog = Some(ConfigMutationDialog::Outcome { message, scroll: 0 });
+        self.show_mutation_dialog(ConfigMutationDialog::Outcome { message, scroll: 0 });
+    }
+
+    /// Called only after a successful terminal draw. Discard type-ahead before
+    /// allowing Enter to confirm or dismiss this particular dialog.
+    pub(crate) fn arm_mutation_dialog_after_draw(
+        &mut self,
+        discard_buffered_input: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.has_mutation_dialog()
+            && self.mutation_input.get() == MutationDialogInput::AwaitingDrain
+        {
+            discard_buffered_input()?;
+            self.mutation_input.set(MutationDialogInput::Armed);
+        }
+        Ok(())
+    }
+
+    fn scroll_mutation_dialog(&mut self, down: bool) {
+        if let Some(dialog) = self.mutation_dialog.as_mut() {
+            let scroll = match dialog {
+                ConfigMutationDialog::Confirm(pending) => &mut pending.scroll,
+                ConfigMutationDialog::Outcome { scroll, .. } => scroll,
+            };
+            *scroll = if down {
+                scroll.saturating_add(1).min(self.mutation_scroll_max.get())
+            } else {
+                scroll.saturating_sub(1)
+            };
+        }
     }
 
     async fn begin_delete_confirmation(&mut self, path: String, key: String, costs: bool) {
@@ -3691,7 +3738,7 @@ impl App {
                     .as_ref()
                     .is_none_or(|plan| plan.path == path && plan.key == key) =>
             {
-                self.mutation_dialog = Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+                self.show_mutation_dialog(ConfigMutationDialog::Confirm(PendingConfigMutation {
                     action: ConfigMutation::Delete { path, key, costs },
                     preview,
                     scroll: 0,
@@ -3725,6 +3772,11 @@ impl App {
             self.cancel_mutation_dialog();
             return Ok(());
         }
+        if E::from_chord(&key) == Some(E::Confirm)
+            && self.mutation_input.get() != MutationDialogInput::Armed
+        {
+            return Ok(());
+        }
         if matches!(
             self.mutation_dialog,
             Some(ConfigMutationDialog::Outcome { .. })
@@ -3734,18 +3786,10 @@ impl App {
             return Ok(());
         }
         if E::from_chord(&key) != Some(E::Confirm) {
-            if let Some(dialog) = self.mutation_dialog.as_mut() {
-                let scroll = match dialog {
-                    ConfigMutationDialog::Confirm(pending) => &mut pending.scroll,
-                    ConfigMutationDialog::Outcome { scroll, .. } => scroll,
-                };
-                match T::from_chord(&key) {
-                    Some(T::Up) => *scroll = scroll.saturating_sub(1),
-                    Some(T::Down) => {
-                        *scroll = scroll.saturating_add(1).min(self.mutation_scroll_max.get())
-                    }
-                    _ => {}
-                }
+            match T::from_chord(&key) {
+                Some(T::Up) => self.scroll_mutation_dialog(false),
+                Some(T::Down) => self.scroll_mutation_dialog(true),
+                _ => {}
             }
             return Ok(());
         }
@@ -3902,6 +3946,15 @@ impl App {
         Ok(())
     }
 
+    fn mark_mutation_dialog_drawn(&self, content: Rect) {
+        if content.width > 0
+            && content.height > 0
+            && self.mutation_input.get() == MutationDialogInput::AwaitingDraw
+        {
+            self.mutation_input.set(MutationDialogInput::AwaitingDrain);
+        }
+    }
+
     fn draw_mutation_confirmation(&self, frame: &mut Frame, area: Rect) {
         if let Some(ConfigMutationDialog::Outcome { message, scroll }) =
             self.mutation_dialog.as_ref()
@@ -3915,6 +3968,7 @@ impl App {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(2)])
                 .split(inner);
+            self.mark_mutation_dialog_drawn(chunks[0]);
             let text = Paragraph::new(message.as_str()).wrap(Wrap { trim: false });
             let scroll = self.clamp_mutation_scroll(&text, chunks[0], *scroll);
             frame.render_widget(text.scroll((scroll, 0)), chunks[0]);
@@ -3951,6 +4005,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(2)])
             .split(inner);
+        self.mark_mutation_dialog_drawn(chunks[0]);
         let mut lines = vec![Line::from(pending.action.target()), Line::default()];
         if deleting {
             if let Some(plan) = pending.preview.as_ref() {
@@ -10243,6 +10298,16 @@ mod tests {
         .unwrap()
     }
 
+    fn draw_and_arm_mutation_dialog(manager: &mut App) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        manager.arm_mutation_dialog_after_draw(|| Ok(())).unwrap();
+        assert!(manager.mutation_input.get() == MutationDialogInput::Armed);
+    }
+
     fn prepare_alias_confirmation(manager: &mut App) {
         manager.sections = vec![entry_with_cost("providers.models", "models")];
         manager.screen = Screen::AliasList {
@@ -10314,6 +10379,104 @@ mod tests {
         clippy::await_holding_lock,
         reason = "serialize process-wide keymap overrides during asynchronous handler tests"
     )]
+    async fn config_confirmation_type_ahead_cannot_delete_or_reset_before_draw_and_drain() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for reset in [false, true] {
+            let (mut manager, requests) = confirmation_manager(confirmation_response);
+            prepare_alias_confirmation(&mut manager);
+            let trigger = if reset {
+                manager.fields = vec![field("a.first")];
+                manager.screen = Screen::FieldList {
+                    section_idx: 0,
+                    prefix: "a".into(),
+                    breadcrumb: vec!["a".into()],
+                };
+                KeyCode::Char('d')
+            } else {
+                KeyCode::Char('x')
+            };
+            let mut term = confirmation_term();
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            manager.handle_key(key(trigger), &mut term).await.unwrap();
+            assert!(manager.has_pending_mutation());
+            let before = requests.lock().unwrap().len();
+            // Neither an early barrier call nor a plain Press can arm a dialog.
+            manager
+                .arm_mutation_dialog_after_draw(|| panic!("dialog has not been drawn"))
+                .unwrap();
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.has_pending_mutation());
+            assert_eq!(requests.lock().unwrap().len(), before);
+
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| manager.draw_into(frame, frame.area()))
+                .unwrap();
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.has_pending_mutation());
+            assert_eq!(requests.lock().unwrap().len(), before);
+            assert!(
+                manager
+                    .arm_mutation_dialog_after_draw(|| anyhow::bail!("input drain failed"))
+                    .is_err()
+            );
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.has_pending_mutation());
+            assert_eq!(requests.lock().unwrap().len(), before);
+
+            manager.arm_mutation_dialog_after_draw(|| Ok(())).unwrap();
+            // Later frames must not discard fresh operator input again.
+            terminal
+                .draw(|frame| manager.draw_into(frame, frame.area()))
+                .unwrap();
+            manager
+                .arm_mutation_dialog_after_draw(|| panic!("dialog is already armed"))
+                .unwrap();
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            assert!(!manager.has_pending_mutation());
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.has_mutation_dialog());
+            let mutation_method = if reset {
+                "config/delete"
+            } else {
+                "config/map-key-delete"
+            };
+            assert_eq!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == mutation_method)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
     async fn config_confirmation_cancels_without_mutation_and_confirms_captured_target_once() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
@@ -10367,6 +10530,7 @@ mod tests {
         manager.filter = Some("unchanged".into());
         manager.handle_paste("unsafe\n").await;
         assert_eq!(manager.filter.as_deref(), Some("unchanged"));
+        draw_and_arm_mutation_dialog(&mut manager);
         let mut repeat = key(KeyCode::Enter);
         repeat.kind = KeyEventKind::Repeat;
         manager.handle_key(repeat, &mut term).await.unwrap();
@@ -10415,6 +10579,7 @@ mod tests {
             .handle_key(key(KeyCode::Char('x')), &mut term)
             .await
             .unwrap();
+        draw_and_arm_mutation_dialog(&mut manager);
         manager
             .handle_key(key(KeyCode::Enter), &mut term)
             .await
@@ -10423,6 +10588,7 @@ mod tests {
             requests.lock().unwrap()[1]["params"],
             serde_json::json!({"path": "cost.rates.providers.models.test", "key": "priced-model"})
         );
+        draw_and_arm_mutation_dialog(&mut manager);
         manager
             .handle_key(key(KeyCode::Enter), &mut term)
             .await
@@ -10464,6 +10630,7 @@ mod tests {
             .handle_key(key(KeyCode::Char('d')), &mut term)
             .await
             .unwrap();
+        draw_and_arm_mutation_dialog(&mut manager);
         manager
             .handle_key(key(KeyCode::Enter), &mut term)
             .await
@@ -10512,6 +10679,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            draw_and_arm_mutation_dialog(&mut manager);
             if denied_preview {
                 assert!(manager.pending_mutation().is_none());
                 assert!(
@@ -10553,12 +10721,23 @@ mod tests {
         });
         prepare_alias_confirmation(&mut manager);
         let mut term = confirmation_term();
-        for code in [KeyCode::Char('x'), KeyCode::Enter] {
-            manager
-                .handle_key(KeyEvent::new(code, KeyModifiers::NONE), &mut term)
-                .await
-                .unwrap();
-        }
+        manager
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        draw_and_arm_mutation_dialog(&mut manager);
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        // A queued second Enter cannot dismiss a result that has not appeared.
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
         assert!(manager.pending_mutation().is_none());
         let Some(ConfigMutationDialog::Outcome {
             message: status, ..
@@ -10585,6 +10764,13 @@ mod tests {
         assert!(rendered.contains("workspace cleanup incomplete"));
         assert!(manager.aliases.is_empty());
         assert!(manager.loaded_section.is_none());
+        // Rendering alone is not enough; buffered input must also be discarded.
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.has_mutation_dialog());
+        manager.arm_mutation_dialog_after_draw(|| Ok(())).unwrap();
         manager
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
             .await
@@ -10636,9 +10822,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_mutation_wheel_scrolls_confirmations_and_results_until_click() {
+        for outcome in [false, true] {
+            let mut manager = test_manager();
+            if outcome {
+                manager.show_mutation_outcome("warning\n".repeat(30));
+            } else {
+                manager.show_mutation_dialog(ConfigMutationDialog::Confirm(
+                    PendingConfigMutation {
+                        action: ConfigMutation::Reset {
+                            prop: "long.configured.path.".repeat(30),
+                            prefix: "a".into(),
+                            tab: None,
+                        },
+                        preview: None,
+                        scroll: 0,
+                    },
+                ));
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 10)).unwrap();
+            terminal
+                .draw(|frame| manager.draw_mutation_confirmation(frame, frame.area()))
+                .unwrap();
+            assert!(manager.mutation_scroll_max.get() > 0);
+            let mut term = confirmation_term();
+            let mouse = |kind| MouseEvent {
+                kind,
+                column: 1,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            let scroll = |manager: &App| match manager.mutation_dialog.as_ref().unwrap() {
+                ConfigMutationDialog::Confirm(pending) => pending.scroll,
+                ConfigMutationDialog::Outcome { scroll, .. } => *scroll,
+            };
+            for _ in 0..100 {
+                manager
+                    .handle_mouse(
+                        mouse(MouseEventKind::ScrollDown),
+                        Rect::default(),
+                        &mut term,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(scroll(&manager), manager.mutation_scroll_max.get());
+            manager
+                .handle_mouse(mouse(MouseEventKind::ScrollUp), Rect::default(), &mut term)
+                .await
+                .unwrap();
+            assert_eq!(scroll(&manager), manager.mutation_scroll_max.get() - 1);
+            manager
+                .handle_mouse(
+                    mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+                    Rect::default(),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert!(!manager.has_mutation_dialog());
+        }
+    }
+
+    #[tokio::test]
     async fn config_reconnect_keeps_a_mutation_result_and_drops_a_pending_confirmation() {
         let mut old = test_manager();
         old.show_mutation_outcome("cleanup incomplete".into());
+        draw_and_arm_mutation_dialog(&mut old);
         let mut next = test_manager();
         old.hand_off_mutation_outcome(&mut next);
         assert!(matches!(
@@ -10646,8 +10897,10 @@ mod tests {
             Some(ConfigMutationDialog::Outcome { message, .. }) if message == "cleanup incomplete"
         ));
 
+        assert!(next.mutation_input.get() == MutationDialogInput::AwaitingDraw);
+
         let mut old = test_manager();
-        old.mutation_dialog = Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+        old.show_mutation_dialog(ConfigMutationDialog::Confirm(PendingConfigMutation {
             action: ConfigMutation::Reset {
                 prop: "cost.daily_limit_usd".into(),
                 prefix: "cost".into(),
