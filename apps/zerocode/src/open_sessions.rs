@@ -162,9 +162,9 @@ impl Snapshot {
     }
 }
 
-/// Check a loaded list against the daemon before resuming it, so a session
-/// deleted or pruned since the last launch is skipped instead of showing as a
-/// failed row that cannot be closed.
+/// Prune missing Code sessions using the dedicated ACP store. Chat listing
+/// is not an existence check: JSONL sessions lack the alias/channel metadata
+/// required by `session/list`. Keep Chat entries for the normal resume path.
 async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize) {
     let wants = |pane| saved.sessions.iter().any(|s| s.pane == pane);
     let code = if wants(SavedPane::Code) {
@@ -172,12 +172,7 @@ async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize
     } else {
         None
     };
-    let chat = if wants(SavedPane::Chat) {
-        rpc.session_list(None).await.ok().map(|list| list.sessions)
-    } else {
-        None
-    };
-    let dropped = saved.retain_known(code.as_deref(), chat.as_deref());
+    let dropped = saved.retain_known(code.as_deref(), None);
     (saved, dropped)
 }
 
@@ -241,7 +236,7 @@ pub(crate) struct Restore {
     pub snapshot: Option<Snapshot>,
     /// Open in another running window.
     pub elsewhere: usize,
-    /// No longer known to the daemon.
+    /// Code sessions no longer known to the daemon.
     pub dropped: usize,
     /// The early write of this window's list failed. The restore still goes
     /// ahead, and the file keeps its previous contents; the next change to
@@ -720,6 +715,47 @@ mod tests {
             rx.try_recv().is_err(),
             "no Chat list is fetched without Chat rows"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_sessions_survive_startup_without_a_complete_daemon_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = "local:/run/chat-restore.sock";
+        let saved = Snapshot::from_rows(
+            &[row(PaneKind::Chat, "jsonl-chat", "alpha", true)],
+            Some(PaneKind::Chat),
+        );
+        owned(dir.path(), target).save_if_changed(&saved).unwrap();
+        let mut window = owned(dir.path(), target);
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let mut startup = tokio::spawn(async move {
+            let outcome = window.start(&client, true).await;
+            (window, outcome)
+        });
+        let (mut window, outcome) = tokio::select! {
+            result = &mut startup => result.unwrap(),
+            line = rx.recv() => {
+                // JSONL sessions have no alias/channel metadata, so session/list
+                // succeeds with an empty list even when their transcripts exist.
+                let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+                assert_eq!(request["method"], crate::client::method::SESSION_LIST);
+                out.dispatch_response(
+                    request["id"].as_str().unwrap(),
+                    Some(serde_json::json!({ "sessions": [] })),
+                    None,
+                );
+                startup.await.unwrap()
+            }
+        };
+        assert_eq!(outcome.dropped, 0);
+        assert_eq!(outcome.snapshot.as_ref(), Some(&saved));
+        assert_eq!(window.load(), Some(saved));
+        let (chat, code) = outcome
+            .snapshot
+            .unwrap()
+            .resume_entries(crate::chat::MAX_TRACKED_SESSIONS_PER_PANE);
+        assert_eq!(chat[0].session_id, "jsonl-chat");
+        assert!(code.is_empty());
     }
 
     #[test]
