@@ -8538,7 +8538,7 @@ impl RpcDispatcher {
                     self.ctx.session_backend.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
-                // Chat rewrites currently replace every row's timestamp (#11420).
+                // Chat rewrites currently replace every row's timestamp.
                 // Omit those times until the backend preserves message times.
                 backend
                     .load(&key)
