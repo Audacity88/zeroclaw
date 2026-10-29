@@ -135,7 +135,17 @@ pub async fn seed_default_personality(
 
 /// Load a specific set of personality files from a workspace directory.
 pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> PersonalityProfile {
+    load_personality_files_with_errors(workspace_dir, filenames).0
+}
+
+/// Preserve read failures for session snapshot capture and explicit reload.
+/// The permissive loader above keeps its existing behavior for other callers.
+pub(crate) fn load_personality_files_with_errors(
+    workspace_dir: &Path,
+    filenames: &[&str],
+) -> (PersonalityProfile, Vec<(String, std::io::Error)>) {
     let mut profile = PersonalityProfile::default();
+    let mut errors = Vec::new();
 
     for &filename in filenames {
         let path = workspace_dir.join(filename);
@@ -154,13 +164,16 @@ pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> Perso
                     path,
                 });
             }
-            Err(_) => {
+            Err(error) => {
                 profile.missing.push(filename.to_string());
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    errors.push((filename.to_string(), error));
+                }
             }
         }
     }
 
-    profile
+    (profile, errors)
 }
 
 /// Truncate content to `MAX_FILE_CHARS` if necessary.

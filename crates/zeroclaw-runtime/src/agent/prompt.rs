@@ -155,6 +155,60 @@ pub fn render_identity_section(
     agent_workspace_dir: &Path,
     inject_memory: bool,
 ) -> String {
+    let profile = if inject_memory {
+        personality::load_personality(agent_workspace_dir)
+    } else {
+        personality::load_personality_files(
+            agent_workspace_dir,
+            &personality::personality_files_without_memory(),
+        )
+    };
+    render_identity_with_profile(identity_config, agent_workspace_dir, &profile).text
+}
+
+/// The text and source-file names belong to the same historical read. Disk
+/// remains canonical for new renders; this manifest describes the cached text.
+#[derive(Debug)]
+pub(crate) struct IdentitySnapshot {
+    pub text: String,
+    pub files: Vec<String>,
+    has_aieos: bool,
+}
+
+impl IdentitySnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && !self.has_aieos
+    }
+}
+
+/// Unlike the legacy renderer, session capture must not freeze read failures.
+pub(crate) fn render_identity_snapshot(
+    identity_config: Option<&IdentityConfig>,
+    agent_workspace_dir: &Path,
+    inject_memory: bool,
+) -> Result<IdentitySnapshot> {
+    let filenames = if inject_memory {
+        personality::PERSONALITY_FILES.to_vec()
+    } else {
+        personality::personality_files_without_memory()
+    };
+    let (profile, errors) =
+        personality::load_personality_files_with_errors(agent_workspace_dir, &filenames);
+    if let Some((name, error)) = errors.into_iter().next() {
+        anyhow::bail!("Could not read personality file {name}: {error}");
+    }
+    Ok(render_identity_with_profile(
+        identity_config,
+        agent_workspace_dir,
+        &profile,
+    ))
+}
+
+fn render_identity_with_profile(
+    identity_config: Option<&IdentityConfig>,
+    agent_workspace_dir: &Path,
+    profile: &personality::PersonalityProfile,
+) -> IdentitySnapshot {
     let mut prompt = String::from("## Project Context\n\n");
     let mut has_aieos = false;
     if let Some(config) = identity_config
@@ -175,16 +229,12 @@ pub fn render_identity_section(
         );
     }
 
-    let profile = if inject_memory {
-        personality::load_personality(agent_workspace_dir)
-    } else {
-        personality::load_personality_files(
-            agent_workspace_dir,
-            &personality::personality_files_without_memory(),
-        )
-    };
     prompt.push_str(&profile.render());
-    prompt
+    IdentitySnapshot {
+        text: prompt,
+        files: profile.files.iter().map(|file| file.name.clone()).collect(),
+        has_aieos,
+    }
 }
 
 /// Model-facing Full-autonomy approval contract used by [`SafetySection`].

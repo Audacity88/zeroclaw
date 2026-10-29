@@ -551,14 +551,13 @@ pub struct Agent {
     /// advertises persistent-memory isolation. Set from the same builder value
     /// that installs `NoneMemory` and forces `auto_save` off.
     inject_memory: bool,
-    /// The `## Project Context` block rendered from the agent workspace's
-    /// personality files, captured on the first system-prompt build of this
-    /// session and reused for every later turn. Re-reading the files every
-    /// turn made any `AGENTS.md`/`SOUL.md`/... edit change the system prompt,
-    /// which invalidated the provider prompt cache for the whole conversation
-    /// of every live session of the agent. Cleared by
-    /// [`Agent::reload_personality`].
-    identity_snapshot: std::sync::OnceLock<String>,
+    /// The `## Project Context` text and its source-file manifest, captured on
+    /// the first build that loads identity content and reused by this live
+    /// `Agent`. This state is not persisted: a resumed session in a fresh agent
+    /// reads the files again. Empty captures are retried on the next build.
+    /// Even a deleted `BOOTSTRAP.md` stays in the snapshot until explicit
+    /// [`Agent::reload_personality`] or a new agent, preserving the cache prefix.
+    identity_snapshot: std::sync::OnceLock<crate::agent::prompt::IdentitySnapshot>,
     /// The shell this agent's runtime adapter will spawn, so the system
     /// prompt reports the dialect the agent actually executes under.
     /// `None` for a shell-less runtime.
@@ -1760,17 +1759,37 @@ impl Agent {
     /// text it captured on its first build, so edits reach new sessions only.
     /// Returns whether the rendered text replaced a different one; a change
     /// alters the system prompt, which heads the cached prefix, so the next
-    /// request may reuse less of the provider's cache.
+    /// request may reuse less of the provider's cache. Read or rebuild errors,
+    /// or losing every previously loaded file, keep the prior context intact.
     pub fn reload_personality(&mut self) -> Result<bool> {
-        let previous = self.identity_snapshot.take();
-        let fresh = crate::agent::prompt::render_identity_section(
+        let fresh = crate::agent::prompt::render_identity_snapshot(
             Some(&self.identity_config),
             &self.agent_workspace_dir,
             self.inject_memory,
-        );
-        // No previous snapshot means no prompt was built yet; the first build
-        // reads the files anyway, so nothing cached is being replaced.
-        let changed = previous.is_some_and(|previous| previous != fresh);
+        )?;
+        if fresh.files.is_empty()
+            && self
+                .identity_snapshot
+                .get()
+                .is_some_and(|previous| !previous.files.is_empty())
+        {
+            anyhow::bail!("No personality files loaded; keeping the previous context");
+        }
+        if fresh.is_empty() {
+            if self.identity_snapshot.get().is_some() {
+                anyhow::bail!("No identity content loaded; keeping the previous context");
+            }
+            // A valid AIEOS-only identity can be cached, but an empty render
+            // during a temporary gap must be retried on the next build.
+            return Ok(false);
+        }
+        // Without a previous snapshot, no cached identity is being replaced.
+        // Read errors above leave the prior snapshot intact.
+        let changed = self
+            .identity_snapshot
+            .get()
+            .is_some_and(|previous| previous.text != fresh.text);
+        let previous = self.identity_snapshot.take();
         let _ = self.identity_snapshot.set(fresh);
         if changed {
             let dispatcher = tool_dispatcher_for_provider(
@@ -1778,7 +1797,15 @@ impl Agent {
                 self.model_provider.as_ref(),
                 &self.model_name,
             );
-            self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
+            if let Err(error) = self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref()) {
+                // Rebuild only mutates history after successful prompt assembly.
+                // Restore the matching snapshot before reporting a failed reload.
+                let _ = self.identity_snapshot.take();
+                if let Some(previous) = previous {
+                    let _ = self.identity_snapshot.set(previous);
+                }
+                return Err(error);
+            }
         }
         Ok(changed)
     }
@@ -3506,15 +3533,24 @@ impl Agent {
             Some(mgr) => (mgr.autonomy_level(), mgr.always_ask_tools()),
             None => (self.autonomy_level, Vec::new()),
         };
-        let identity_snapshot = self.identity_snapshot.get_or_init(|| {
-            crate::agent::prompt::render_identity_section(
+        let identity_snapshot = if let Some(snapshot) = self.identity_snapshot.get() {
+            std::borrow::Cow::Borrowed(snapshot.text.as_str())
+        } else {
+            let fresh = crate::agent::prompt::render_identity_snapshot(
                 Some(&self.identity_config),
                 &self.agent_workspace_dir,
                 self.inject_memory,
-            )
-        });
+            )?;
+            if fresh.is_empty() {
+                std::borrow::Cow::Owned(fresh.text)
+            } else {
+                std::borrow::Cow::Borrowed(
+                    self.identity_snapshot.get_or_init(|| fresh).text.as_str(),
+                )
+            }
+        };
         let ctx = PromptContext {
-            identity_snapshot: Some(identity_snapshot.as_str()),
+            identity_snapshot: Some(identity_snapshot.as_ref()),
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
             model_name: &self.model_name,
@@ -8917,6 +8953,218 @@ mod tests {
         fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
             Err(anyhow::Error::msg("synthetic prompt rebuild failure"))
         }
+    }
+
+    fn personality_snapshot_test_agent(workspace: &Path) -> Agent {
+        let mut agent = build_test_agent("test", "test-model", None);
+        agent.workspace_dir = workspace.to_path_buf();
+        agent.agent_workspace_dir = workspace.to_path_buf();
+        agent
+    }
+
+    fn prime_personality_snapshot(agent: &mut Agent) -> String {
+        let prompt = agent
+            .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+            .expect("initial prompt");
+        agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+            prompt.clone(),
+        ))];
+        prompt
+    }
+
+    fn assert_personality_prompt_unchanged(agent: &Agent, previous: &str) {
+        let ConversationMessage::Chat(system) = &agent.history[0] else {
+            panic!("system message");
+        };
+        assert_eq!(system.content, previous);
+        assert_eq!(
+            agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .expect("cached prompt"),
+            previous
+        );
+    }
+
+    #[test]
+    fn reload_context_rejects_deletion_of_all_personality_files() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let agents_md = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents_md, "KEEP_ORIGINAL_IDENTITY").unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        let previous = prime_personality_snapshot(&mut agent);
+        std::fs::remove_file(&agents_md).unwrap();
+
+        let error = agent.reload_personality().expect_err("empty reload fails");
+        assert!(error.to_string().contains("No personality files loaded"));
+        assert_personality_prompt_unchanged(&agent, &previous);
+    }
+
+    #[test]
+    fn reload_context_rejects_unreadable_personality_files() {
+        for directory in [false, true] {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let agents_md = workspace.path().join("AGENTS.md");
+            std::fs::write(&agents_md, "KEEP_ORIGINAL_IDENTITY").unwrap();
+            // A surviving file must not hide a partial read failure.
+            std::fs::write(workspace.path().join("SOUL.md"), "SURVIVING_SOUL").unwrap();
+            let mut agent = personality_snapshot_test_agent(workspace.path());
+            let previous = prime_personality_snapshot(&mut agent);
+            if directory {
+                std::fs::remove_file(&agents_md).unwrap();
+                std::fs::create_dir(&agents_md).unwrap();
+            } else {
+                std::fs::write(&agents_md, [0xff, 0xfe]).unwrap();
+            }
+
+            let error = agent.reload_personality().expect_err("bad read fails");
+            assert!(error.to_string().contains("AGENTS.md"));
+            assert_personality_prompt_unchanged(&agent, &previous);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_context_rejects_permission_denied_personality_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let agents_md = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents_md, "KEEP_ORIGINAL_IDENTITY").unwrap();
+        std::fs::write(workspace.path().join("SOUL.md"), "SURVIVING_SOUL").unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        let previous = prime_personality_snapshot(&mut agent);
+        let permissions = std::fs::metadata(&agents_md).unwrap().permissions();
+        std::fs::set_permissions(&agents_md, std::fs::Permissions::from_mode(0)).unwrap();
+        let read = std::fs::read_to_string(&agents_md);
+        let result = agent.reload_personality();
+        std::fs::set_permissions(&agents_md, permissions).unwrap();
+
+        // Privileged runners can read mode 000. The invalid-UTF-8 and directory
+        // cases above still exercise failed reads on those runners.
+        if read.is_ok() {
+            return;
+        }
+        assert_eq!(
+            read.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            result
+                .expect_err("permission denial fails")
+                .to_string()
+                .contains("AGENTS.md")
+        );
+        assert_personality_prompt_unchanged(&agent, &previous);
+    }
+
+    #[test]
+    fn first_empty_personality_capture_is_retried() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        let first = agent
+            .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+            .unwrap();
+        assert!(agent.identity_snapshot.get().is_none());
+        assert!(!agent.reload_personality().unwrap());
+        assert!(agent.identity_snapshot.get().is_none());
+
+        let agents_md = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents_md, [0xff]).unwrap();
+        assert!(
+            agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .is_err()
+        );
+        assert!(agent.identity_snapshot.get().is_none());
+        std::fs::write(&agents_md, "RECOVERED_IDENTITY").unwrap();
+        let recovered = agent
+            .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+            .unwrap();
+        assert!(!first.contains("RECOVERED_IDENTITY"));
+        assert!(recovered.contains("RECOVERED_IDENTITY"));
+        assert!(agent.identity_snapshot.get().is_some());
+        std::fs::write(&agents_md, "LATER_EDIT").unwrap();
+        assert_eq!(
+            agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .unwrap(),
+            recovered
+        );
+    }
+
+    #[test]
+    fn aieos_only_identity_keeps_its_snapshot_until_reload() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let identity = workspace.path().join("identity.json");
+        std::fs::write(&identity, r#"{"identity":{"names":{"first":"Original"}}}"#).unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        agent.identity_config = zeroclaw_config::schema::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+        let previous = prime_personality_snapshot(&mut agent);
+        assert!(previous.contains("Original"));
+        std::fs::write(&identity, r#"{"identity":{"names":{"first":"Updated"}}}"#).unwrap();
+        assert_personality_prompt_unchanged(&agent, &previous);
+        assert!(agent.reload_personality().unwrap());
+        let fresh = agent
+            .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+            .unwrap();
+        assert!(fresh.contains("Updated"));
+    }
+
+    #[test]
+    fn reload_context_allows_deliberate_single_file_removal() {
+        for filename in ["TOOLS.md", "BOOTSTRAP.md"] {
+            let workspace = tempfile::TempDir::new().unwrap();
+            std::fs::write(workspace.path().join("AGENTS.md"), "RETAINED_IDENTITY").unwrap();
+            let removed = workspace.path().join(filename);
+            std::fs::write(&removed, "REMOVABLE_INSTRUCTIONS").unwrap();
+            let mut agent = personality_snapshot_test_agent(workspace.path());
+            let previous = prime_personality_snapshot(&mut agent);
+            std::fs::remove_file(&removed).unwrap();
+
+            // BOOTSTRAP removal, like any edit, requires explicit reload so
+            // normal prompt builds keep the provider cache prefix stable.
+            assert_personality_prompt_unchanged(&agent, &previous);
+            assert!(agent.reload_personality().unwrap());
+            let fresh = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .unwrap();
+            assert!(fresh.contains("RETAINED_IDENTITY"));
+            assert!(!fresh.contains("REMOVABLE_INSTRUCTIONS"));
+            assert!(!agent.reload_personality().unwrap());
+        }
+    }
+
+    #[test]
+    fn reload_context_restores_snapshot_when_prompt_rebuild_fails() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let agents_md = workspace.path().join("AGENTS.md");
+        std::fs::write(&agents_md, "ORIGINAL_IDENTITY").unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        let previous = prime_personality_snapshot(&mut agent);
+        std::fs::write(&agents_md, "UPDATED_IDENTITY").unwrap();
+        agent.prompt_builder =
+            SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
+
+        let error = agent.reload_personality().expect_err("rebuild fails");
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic prompt rebuild failure")
+        );
+        agent.prompt_builder = SystemPromptBuilder::with_defaults();
+        assert_personality_prompt_unchanged(&agent, &previous);
+        assert!(
+            agent.reload_personality().unwrap(),
+            "failed reload did not commit"
+        );
+        let fresh = agent
+            .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+            .unwrap();
+        assert!(fresh.contains("UPDATED_IDENTITY"));
     }
 
     struct ToolThenFailingModelProvider {

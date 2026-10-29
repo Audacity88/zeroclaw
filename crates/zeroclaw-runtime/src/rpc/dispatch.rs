@@ -45752,6 +45752,52 @@ mod tests {
         assert_eq!(again["changed"], json!(false), "{again}");
     }
 
+    #[tokio::test]
+    async fn session_reload_context_reports_failed_personality_read_without_replacing_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let workspace = config.agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({"agent_alias": "test-agent"}))
+            .await
+            .expect("session/new");
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let agent = sessions.get_agent(&sid).await.expect("live agent");
+        // Isolate the deletion case from any personality templates seeded by
+        // session construction: AGENTS.md is the only captured file.
+        for file in crate::agent::personality::PERSONALITY_FILES {
+            let path = workspace.join(file);
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let agents_md = workspace.join("AGENTS.md");
+        std::fs::write(&agents_md, "ORIGINAL_RPC_IDENTITY").unwrap();
+        assert!(!agent.lock().await.reload_personality().unwrap());
+
+        for invalid_utf8 in [false, true] {
+            if invalid_utf8 {
+                std::fs::write(&agents_md, [0xff]).unwrap();
+            } else {
+                std::fs::remove_file(&agents_md).unwrap();
+            }
+            let error = dispatcher
+                .handle_session_reload_context(&json!({"session_id": sid}))
+                .await
+                .expect_err("bad personality reload fails at the RPC boundary");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert!(error.message.contains("Failed to reload context"));
+            std::fs::write(&agents_md, "ORIGINAL_RPC_IDENTITY").unwrap();
+            let restored = dispatcher
+                .handle_session_reload_context(&json!({"session_id": sid}))
+                .await
+                .expect("restore original file");
+            assert_eq!(restored["changed"], json!(false), "prior snapshot survived");
+        }
+    }
+
     /// Alice's `session/reload_context` on `sid`, paused after its gate
     /// while `change` runs. `AGENTS.md` changes between the first snapshot
     /// and the reload, so a reload that goes through reports `changed`.

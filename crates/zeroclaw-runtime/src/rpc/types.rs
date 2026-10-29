@@ -402,8 +402,8 @@ rpc_type! {
         /// False when the session has no live agent; its next turn rebuilds
         /// from the files on disk anyway.
         pub live: bool,
-        /// True when the re-read text differs from what the session had. The
-        /// next request then misses the prompt cache once.
+        /// True when the re-read text differs from the live agent's snapshot.
+        /// The next request may reuse less of the provider's cache.
         pub changed: bool,
     }
 }
