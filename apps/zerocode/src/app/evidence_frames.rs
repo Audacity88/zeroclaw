@@ -16,7 +16,32 @@ struct EvidenceApp {
     client: Arc<RpcClient>,
     help: Option<HelpOverlayState>,
     term: config_manager::Term,
+    // Restore the process override before deleting its temporary directory.
+    _config_dir_override: ConfigDirOverride,
     _config_dir: tempfile::TempDir,
+}
+
+/// All evidence tests hold `env_test_lock` until the app is dropped. Unlike
+/// `i18n::init`, this override can be restored before sibling tests run.
+struct ConfigDirOverride(Option<std::ffi::OsString>);
+
+impl ConfigDirOverride {
+    fn set(dir: &std::path::Path) -> Self {
+        let previous = std::env::var_os("ZEROCLAW_CONFIG_DIR");
+        // SAFETY: the evidence test owns the crate's shared environment lock.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", dir) };
+        Self(previous)
+    }
+}
+
+impl Drop for ConfigDirOverride {
+    fn drop(&mut self) {
+        // SAFETY: the app is dropped before the evidence test's environment lock.
+        match &self.0 {
+            Some(previous) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", previous) },
+            None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
+        }
+    }
 }
 
 async fn answer(
@@ -78,7 +103,10 @@ impl EvidenceApp {
         let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
         // Isolate local ZeroCode preferences from the operator's config.
         let config_dir = tempfile::tempdir().unwrap();
-        crate::i18n::init("en", config_dir.path());
+        // Do not call i18n::init here: its OnceLock pins the config directory
+        // for the whole binary and defeats later Todo-settings tests' overrides.
+        let config_dir_override = ConfigDirOverride::set(config_dir.path());
+        assert_eq!(crate::i18n::config_dir(), config_dir.path());
         let mut config = config_manager::App::new(client.clone(), config_dir.path());
         let replies = async {
             answer(
@@ -135,6 +163,7 @@ impl EvidenceApp {
             client,
             help: None,
             term,
+            _config_dir_override: config_dir_override,
             _config_dir: config_dir,
         };
         app.key(KeyCode::Enter, KeyModifiers::NONE).await;
