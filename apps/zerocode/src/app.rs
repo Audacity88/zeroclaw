@@ -1351,6 +1351,62 @@ pub(crate) fn draw_app_frame(
     }
 }
 
+/// Evidence tests use the production Code renderers and dock geometry, including
+/// the app-owned notice row. Only the connection and sidebar configuration are
+/// fixtures; no screen text or widget renderer is replaced.
+#[cfg(test)]
+pub(crate) fn draw_code_frame_for_test(
+    frame: &mut ratatui::Frame,
+    chat_pane: &mut chat::Chat,
+    acp_pane: &mut acp::Acp,
+    config_dir: &std::path::Path,
+) -> (Rect, Option<Rect>) {
+    let mut dock = ConversationDock::from_config_dir(config_dir);
+    dock.sessions_visible = true;
+    dock.queue_visible = true;
+    dock.plan_visible = false;
+    dock.width = 28;
+    dock.side = config::SidebarSide::Right;
+    let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+    let mut rows = acp_pane.session_summaries();
+    rows.extend(chat_pane.session_summaries());
+    let ctx = crate::agent_sidebar::SidebarCtx {
+        active_pane: Some(chat::PaneKind::Acp),
+        quickstart_active: false,
+        connected: true,
+    };
+    let mut geometry = (Rect::default(), None);
+    draw_app_frame(
+        frame,
+        Mode::Acp,
+        chat_pane,
+        acp_pane,
+        |frame, chunks, _chat, code| {
+            draw_mode_bar(frame, chunks[0], Mode::Acp, None);
+            let layout = dock.layout(chunks[1], Mode::Acp, code.plan_visible());
+            geometry = (layout.conversation, layout.queue);
+            dock.draw_shell(frame);
+            if let Some(area) = layout.sessions {
+                sidebar.draw(frame, area, &rows, &ctx);
+            }
+            code.draw_with_dock(frame, layout.conversation, layout.queue, layout.plan);
+            dock.draw_resize_handles(frame);
+            code.draw_dock_overlay(frame);
+            let (input, source, max, window) = code.ctx_tokens();
+            draw_status_bar(
+                frame,
+                chunks[2],
+                &ConnectionState::Connected,
+                None,
+                CtxBar::new(input, source, max, window),
+                false,
+                code.in_browse_mode(),
+            );
+        },
+    );
+    geometry
+}
+
 #[derive(Debug, Clone)]
 struct ModeBarEntry {
     mode: Mode,
