@@ -4756,6 +4756,8 @@ impl App {
             Some(E::Cancel) => {
                 if self.filter.is_some() {
                     self.cancel_filter().await?;
+                } else if self.array_selection.is_some() && self.has_pending_edits() {
+                    self.pending_confirmation = Some(PendingConfirmation::DiscardKey(key));
                 } else {
                     self.pop_to_field_list().await?;
                 }
@@ -4856,6 +4858,12 @@ impl App {
     }
 
     async fn save_array_selection(&mut self) -> Result<()> {
+        if self.array_selection.is_some()
+            && matches!(self.screen, Screen::FieldEdit { .. })
+            && self.field_draft() == self.field_draft_loaded
+        {
+            return self.pop_to_field_list_keep_cursor().await;
+        }
         if let Some(selected) = &self.array_selection
             && let Screen::FieldEdit { field_idx, .. } = &self.screen
         {
@@ -10038,6 +10046,7 @@ mod tests {
         };
         manager.prepare_edit_at(1);
         manager.resolve_field_aliases(1).await;
+        manager.field_draft_loaded = manager.field_draft();
         (manager, calls)
     }
 
@@ -10184,18 +10193,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn array_picker_cancel_does_not_write_and_reentry_discards_staging() {
+    async fn array_picker_cancel_confirms_discard_and_reentry_loads_saved_values() {
         let (mut manager, calls) =
             array_picker_manager(&["a.live"], Some(vec!["a.live".into(), "b.new".into()])).await;
+        let mut term = filter_test_term();
+        assert!(!manager.has_pending_edits());
+        assert!(manager.bottom_hint().contains("No pending edits"));
         manager.select_cursor = 1;
-        manager
-            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await
-            .unwrap();
-        manager
-            .handle_field_edit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .await
-            .unwrap();
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(manager.has_pending_edits());
+        assert!(manager.bottom_hint().contains("Pending edits"));
+
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        config_key(&mut manager, &mut term, KeyCode::Char('b')).await;
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.filter.is_none());
+        assert!(manager.pending_confirmation.is_none());
+        assert!(manager.has_pending_edits());
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.pending_confirmation.is_some());
+        assert_eq!(*calls.lock().unwrap(), vec!["config/resolve-alias-source"]);
+        // Stay preserves the entire staged list.
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.pending_confirmation.is_none());
+        assert_eq!(
+            &manager.array_selection.as_ref().unwrap().entries,
+            &["a.live", "b.new"]
+        );
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
         assert_eq!(
             *calls.lock().unwrap(),
             vec!["config/resolve-alias-source", "config/list"]
@@ -10210,6 +10236,56 @@ mod tests {
             &manager.array_selection.as_ref().unwrap().entries,
             &["a.live"]
         );
+    }
+
+    #[tokio::test]
+    async fn array_picker_skips_unchanged_saves_including_reverted_toggles() {
+        for current in [vec![], vec!["b.new", "a.live", "missing"]] {
+            for toggle_twice in [false, true] {
+                let (mut manager, calls) = array_picker_manager(
+                    &current,
+                    Some(vec!["a.live".into(), "b.new".into(), "c.new".into()]),
+                )
+                .await;
+                let feedback = manager.application_feedback.summary();
+                if toggle_twice {
+                    // Toggle an unselected entry, preserving the saved order.
+                    manager.select_cursor = 2;
+                    manager
+                        .handle_field_edit(key(KeyCode::Enter))
+                        .await
+                        .unwrap();
+                    assert!(manager.has_pending_edits());
+                    manager
+                        .handle_field_edit(key(KeyCode::Enter))
+                        .await
+                        .unwrap();
+                }
+                assert!(!manager.has_pending_edits());
+                if toggle_twice {
+                    manager
+                        .handle_field_edit(key(KeyCode::Char('/')))
+                        .await
+                        .unwrap();
+                    manager
+                        .handle_field_edit(key(KeyCode::Char('!')))
+                        .await
+                        .unwrap();
+                    assert!(manager.filtered_indices(&manager.select_items).is_empty());
+                }
+                manager
+                    .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    vec!["config/resolve-alias-source", "config/list"]
+                );
+                assert_eq!(manager.application_feedback.summary(), feedback);
+                assert!(matches!(manager.screen, Screen::FieldList { .. }));
+                assert!(manager.array_selection.is_none());
+            }
+        }
     }
 
     #[tokio::test]
@@ -10263,16 +10339,14 @@ mod tests {
         ];
         for aliases in [Some(vec!["known".into(), "new".into()]), None, Some(vec![])] {
             let (mut manager, _) = array_picker_manager(&current, aliases).await;
+            let mut expected: Vec<String> = current.iter().map(|s| s.to_string()).collect();
             if manager.array_selection.is_some() {
                 manager.select_cursor = 1;
                 manager
                     .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                     .await
                     .unwrap();
-                manager
-                    .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                    .await
-                    .unwrap();
+                expected.push("new".into());
             }
             manager
                 .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
@@ -10280,7 +10354,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 string_array_entries(manager.fields[1].value.as_ref().unwrap().as_str().unwrap()),
-                Some(current.iter().map(|s| s.to_string()).collect())
+                Some(expected)
             );
         }
     }
