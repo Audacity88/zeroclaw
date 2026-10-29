@@ -9034,7 +9034,7 @@ mod tests {
         let mut agent = personality_snapshot_test_agent(workspace.path());
         let previous = prime_personality_snapshot(&mut agent);
         let permissions = std::fs::metadata(&agents_md).unwrap().permissions();
-        std::fs::set_permissions(&agents_md, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&agents_md, std::fs::Permissions::from_mode(0o0)).unwrap();
         let read = std::fs::read_to_string(&agents_md);
         let result = agent.reload_personality();
         std::fs::set_permissions(&agents_md, permissions).unwrap();
