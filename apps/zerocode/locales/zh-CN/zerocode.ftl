@@ -710,3 +710,5 @@ zc-config-section-peer-groups-help = 绑定频道、成员代理和外部对等�
 zc-config-section-cron-help = 将计划与提示、频道和目标绑定的计划任务。
 zc-config-section-tunnel-help = 可选择通过 Cloudflare 或 ngrok 暴露网关，或仅保持本地访问。
 zc-config-section-onboard-state-help = 快速入门生命周期状态及其按分区记录的旧版完成记录。
+
+zc-chat-tool-question = 问题

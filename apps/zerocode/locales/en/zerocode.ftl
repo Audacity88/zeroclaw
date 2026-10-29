@@ -893,3 +893,5 @@ zc-config-setup-create = Enter a name. { $confirm } saves it and opens fields. {
 zc-config-setup-required = required
 zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
+
+zc-chat-tool-question = question

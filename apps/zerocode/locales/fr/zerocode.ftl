@@ -710,3 +710,5 @@ zc-config-section-peer-groups-help = Groupes nommés associant un canal, des age
 zc-config-section-cron-help = Tâches planifiées associant une planification à un prompt, un canal et une cible.
 zc-config-section-tunnel-help = Exposez éventuellement la passerelle via Cloudflare ou ngrok, ou gardez-la uniquement en local.
 zc-config-section-onboard-state-help = État du cycle de vie du démarrage rapide et registre hérité de complétion par section.
+
+zc-chat-tool-question = question
