@@ -394,9 +394,12 @@ async fn execute_one_tool_with_provenance(
         parent_tool_call_id: event_call_id.clone(),
         depth: 0,
     });
+    // Boxed so the tool future lives on the heap. Held inline, the scoped
+    // future made the turn future large enough to overflow a 2 MiB test
+    // thread stack (cron_uses_memory_free_8695).
     let execute = scope_parent_turn_events(
         parent_events,
-        context.run(tool.execute_with_context(call_arguments.clone(), &context)),
+        Box::pin(context.run(tool.execute_with_context(call_arguments.clone(), &context))),
     )
     .instrument(tool_span.clone());
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
