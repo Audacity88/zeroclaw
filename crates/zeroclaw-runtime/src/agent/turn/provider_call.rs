@@ -4682,7 +4682,7 @@ mod budget_override_tests {
         );
         let grant = &grants[0];
         assert_eq!(grant["zeroclaw"]["session_key"], "approving-session");
-        assert_eq!(grant["zeroclaw"]["channel"], "test");
+        assert_eq!(grant["zeroclaw"]["channel_type"], "test");
         assert_eq!(grant["attributes"]["decided_by"], "approval-surface");
         assert_eq!(grant["attributes"]["approval_source"], "operator");
         assert_eq!(grant["attributes"]["period"], "Day");
