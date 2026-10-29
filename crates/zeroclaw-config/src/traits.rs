@@ -146,8 +146,6 @@ impl HasPropKind for crate::providers::ModelProviderRef {
 }
 impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
-    const ALIAS_SOURCE: Option<AliasSource> =
-        <crate::providers::ModelProviderRef as HasPropKind>::ALIAS_SOURCE;
 }
 impl HasPropKind for crate::providers::TtsProviderRef {
     const PROP_KIND: PropKind = PropKind::AliasRef;
@@ -171,8 +169,6 @@ impl HasPropKind for crate::providers::RuntimeProfileRef {
 }
 impl HasPropKind for Vec<crate::providers::ChannelRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
-    const ALIAS_SOURCE: Option<AliasSource> =
-        <crate::providers::ChannelRef as HasPropKind>::ALIAS_SOURCE;
 }
 
 // Multi-agent typed primitives. AgentAlias / PeerGroupName /
@@ -202,8 +198,6 @@ impl HasPropKind for crate::multi_agent::MemoryGrant {
 }
 impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
     const PROP_KIND: PropKind = PropKind::StringArray;
-    const ALIAS_SOURCE: Option<AliasSource> =
-        <crate::multi_agent::AgentAlias as HasPropKind>::ALIAS_SOURCE;
 }
 impl HasPropKind for Vec<crate::multi_agent::MemoryGrant> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -1275,12 +1269,6 @@ mod alias_metadata_tests {
     fn config_reference_arrays_declare_canonical_sources() {
         let fields = config_with_aliases().prop_fields();
         for (name, source) in [
-            (
-                "providers.models.openai.primary.fallback",
-                AliasSource::ModelProviders,
-            ),
-            ("agents.assistant.channels", AliasSource::Channels),
-            ("peer_groups.team.agents", AliasSource::Agents),
             ("agents.assistant.skill_bundles", AliasSource::SkillBundles),
             (
                 "agents.assistant.knowledge_bundles",
@@ -1302,9 +1290,12 @@ mod alias_metadata_tests {
     }
 
     #[test]
-    fn ordinary_config_arrays_have_no_alias_source() {
+    fn unannotated_config_arrays_keep_the_text_editor() {
         let fields = config_with_aliases().prop_fields();
         for name in [
+            "providers.models.openai.primary.fallback",
+            "agents.assistant.channels",
+            "peer_groups.team.agents",
             "providers.models.openai.primary.fallback_models",
             "peer_groups.team.external_peers",
             "peer_groups.team.ignore",

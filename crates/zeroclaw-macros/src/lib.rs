@@ -79,8 +79,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
 ///   emitted children, or on a scalar field classifies only that property.
 ///   Unannotated properties require reload.
 /// - `#[alias_source(Variant)]` on `Vec<String>` or `Option<Vec<String>>`
-///   declares its canonical `AliasSource` namespace. Typed reference vectors
-///   inherit metadata from their `HasPropKind` implementation.
+///   declares its canonical `AliasSource` namespace. Unannotated vectors
+///   retain the text editor, including order-sensitive reference lists.
 /// - `#[field_metadata = "path::to::annotator"]` on a struct enriches its
 ///   property fields after nested paths have been resolved.
 /// - `#[multiline]` on a string field hints surfaces to render a multi-line
@@ -2086,6 +2086,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
         let alias_source_expr = if let Some(variant) = alias_source_variant {
             quote! { Some(crate::config::AliasSource::#variant) }
+        } else if is_vec {
+            quote! { None::<crate::config::AliasSource> }
         } else {
             quote! { <#inner_ty as crate::config::HasPropKind>::ALIAS_SOURCE }
         };
