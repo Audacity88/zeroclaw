@@ -1,6 +1,7 @@
 //! Review evidence drawn by the real app widgets after RPC-backed transitions.
 //! These buffers are interface evidence, not proof of a real daemon restart.
 
+#[cfg(test)] // test-only module: lets the keymap guard skip review-evidence key input
 use super::*;
 use crate::agent_sidebar::{AgentSidebar, SidebarEvent};
 use crate::chat::{MAX_TRACKED_SESSIONS_PER_PANE, PaneKind, ResumeEntry};
