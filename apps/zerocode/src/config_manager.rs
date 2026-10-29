@@ -10914,6 +10914,705 @@ mod tests {
         assert!(!next.has_mutation_dialog());
     }
 
+    // Evidence fixtures enter Config through init and the real key handlers.
+    // Only the daemon replies are scripted; no dialog or outcome is installed
+    // directly, and every printed row comes from the production renderer.
+    fn evidence_config_response(
+        request: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError> {
+        use serde_json::json;
+        match request["method"].as_str().unwrap() {
+            "config/sections" => Ok(json!({"sections": [{
+                "key": "providers.models", "label": "Model providers", "help": "",
+                "completed": true, "shape": "typed_family_map", "cost_category": "models"
+            }]})),
+            "config/templates" => Ok(json!({"templates": [{"path": "providers.models.test"}]})),
+            "config/map-keys" => Ok(json!({"keys": ["first", "second"]})),
+            "config/list" => {
+                if request["params"]["prefix"] == "providers.models.test.first" {
+                    let mut model = field("providers.models.test.first.model");
+                    model.tab = ConfigTab::Model;
+                    model.populated = true;
+                    model.value = Some(json!("example-model"));
+                    Ok(json!({"entries": [model]}))
+                } else {
+                    Ok(json!({"entries": []}))
+                }
+            }
+            _ => confirmation_response(request),
+        }
+    }
+
+    async fn evidence_alias_manager(
+        respond: impl Fn(
+            &serde_json::Value,
+        )
+            -> std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>
+        + Send
+        + 'static,
+    ) -> (App, Arc<std::sync::Mutex<Vec<serde_json::Value>>>, Term) {
+        let (mut manager, requests) = confirmation_manager(respond);
+        tokio::time::timeout(std::time::Duration::from_secs(2), manager.init())
+            .await
+            .expect("evidence Config initialization completes")
+            .unwrap();
+        let mut term = confirmation_term();
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert_eq!(manager.aliases, ["first", "second"]);
+        (manager, requests, term)
+    }
+
+    /// Preserve the manager's loaded/stale state while drawing the same app
+    /// frame and Config entry point as draw_setup_test_frame and app::run.
+    #[allow(
+        clippy::print_stdout,
+        reason = "emit real TestBackend buffers for review evidence with --nocapture"
+    )]
+    fn print_evidence_config_frame(
+        manager: &mut App,
+        state_slug: &str,
+        width: u16,
+        height: u16,
+        expected: &[&str],
+    ) -> Vec<String> {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let rpc = manager.rpc.clone();
+        terminal
+            .draw(|frame| {
+                crate::app::draw_config_evidence_frame(frame, manager, rpc.clone());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let text = rows.join("\n");
+        for needle in expected {
+            assert!(
+                text.contains(needle),
+                "{state_slug}: missing {needle:?} in rendered frame:\n{text}"
+            );
+        }
+        println!("=== EVIDENCE BEGIN {state_slug} ({width}x{height}) ===");
+        for row in &rows {
+            println!("{row}");
+        }
+        println!("=== EVIDENCE END {state_slug} ===");
+        rows
+    }
+
+    fn evidence_mutation_count(requests: &std::sync::Mutex<Vec<serde_json::Value>>) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["method"].as_str(),
+                    Some("config/delete" | "config/map-key-delete")
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_alias_footer_delete_and_cancel() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(evidence_config_response).await;
+        print_evidence_config_frame(
+            &mut manager,
+            "alias-delete-footer",
+            100,
+            30,
+            &["first", "second", "e=rename", "x=delete"],
+        );
+        config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+        print_evidence_config_frame(
+            &mut manager,
+            "delete-confirmation-preview-unavailable",
+            100,
+            30,
+            &[
+                "Confirm deletion",
+                "providers.models.test.first",
+                "cannot preview",
+                "Enter=confirm",
+                "Esc=cancel",
+            ],
+        );
+        let before_cancel = requests.lock().unwrap().len();
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(!manager.has_mutation_dialog());
+        assert_eq!(requests.lock().unwrap().len(), before_cancel);
+        assert_eq!(evidence_mutation_count(&requests), 0);
+        assert_eq!(manager.aliases, ["first", "second"]);
+        print_evidence_config_frame(
+            &mut manager,
+            "delete-cancelled-alias-list-unchanged",
+            100,
+            30,
+            &["first", "second", "x=delete"],
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_reset_confirmation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(evidence_config_response).await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        let before_reset = requests.lock().unwrap().len();
+        config_key(&mut manager, &mut term, KeyCode::Char('d')).await;
+        assert_eq!(requests.lock().unwrap().len(), before_reset);
+        print_evidence_config_frame(
+            &mut manager,
+            "reset-confirmation",
+            100,
+            30,
+            &[
+                "Confirm reset",
+                "providers.models.test.first.model",
+                "Remove this configured value.",
+                "Enter=confirm",
+                "Esc=cancel",
+            ],
+        );
+        assert_eq!(evidence_mutation_count(&requests), 0);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_costs_footer_and_delete_confirmation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(evidence_config_response).await;
+        config_key(&mut manager, &mut term, KeyCode::Right).await;
+        assert_eq!(manager.alias_tab, 1);
+        print_evidence_config_frame(
+            &mut manager,
+            "costs-delete-footer",
+            100,
+            30,
+            &["Costs", "first", "x=delete"],
+        );
+        // Reset is not a second shortcut for Costs deletion.
+        config_key(&mut manager, &mut term, KeyCode::Char('d')).await;
+        assert!(!manager.has_mutation_dialog());
+        config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+        print_evidence_config_frame(
+            &mut manager,
+            "costs-delete-confirmation",
+            100,
+            30,
+            &[
+                "Confirm deletion",
+                "cost.rates.providers.models.test.first",
+                "Enter=confirm",
+                "Esc=cancel",
+            ],
+        );
+        assert_eq!(evidence_mutation_count(&requests), 0);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_delete_hint_absent_on_add_and_when_unbound() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(evidence_config_response).await;
+        config_key(&mut manager, &mut term, KeyCode::Down).await;
+        config_key(&mut manager, &mut term, KeyCode::Down).await;
+        let rows = print_evidence_config_frame(
+            &mut manager,
+            "add-row-without-delete-hint",
+            100,
+            30,
+            &["[+ Add]", "Enter=add"],
+        );
+        assert!(!rows.iter().any(|row| row.contains("x=delete")));
+        config_key(&mut manager, &mut term, KeyCode::Up).await;
+        crate::keymap::overrides::set_row("config_tab", "toggle_secret", vec![]);
+        let rows = print_evidence_config_frame(
+            &mut manager,
+            "alias-delete-unbound",
+            100,
+            30,
+            &["first", "second", "e=rename"],
+        );
+        assert!(!rows.iter().any(|row| row.contains("=delete")));
+        config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+        assert!(!manager.has_mutation_dialog());
+        assert_eq!(evidence_mutation_count(&requests), 0);
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_result_warning_and_committed_refresh_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let deleted = AtomicBool::new(false);
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(move |request| match request["method"].as_str().unwrap() {
+                "config/map-key-delete" => {
+                    deleted.store(true, Ordering::SeqCst);
+                    Ok(serde_json::json!({
+                        "path": request["params"]["path"], "key": request["params"]["key"],
+                        "deleted": true, "warnings": ["workspace cleanup incomplete"]
+                    }))
+                }
+                "config/map-keys" if deleted.load(Ordering::SeqCst) => {
+                    Err(crate::jsonrpc::JsonRpcError {
+                        code: -32603,
+                        message: "refresh unavailable".into(),
+                        data: None,
+                    })
+                }
+                _ => evidence_config_response(request),
+            })
+            .await;
+        config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+        draw_and_arm_mutation_dialog(&mut manager);
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        // The next Press precedes the result's first draw, as in double Enter.
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(manager.has_mutation_dialog());
+        assert!(!manager.has_pending_mutation());
+        assert!(manager.aliases.is_empty());
+        assert!(manager.loaded_section.is_none());
+        print_evidence_config_frame(
+            &mut manager,
+            "result-warning-and-refresh-failure",
+            100,
+            30,
+            &[
+                "Config mutation result",
+                "Deleted providers.models.test.first",
+                "refresh unavailable",
+                "workspace cleanup incomplete",
+                "dismiss",
+            ],
+        );
+        assert!(
+            manager.loaded_section.is_none(),
+            "drawing must not mark stale data loaded"
+        );
+        manager.arm_mutation_dialog_after_draw(|| Ok(())).unwrap();
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(!manager.has_mutation_dialog());
+        assert_eq!(evidence_mutation_count(&requests), 1);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_type_ahead_and_double_enter() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for reset in [false, true] {
+            let committed = AtomicBool::new(false);
+            let (mut manager, requests, mut term) =
+                evidence_alias_manager(move |request| match request["method"].as_str().unwrap() {
+                    "config/map-key-delete" | "config/delete" => {
+                        committed.store(true, Ordering::SeqCst);
+                        confirmation_response(request)
+                    }
+                    "config/map-keys" if committed.load(Ordering::SeqCst) => {
+                        Ok(serde_json::json!({"keys": ["second"]}))
+                    }
+                    "config/list" if committed.load(Ordering::SeqCst) => {
+                        let mut model = field("providers.models.test.first.model");
+                        model.tab = ConfigTab::Model;
+                        Ok(serde_json::json!({"entries": [model]}))
+                    }
+                    _ => evidence_config_response(request),
+                })
+                .await;
+            if reset {
+                config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            }
+            let trigger = if reset { 'd' } else { 'x' };
+            config_key(&mut manager, &mut term, KeyCode::Char(trigger)).await;
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(manager.has_pending_mutation());
+            assert_eq!(evidence_mutation_count(&requests), 0);
+            print_evidence_config_frame(
+                &mut manager,
+                if reset {
+                    "reset-type-ahead-awaits-arming"
+                } else {
+                    "delete-type-ahead-awaits-arming"
+                },
+                100,
+                30,
+                &[
+                    if reset {
+                        "Confirm reset"
+                    } else {
+                        "Confirm deletion"
+                    },
+                    "providers.models.test.first",
+                    "Enter=confirm",
+                ],
+            );
+            // The first visible frame alone cannot enable an already queued
+            // Press. The outer loop must finish its input-drain barrier too.
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(manager.has_pending_mutation());
+            assert_eq!(evidence_mutation_count(&requests), 0);
+            let mut drained = false;
+            manager
+                .arm_mutation_dialog_after_draw(|| {
+                    drained = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(drained);
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(manager.has_mutation_dialog());
+            assert!(!manager.has_pending_mutation());
+            print_evidence_config_frame(
+                &mut manager,
+                if reset {
+                    "reset-double-enter-keeps-result"
+                } else {
+                    "delete-double-enter-keeps-result"
+                },
+                100,
+                30,
+                &[
+                    "Config mutation result",
+                    if reset { "Reset" } else { "Deleted" },
+                    "providers.models.test.first",
+                    "dismiss",
+                ],
+            );
+            manager.arm_mutation_dialog_after_draw(|| Ok(())).unwrap();
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(!manager.has_mutation_dialog());
+            assert_eq!(evidence_mutation_count(&requests), 1);
+            let requests = requests.lock().unwrap();
+            let mutation = requests
+                .iter()
+                .find(|request| {
+                    request["method"]
+                        == if reset {
+                            "config/delete"
+                        } else {
+                            "config/map-key-delete"
+                        }
+                })
+                .unwrap();
+            assert_eq!(
+                mutation["params"],
+                if reset {
+                    serde_json::json!({"prop": "providers.models.test.first.model"})
+                } else {
+                    serde_json::json!({"path": "providers.models.test", "key": "first"})
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_long_result_wheel_and_keyboard_scroll() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let deleted = AtomicBool::new(false);
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(move |request| match request["method"].as_str().unwrap() {
+                "config/map-key-delete" => {
+                    deleted.store(true, Ordering::SeqCst);
+                    let warnings: Vec<String> =
+                        (0..40).map(|i| format!("cleanup-{i:02}")).collect();
+                    Ok(serde_json::json!({
+                        "path": request["params"]["path"], "key": request["params"]["key"],
+                        "deleted": true, "warnings": warnings
+                    }))
+                }
+                "config/map-keys" if deleted.load(Ordering::SeqCst) => {
+                    Ok(serde_json::json!({"keys": ["second"]}))
+                }
+                _ => evidence_config_response(request),
+            })
+            .await;
+        config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+        draw_and_arm_mutation_dialog(&mut manager);
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        print_evidence_config_frame(
+            &mut manager,
+            "long-result-narrow-top",
+            70,
+            20,
+            &["Config mutation result", "Deleted", "cleanup-00", "dismiss"],
+        );
+        let max_scroll = manager.mutation_scroll_max.get();
+        assert!(max_scroll > 1, "the fixture must genuinely need scrolling");
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 35,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..128 {
+            manager
+                .handle_mouse(
+                    mouse(MouseEventKind::ScrollDown),
+                    Rect::new(0, 0, 70, 20),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        }
+        config_key(&mut manager, &mut term, KeyCode::Down).await;
+        assert!(matches!(
+            manager.mutation_dialog,
+            Some(ConfigMutationDialog::Outcome { scroll, .. }) if scroll == max_scroll
+        ));
+        print_evidence_config_frame(
+            &mut manager,
+            "long-result-narrow-wheel-bottom-clamped",
+            70,
+            20,
+            &["Config mutation result", "cleanup-39", "dismiss"],
+        );
+        manager
+            .handle_mouse(
+                mouse(MouseEventKind::ScrollUp),
+                Rect::new(0, 0, 70, 20),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        config_key(&mut manager, &mut term, KeyCode::Up).await;
+        assert!(matches!(
+            manager.mutation_dialog,
+            Some(ConfigMutationDialog::Outcome { scroll, .. }) if scroll == max_scroll - 2
+        ));
+        print_evidence_config_frame(
+            &mut manager,
+            "long-result-narrow-scroll-back",
+            70,
+            20,
+            &["Config mutation result", "cleanup-", "dismiss"],
+        );
+        manager
+            .handle_mouse(
+                mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+                Rect::new(0, 0, 70, 20),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(!manager.has_mutation_dialog());
+        assert_eq!(manager.aliases, ["second"]);
+        assert_eq!(evidence_mutation_count(&requests), 1);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_narrow_confirmation_wheel_and_keyboard_scroll() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests, mut term) =
+            evidence_alias_manager(evidence_config_response).await;
+        config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+        print_evidence_config_frame(
+            &mut manager,
+            "delete-confirmation-narrow-top",
+            70,
+            14,
+            &[
+                "Confirm deletion",
+                "providers.models.test.first",
+                "cannot preview",
+                "Enter=confirm",
+            ],
+        );
+        let max_scroll = manager.mutation_scroll_max.get();
+        assert!(max_scroll > 0, "the notice must genuinely need scrolling");
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 35,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..128 {
+            manager
+                .handle_mouse(
+                    mouse(MouseEventKind::ScrollDown),
+                    Rect::new(0, 0, 70, 14),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            manager.mutation_dialog.as_ref(),
+            Some(ConfigMutationDialog::Confirm(pending)) if pending.scroll == max_scroll
+        ));
+        print_evidence_config_frame(
+            &mut manager,
+            "delete-confirmation-narrow-wheel-bottom-clamped",
+            70,
+            14,
+            &["Confirm deletion", "confirmed.", "Enter=confirm", "scroll"],
+        );
+        manager
+            .handle_mouse(
+                mouse(MouseEventKind::ScrollUp),
+                Rect::new(0, 0, 70, 14),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        config_key(&mut manager, &mut term, KeyCode::Up).await;
+        assert!(matches!(
+            manager.mutation_dialog.as_ref(),
+            Some(ConfigMutationDialog::Confirm(pending))
+                if pending.scroll == max_scroll.saturating_sub(2)
+        ));
+        assert_eq!(evidence_mutation_count(&requests), 0);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides"
+    )]
+    async fn evidence_frame_reconnect_handoff_keeps_result_and_drops_confirmation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let deleted = AtomicBool::new(false);
+        let (mut old, requests, mut term) =
+            evidence_alias_manager(move |request| match request["method"].as_str().unwrap() {
+                "config/map-key-delete" => {
+                    deleted.store(true, Ordering::SeqCst);
+                    Ok(serde_json::json!({
+                        "path": request["params"]["path"], "key": request["params"]["key"],
+                        "deleted": true, "warnings": ["workspace cleanup incomplete"]
+                    }))
+                }
+                "config/map-keys" if deleted.load(Ordering::SeqCst) => {
+                    Ok(serde_json::json!({"keys": ["second"]}))
+                }
+                _ => evidence_config_response(request),
+            })
+            .await;
+        config_key(&mut old, &mut term, KeyCode::Char('x')).await;
+        draw_and_arm_mutation_dialog(&mut old);
+        config_key(&mut old, &mut term, KeyCode::Enter).await;
+        let (mut next, next_requests) = confirmation_manager(|request| {
+            if request["method"] == "config/map-keys" {
+                Ok(serde_json::json!({"keys": ["second"]}))
+            } else {
+                evidence_config_response(request)
+            }
+        });
+        next.init().await.unwrap();
+        // This is the production transfer seam invoked by adopt_client!, not
+        // a claim that a network connection or daemon actually restarted.
+        old.hand_off_mutation_outcome(&mut next);
+        assert!(next.mutation_input.get() == MutationDialogInput::AwaitingDraw);
+        print_evidence_config_frame(
+            &mut next,
+            "reconnect-handoff-retains-result",
+            100,
+            30,
+            &[
+                "Config mutation result",
+                "Deleted providers.models.test.first",
+                "workspace cleanup incomplete",
+                "dismiss",
+            ],
+        );
+        assert_eq!(evidence_mutation_count(&requests), 1);
+        assert_eq!(evidence_mutation_count(&next_requests), 0);
+
+        let (mut old, old_requests, mut term) =
+            evidence_alias_manager(evidence_config_response).await;
+        config_key(&mut old, &mut term, KeyCode::Char('x')).await;
+        assert!(old.has_pending_mutation());
+        let (mut next, next_requests) = confirmation_manager(evidence_config_response);
+        next.init().await.unwrap();
+        old.hand_off_mutation_outcome(&mut next);
+        assert!(!next.has_mutation_dialog());
+        let rows = print_evidence_config_frame(
+            &mut next,
+            "reconnect-handoff-drops-pending-confirmation",
+            100,
+            30,
+            &["Model providers", "test"],
+        );
+        assert!(!rows.iter().any(|row| row.contains("Confirm deletion")));
+        assert_eq!(evidence_mutation_count(&old_requests), 0);
+        assert_eq!(evidence_mutation_count(&next_requests), 0);
+    }
+
     #[tokio::test]
     async fn config_application_noop_alias_creation_preserves_the_last_save() {
         let (mut manager, _) = responding_manager();

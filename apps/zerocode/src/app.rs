@@ -3861,6 +3861,37 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
         inner,
     );
 }
+/// Render Config evidence with the production app frame, mode bar and status
+/// bar. Connection status comes from the test RPC client, not invented text.
+#[cfg(test)]
+pub(crate) fn draw_config_evidence_frame(
+    frame: &mut ratatui::Frame,
+    manager: &mut config_manager::App,
+    rpc: Arc<RpcClient>,
+) {
+    let mut chat = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+    let mut acp = acp::Acp::new(rpc.clone());
+    draw_app_frame(
+        frame,
+        Mode::Config,
+        &mut chat,
+        &mut acp,
+        |frame, chunks, _, _| {
+            draw_mode_bar(frame, chunks[0], Mode::Config, None);
+            manager.draw_into(frame, chunks[1]);
+            draw_status_bar(
+                frame,
+                chunks[2],
+                &rpc.connection_state(),
+                rpc.tui_id(),
+                CtxBar::new(None, None, None, None),
+                false,
+                false,
+            );
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
