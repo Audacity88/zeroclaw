@@ -1,6 +1,7 @@
 //! Review evidence from production input, RPC decoding and app renderers.
 //! These fixtures describe daemon replies, not a real daemon or network run.
 
+#[cfg(test)] // test-only module: lets the keymap guard skip review-evidence key input
 use super::*;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
