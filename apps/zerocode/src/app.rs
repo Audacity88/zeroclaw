@@ -6142,7 +6142,7 @@ mod tests {
         let outcome = crate::open_sessions::Restore {
             elsewhere: 2,
             dropped: 3,
-            publish_error: Some(anyhow::anyhow!("disk full")),
+            publish_error: Some(anyhow::Error::msg("disk full")),
             ..Default::default()
         };
         let status = restore_status(&outcome).unwrap();
