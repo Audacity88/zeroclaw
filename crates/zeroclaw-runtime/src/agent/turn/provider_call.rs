@@ -278,42 +278,65 @@ pub(crate) async fn gate_tool_loop_budget(ctx: &TurnCtx<'_>) -> Result<()> {
         && let Some(offer) = tool_loop_budget_override_offer()
     {
         prompts += 1;
-        if !ask_budget_override(ctx, channel, &offer).await? {
-            break;
-        }
+        let attributed = match ask_budget_override(ctx, channel, &offer).await? {
+            BudgetOverrideAnswer::Approved(attributed) => attributed,
+            BudgetOverrideAnswer::GrantedElsewhere => continue,
+            BudgetOverrideAnswer::Stopped => break,
+        };
         match grant_tool_loop_budget_offer(&offer) {
             OverrideGrant::Granted => {}
-            OverrideGrant::Expired => continue,
+            OverrideGrant::AlreadyGranted | OverrideGrant::Expired => continue,
             OverrideGrant::Refused => break,
         }
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_attrs(::serde_json::json!({
-                    "current_usd": offer.current_usd,
-                    "limit_usd": offer.limit_usd,
-                    "period": format!("{:?}", offer.period),
-                })),
-            "cost limit overridden by the operator for the rest of the period"
-        );
+        // Session attribution comes from the turn's canonical session scope.
+        // `decided_by` identifies the answering back-channel, not a human identity.
+        // Only the atomic new-grant result emits this audit event, even if two
+        // operators answer concurrently. Released waiters never reach it.
+        ::zeroclaw_log::scope!(
+            channel: ctx.channel_name,
+            decided_by: attributed.decided_by.as_deref().unwrap_or(channel.name()),
+            approval_source: "operator",
+            trace_id: ctx.turn_id,
+            => async {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "current_usd": offer.current_usd,
+                            "limit_usd": offer.limit_usd,
+                            "period": format!("{:?}", offer.period),
+                            "granted_at": chrono::Utc::now().to_rfc3339(),
+                        })),
+                    "cost limit overridden by the operator for the rest of the period"
+                );
+            }
+        )
+        .await;
     }
     enforce_tool_loop_budget()
 }
 
 /// Ask the operator whether to override the exceeded `period` limit.
-/// `Ok(true)` only for an operator's approval; a runtime fail-closed answer
-/// (timeout, unreachable client) or a channel that cannot ask is `Ok(false)`.
+/// Preserve attribution for an operator's one-time approval and distinguish
+/// waiters released by another session. Every other answer stops the turn.
 /// Cancelling the turn while the prompt is open returns `ToolLoopCancelled`.
+enum BudgetOverrideAnswer {
+    Approved(zeroclaw_api::channel::AttributedApprovalResponse),
+    GrantedElsewhere,
+    Stopped,
+}
+
 async fn ask_budget_override(
     ctx: &TurnCtx<'_>,
     channel: &dyn zeroclaw_api::channel::Channel,
     offer: &OverrideOffer,
-) -> Result<bool> {
+) -> Result<BudgetOverrideAnswer> {
     let key = match offer.period {
         UsagePeriod::Day => "turn-cost-limit-override-day",
         UsagePeriod::Month => "turn-cost-limit-override-month",
-        UsagePeriod::Session => return Ok(false),
+        UsagePeriod::Session => return Ok(BudgetOverrideAnswer::Stopped),
     };
     let request = zeroclaw_api::channel::ChannelApprovalRequest {
         tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
@@ -345,19 +368,18 @@ async fn ask_budget_override(
     let answer = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(ToolLoopCancelled.into()),
-        () = granted_elsewhere => return Ok(true),
+        () = granted_elsewhere => return Ok(BudgetOverrideAnswer::GrantedElsewhere),
         answer = ask => answer,
     };
     Ok(match answer {
-        Ok(Some(attributed)) => {
-            !attributed.source.is_runtime_fail_closed()
-                && matches!(
-                    attributed.response,
-                    zeroclaw_api::channel::ChannelApprovalResponse::Approve
-                        | zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
-                )
+        Ok(Some(attributed))
+            if attributed.source == zeroclaw_api::channel::ApprovalSource::Operator
+                && attributed.response
+                    == zeroclaw_api::channel::ChannelApprovalResponse::Approve =>
+        {
+            BudgetOverrideAnswer::Approved(attributed)
         }
-        Ok(None) => false,
+        Ok(_) => BudgetOverrideAnswer::Stopped,
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -367,7 +389,7 @@ async fn ask_budget_override(
                     .with_attrs(::serde_json::json!({"error": format!("{error}")})),
                 "cost limit override prompt failed; stopping the turn"
             );
-            false
+            BudgetOverrideAnswer::Stopped
         }
     })
 }
@@ -4518,6 +4540,7 @@ mod budget_override_tests {
     async fn deny_or_timeout_stops_the_turn() {
         for answer in [
             AttributedApprovalResponse::operator(ChannelApprovalResponse::Deny),
+            AttributedApprovalResponse::operator(ChannelApprovalResponse::AlwaysApprove),
             AttributedApprovalResponse::from_runtime(
                 ChannelApprovalResponse::Approve,
                 ApprovalSource::TimedOut,
@@ -4586,16 +4609,30 @@ mod budget_override_tests {
     /// Dan saw the prompt in two sessions; approving one left the other
     /// waiting. A grant from anywhere must release every waiting turn.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn approval_in_another_session_releases_a_waiting_prompt() {
         use std::sync::atomic::Ordering;
+        // Audit capture uses the process-wide logger, just like provider trace tests.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut records = zeroclaw_log::subscribe_or_install();
         let tmp = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
         let tracker = over_limit_tracker(&tmp, true);
         let channel = UnansweredChannel {
             asked: std::sync::atomic::AtomicBool::new(false),
             withdrawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (observer, pacing) = (NoopObserver, PacingConfig::default());
-        let turn_ctx = ctx(&observer, &pacing, Some(&channel));
+        let mut turn_ctx = ctx(&observer, &pacing, Some(&channel));
+        turn_ctx.turn_id = "budget-override-audit-release";
         let waiting = gate(&tracker, &turn_ctx);
         tokio::pin!(waiting);
 
@@ -4607,8 +4644,19 @@ mod budget_override_tests {
         }
         assert!(channel.asked.load(Ordering::SeqCst));
 
-        // The other session's operator approves.
-        assert!(tracker.grant_override(UsagePeriod::Day));
+        // The other session's operator approves through the real gate.
+        let approver = ScriptedChannel::answering(
+            AttributedApprovalResponse::operator(ChannelApprovalResponse::Approve)
+                .with_decider("approval-surface"),
+        );
+        let mut approver_ctx = ctx(&observer, &pacing, Some(&approver));
+        approver_ctx.turn_id = "budget-override-audit-release";
+        let approved = crate::agent::loop_::scope_session_key(
+            Some("approving-session".to_string()),
+            gate(&tracker, &approver_ctx),
+        )
+        .await;
+        assert!(approved.is_ok(), "{approved:?}");
 
         let result = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
@@ -4617,6 +4665,34 @@ mod budget_override_tests {
         assert!(
             channel.withdrawn.load(Ordering::SeqCst),
             "the released prompt's request must be dropped so the client withdraws it"
+        );
+        let mut grants = Vec::new();
+        while let Ok(record) = records.try_recv() {
+            if record["message"]
+                == "cost limit overridden by the operator for the rest of the period"
+                && record["trace_id"] == "budget-override-audit-release"
+            {
+                grants.push(record);
+            }
+        }
+        assert_eq!(
+            grants.len(),
+            1,
+            "released waiters must not emit operator grants"
+        );
+        let grant = &grants[0];
+        assert_eq!(grant["zeroclaw"]["session_key"], "approving-session");
+        assert_eq!(grant["zeroclaw"]["channel"], "test");
+        assert_eq!(grant["attributes"]["decided_by"], "approval-surface");
+        assert_eq!(grant["attributes"]["approval_source"], "operator");
+        assert_eq!(grant["attributes"]["period"], "Day");
+        assert_eq!(grant["attributes"]["current_usd"], 3.0);
+        assert_eq!(grant["attributes"]["limit_usd"], 1.0);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(
+                grant["attributes"]["granted_at"].as_str().unwrap()
+            )
+            .is_ok()
         );
     }
 

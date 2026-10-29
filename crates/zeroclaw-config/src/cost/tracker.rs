@@ -192,27 +192,25 @@ pub struct CostTracker {
     /// Shared limits the operator chose to override for the rest of the
     /// current reporting period (`cost.allow_override`). Shared by every
     /// tracker derived from the same base, so one decision covers every
-    /// session and delegation of the daemon. Persisted next to the ledger,
-    /// so a daemon restart keeps it until the period rolls over.
+    /// session and delegation of the daemon. Kept only in memory: a restart
+    /// clears grants and workspace files cannot supply approval authority.
     overrides: Arc<OverrideState>,
 }
 
-/// The granted overrides, where they persist, and a signal that fires on
+/// The process-local grants are the source of truth for overrides, with a signal on
 /// each grant so a turn still waiting on its own prompt can stop asking
 /// once another session's prompt was approved.
 struct OverrideState {
     current: Mutex<BudgetOverrides>,
-    path: PathBuf,
     granted: tokio::sync::watch::Sender<BudgetOverrides>,
 }
 
 impl OverrideState {
-    fn load(path: PathBuf) -> Self {
-        let current = BudgetOverrides::load(&path);
+    fn new() -> Self {
+        let current = BudgetOverrides::default();
         let (granted, _) = tokio::sync::watch::channel(current);
         Self {
             current: Mutex::new(current),
-            path,
             granted,
         }
     }
@@ -225,41 +223,13 @@ impl OverrideState {
 /// Reporting periods whose shared limit the operator overrode. Each entry
 /// names the period it was granted for, so it stops matching on its own at
 /// the next UTC day or month rollover.
-#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 struct BudgetOverrides {
-    #[serde(default)]
     day: Option<NaiveDate>,
-    #[serde(default)]
     month: Option<(i32, u32)>,
 }
 
 impl BudgetOverrides {
-    /// Read the persisted overrides. A missing or unreadable file means
-    /// none: the limit stays enforced, which is the safe failure.
-    fn load(path: &Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{error}")})),
-                    "ignoring unreadable cost override file; limits stay enforced"
-                );
-                Self::default()
-            }),
-            Err(_) => Self::default(),
-        }
-    }
-
-    /// Write via a temp file and rename so a crash never leaves a torn file.
-    fn save(self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec(&self)?)
-            .with_context(|| format!("Failed to write {}", tmp.display()))?;
-        fs::rename(&tmp, path).with_context(|| format!("Failed to replace {}", path.display()))
-    }
-
     /// These overrides plus `period` granted for `at`. `Session` is not a
     /// budget period and adds nothing.
     fn with(mut self, period: UsagePeriod, at: ReportingPeriod) -> Self {
@@ -306,8 +276,10 @@ pub struct OverrideOffer {
 /// What [`CostTracker::grant_offer`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverrideGrant {
-    /// The offered period's limit is lifted (or already was).
+    /// This decision newly lifted the offered period's limit.
     Granted,
+    /// Another decision already lifted the limit; no new grant was recorded.
+    AlreadyGranted,
     /// The offered period rolled over before the answer: nothing recorded.
     /// Check again; the new period may not be exceeded at all.
     Expired,
@@ -346,7 +318,7 @@ impl CostTracker {
             session_totals: Arc::new(Mutex::new(HashMap::new())),
             budget_scope: BudgetScope::Shared,
             enforcement_mode: EnforcementMode::Live,
-            overrides: Arc::new(OverrideState::load(overrides_path(&storage_path))),
+            overrides: Arc::new(OverrideState::new()),
         })
     }
 
@@ -415,38 +387,30 @@ impl CostTracker {
         if !same_period {
             return OverrideGrant::Expired;
         }
-        if self.grant_override_at_period(offer.period, offer.at) {
-            OverrideGrant::Granted
-        } else {
-            OverrideGrant::Refused
-        }
+        self.apply_override_at_period(offer.period, offer.at)
     }
 
     fn grant_override_at_period(&self, period: UsagePeriod, at: ReportingPeriod) -> bool {
+        matches!(
+            self.apply_override_at_period(period, at),
+            OverrideGrant::Granted | OverrideGrant::AlreadyGranted
+        )
+    }
+
+    fn apply_override_at_period(&self, period: UsagePeriod, at: ReportingPeriod) -> OverrideGrant {
         if !self.config.read().allow_override || matches!(period, UsagePeriod::Session) {
-            return false;
+            return OverrideGrant::Refused;
         }
         let mut overrides = self.overrides.current.lock();
         let next = overrides.with(period, at);
         if next == *overrides {
-            return true;
+            return OverrideGrant::AlreadyGranted;
         }
         *overrides = next;
-        // Persisting is best effort: the grant already holds for this
-        // daemon, and a failed write only costs a re-ask after a restart.
-        if let Err(error) = next.save(&self.overrides.path) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
-                "cost override granted but not persisted; a restart will ask again"
-            );
-        }
         // Publish under the same lock, so concurrent grants reach the
         // watch in the order they were applied.
         self.overrides.granted.send_replace(next);
-        true
+        OverrideGrant::Granted
     }
 
     /// Resolves once `offer`'s limit is overridden for the period it was
@@ -710,7 +674,7 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs_at_period(period)?;
         let day = storage.reporting_period().day;
-        // A persisted override only counts while the operator still allows
+        // An override only counts while the operator still allows
         // overrides: turning `allow_override` off restores the limit.
         let mut overrides = if config.allow_override {
             self.overrides.get()
@@ -1260,11 +1224,6 @@ impl CostTracker {
             }
         }
     }
-}
-
-/// The override file sits beside the ledger (`state/cost-overrides.json`).
-fn overrides_path(storage_path: &Path) -> PathBuf {
-    storage_path.with_file_name("cost-overrides.json")
 }
 
 fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
@@ -4115,12 +4074,13 @@ mod tests {
         tracker
     }
 
-    /// Dan restarted the app after overriding and was asked again.
+    /// A restart must restore enforcement; no grant is written to the workspace.
     #[test]
-    fn override_survives_a_restart_and_stops_counting_when_disallowed() {
+    fn override_is_memory_only_and_live_disallow_restores_the_limit() {
         let tmp = TempDir::new().unwrap();
         let first = over_daily_limit(tmp.path(), true);
         assert!(first.grant_override(UsagePeriod::Day));
+        assert!(!tmp.path().join("state/cost-overrides.json").exists());
         drop(first);
 
         let restarted = CostTracker::new(
@@ -4136,11 +4096,18 @@ mod tests {
         .unwrap();
         assert!(matches!(
             restarted.check_budget(0.0).unwrap(),
-            BudgetCheck::Allowed
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                ..
+            }
         ));
 
-        // Turning allow_override off restores the limit even with a
-        // persisted grant on disk.
+        assert!(restarted.grant_override(UsagePeriod::Day));
+        assert!(matches!(
+            restarted.check_budget(0.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
+        // Live policy updates restore enforcement without restarting.
         restarted.update_config(CostConfig {
             enabled: true,
             daily_limit_usd: 1.0,
@@ -4158,13 +4125,17 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_override_file_keeps_the_limit() {
+    fn forged_legacy_override_file_cannot_lift_the_limit() {
         let tmp = TempDir::new().unwrap();
         let tracker = over_daily_limit(tmp.path(), true);
         drop(tracker);
         fs::write(
             tmp.path().join("state").join("cost-overrides.json"),
-            "not json",
+            serde_json::json!({
+                "day": Utc::now().date_naive(),
+                "month": [Utc::now().year(), Utc::now().month()],
+            })
+            .to_string(),
         )
         .unwrap();
         let tracker = over_daily_limit(tmp.path(), true);
@@ -4172,6 +4143,18 @@ mod tests {
             tracker.check_budget(0.0).unwrap(),
             BudgetCheck::Exceeded { .. }
         ));
+    }
+
+    #[test]
+    fn only_the_first_decision_records_a_new_grant() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = over_daily_limit(tmp.path(), true);
+        let offer = tracker.override_offer().unwrap();
+        assert_eq!(tracker.grant_offer(&offer), OverrideGrant::Granted);
+        assert_eq!(
+            tracker.derived_shared().grant_offer(&offer),
+            OverrideGrant::AlreadyGranted
+        );
     }
 
     #[tokio::test]
