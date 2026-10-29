@@ -12879,6 +12879,8 @@ pub async fn open_editor_for_content(content: &str) -> String {
 mod tests {
     use super::*;
 
+    mod evidence_frames;
+
     /// Async env-lock for `#[tokio::test]` cases that resolve config through
     /// environment variables and hold the guard across await points. Serializes
     /// on a dedicated async mutex and, internally, on the shared sync
