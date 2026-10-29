@@ -12455,9 +12455,13 @@ impl ChatState {
             self.turn_had_streaming_text = true;
         }
         self.flush_streaming_thought();
-        self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-            "zc-chat-resynced-turn-running",
-        ))));
+        // A local resync notice is not conversation activity.
+        self.push_entry_at(
+            None,
+            ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                "zc-chat-resynced-turn-running",
+            ))),
+        );
         self.info_message = None;
         self.lag_reattach = Some(LagReattach {
             generation: self.turn_generation,
@@ -12522,7 +12526,11 @@ impl ChatState {
             ResyncNotice::TurnFinished => crate::i18n::t("zc-chat-resynced-turn-finished"),
             ResyncNotice::Idle => crate::i18n::t("zc-chat-resynced"),
         };
-        self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(notice_text)));
+        // Reloading history must not shorten the gap since the last exchange.
+        self.push_entry_at(
+            None,
+            ChatEntry::SystemMessage(Arc::<str>::from(notice_text)),
+        );
         self.info_message = None;
         // The reload clears the connection-class errors: a stale
         // `ResyncFailed` from this very resync must not stick once the
@@ -13139,6 +13147,60 @@ mod tests {
             for line in &text[lo..hi] {
                 assert!(!line.starts_with("─── ") && !line.contains("── Today "));
             }
+        }
+    }
+
+    #[test]
+    fn a_prompt_after_a_reload_notice_keeps_the_last_exchange_gap() {
+        for notice in [ResyncNotice::Idle, ResyncNotice::TurnFinished] {
+            let mut s = state();
+            s.replace_history_after_notification_resync(
+                vec![
+                    timed("user", "old question", minutes_ago(121)),
+                    timed("assistant", "old answer", minutes_ago(120)),
+                ],
+                true,
+                notice,
+                None,
+                None,
+            );
+            // Cache the reloaded history before appending the next live prompt.
+            s.rebuild_lines(80);
+            let notice_text = crate::i18n::t(match notice {
+                ResyncNotice::Idle => "zc-chat-resynced",
+                ResyncNotice::TurnFinished => "zc-chat-resynced-turn-finished",
+            });
+            assert!(
+                transcript_text(&s)
+                    .iter()
+                    .any(|line| line.contains(&notice_text)),
+                "the reload notice remains visible"
+            );
+
+            s.push_user_message(Some("new question".to_string()), Vec::new());
+            let prompt_index = s.entries.len() - 1;
+            let prompt_at = s.entry_time(prompt_index).unwrap();
+            let today = prompt_at.date_naive();
+            s.rebuild_lines_on(80, today);
+            let text = transcript_text(&s);
+            let divider = format!("── {} ──", entry_time::divider_label(&prompt_at, today));
+            let prompt_line = s
+                .transcript_layout
+                .view()
+                .cached_line_ranges
+                .iter()
+                .find(|(index, _, _)| *index == prompt_index)
+                .map(|(_, lo, _)| *lo)
+                .expect("the new prompt is rendered");
+            assert_eq!(
+                text[prompt_line - 1].trim(),
+                divider,
+                "the two-hour gap survives the local {notice:?} notice: {text:#?}"
+            );
+
+            s.mark_dirty_full();
+            s.rebuild_lines_on(80, today);
+            assert_eq!(transcript_text(&s), text);
         }
     }
 
