@@ -19033,8 +19033,8 @@ mod tests {
     fn callback_ack_source_region() -> &'static str {
         const SRC: &str = include_str!("telegram.rs");
         let start = SRC
-            .find("let answer_text = match (action, resolution) {")
-            .expect("callback ack arm: `let answer_text = match (action, resolution) {` not found");
+            .find("let answer_text = match (effective_action, resolution) {")
+            .expect("callback ack arm: `let answer_text = match (effective_action, resolution) {` not found");
         let rest = &SRC[start..];
         let end = rest
             .find("let answer_body")
