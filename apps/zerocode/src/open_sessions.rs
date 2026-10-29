@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chat::{MAX_TRACKED_SESSIONS_PER_PANE, PaneKind, ResumeEntry, SidebarSessionSummary};
+use crate::chat::{PaneKind, ResumeEntry, SidebarSessionSummary};
 use crate::client::{RpcClient, SessionEntry, Transport};
 
 const DIR_NAME: &str = "open-sessions";
@@ -86,7 +86,7 @@ impl Snapshot {
     }
 
     /// Resume entries for the Chat and Code panes, in saved order.
-    pub(crate) fn resume_entries(&self) -> (Vec<ResumeEntry>, Vec<ResumeEntry>) {
+    pub(crate) fn resume_entries(&self, cap: usize) -> (Vec<ResumeEntry>, Vec<ResumeEntry>) {
         let mut chat = Vec::new();
         let mut code = Vec::new();
         for saved in &self.sessions {
@@ -94,7 +94,7 @@ impl Snapshot {
                 SavedPane::Chat => &mut chat,
                 SavedPane::Code => &mut code,
             };
-            if list.len() < MAX_TRACKED_SESSIONS_PER_PANE {
+            if list.len() < cap {
                 list.push(ResumeEntry::saved(
                     saved.session_id.clone(),
                     saved.agent_alias.clone(),
@@ -103,6 +103,20 @@ impl Snapshot {
             }
         }
         (chat, code)
+    }
+
+    /// Keep the cross-pane order independently of the panes' resume lists.
+    pub(crate) fn sidebar_order(&self) -> Vec<(PaneKind, String)> {
+        self.sessions
+            .iter()
+            .map(|saved| {
+                let pane = match saved.pane {
+                    SavedPane::Code => PaneKind::Acp,
+                    SavedPane::Chat => PaneKind::Chat,
+                };
+                (pane, saved.session_id.clone())
+            })
+            .collect()
     }
 
     /// The pane to open on: the saved one if it has sessions, else Code, else
@@ -473,8 +487,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rows = [
             row(PaneKind::Acp, "code-1", "fable", false),
-            row(PaneKind::Acp, "code-2", "ox", true),
             row(PaneKind::Chat, "chat-1", "fable", true),
+            row(PaneKind::Acp, "code-2", "ox", true),
         ];
         let snapshot = Snapshot::from_rows(&rows, Some(PaneKind::Acp));
         let mut store = owned(dir.path(), "local:/run/a.sock");
@@ -485,7 +499,7 @@ mod tests {
         let loaded = reopened.load().expect("saved list loads");
         assert_eq!(loaded, snapshot);
 
-        let (chat, code) = loaded.resume_entries();
+        let (chat, code) = loaded.resume_entries(crate::chat::MAX_TRACKED_SESSIONS_PER_PANE);
         let ids = |entries: &[ResumeEntry]| {
             entries
                 .iter()
@@ -501,6 +515,26 @@ mod tests {
         );
         assert_eq!(ids(&chat), vec![("chat-1".into(), "fable".into(), true)]);
         assert_eq!(loaded.start_pane(), Some(PaneKind::Acp));
+
+        // Pane reconstruction groups Code and Chat separately and may put
+        // the focused session first. The saved order must win before draw.
+        let mut restored_rows: Vec<_> = code
+            .iter()
+            .rev()
+            .map(|e| row(PaneKind::Acp, &e.session_id, &e.agent_alias, e.was_focused))
+            .chain(
+                chat.iter()
+                    .map(|e| row(PaneKind::Chat, &e.session_id, &e.agent_alias, e.was_focused)),
+            )
+            .collect();
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        sidebar.restore_order(loaded.sidebar_order());
+        sidebar.sort_in_display_order(&mut restored_rows);
+        assert_eq!(
+            Snapshot::from_rows(&restored_rows, loaded.start_pane()),
+            snapshot,
+            "the cross-pane order and focus survive a save and restore"
+        );
     }
 
     #[test]
@@ -561,13 +595,23 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_edited_file_cannot_exceed_the_pane_cap() {
-        let rows: Vec<_> = (0..12)
-            .map(|i| row(PaneKind::Acp, &format!("s{i}"), "a", i == 0))
-            .collect();
-        let (_, code) = Snapshot::from_rows(&rows, None).resume_entries();
-        assert_eq!(code.len(), MAX_TRACKED_SESSIONS_PER_PANE);
-        assert_eq!(code[0].session_id, "s0");
+    fn restore_limits_each_pane_to_the_supplied_cap() {
+        for cap in [1, 4, 8, 32] {
+            let rows: Vec<_> = (0..=cap)
+                .flat_map(|i| {
+                    [
+                        row(PaneKind::Acp, &format!("code-{i}"), "a", i == 0),
+                        row(PaneKind::Chat, &format!("chat-{i}"), "a", i == 0),
+                    ]
+                })
+                .collect();
+            let (chat, code) = Snapshot::from_rows(&rows, None).resume_entries(cap);
+            for (entries, prefix) in [(chat, "chat"), (code, "code")] {
+                let ids: Vec<_> = entries.into_iter().map(|e| e.session_id).collect();
+                let expected: Vec<_> = (0..cap).map(|i| format!("{prefix}-{i}")).collect();
+                assert_eq!(ids, expected, "cap {cap}, pane {prefix}");
+            }
+        }
     }
 
     #[test]

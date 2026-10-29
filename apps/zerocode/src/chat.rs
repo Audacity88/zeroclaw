@@ -23219,6 +23219,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_open_sessions_attach_exactly_the_restore_cap() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for cap in [1, 4, MAX_TRACKED_SESSIONS_PER_PANE] {
+                let rows: Vec<_> = (0..=cap)
+                    .map(|i| SidebarSessionSummary {
+                        session_id: format!("saved-{i}"),
+                        agent_alias: "alpha".into(),
+                        message_count: 0,
+                        status: SidebarStatus::Ready,
+                        pane_kind: pane,
+                        focused: i == 0,
+                    })
+                    .collect();
+                let snapshot = crate::open_sessions::Snapshot::from_rows(&rows, Some(pane));
+                let (chat_entries, code_entries) = snapshot.resume_entries(cap);
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let rpc = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc_transport(
+                    Arc::clone(&rpc),
+                    crate::client::Transport::Local,
+                ));
+                let mut chat = Chat::new(client, pane);
+                chat.launch_dir =
+                    || panic!("a restored session must not read the launch directory");
+                chat.set_resume_sessions(match pane {
+                    PaneKind::Chat => chat_entries,
+                    PaneKind::Acp => code_entries,
+                });
+                let task = tokio::spawn(async move {
+                    chat.init().await.unwrap();
+                    chat
+                });
+                let request = next_rpc_request(&mut rx, "restore requests enabled agents").await;
+                assert_eq!(request["method"], method::AGENTS_STATUS);
+                respond_ok(
+                    &rpc,
+                    &request,
+                    serde_json::json!({ "agents": [
+                        {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": cap + 1}
+                    ]}),
+                );
+                for i in 0..cap {
+                    let id = format!("saved-{i}");
+                    let request = next_rpc_request(&mut rx, "restore attaches a saved id").await;
+                    assert_eq!(request["method"], method::SESSION_NEW);
+                    assert_eq!(request["params"]["session_id"], id);
+                    assert!(request["params"]["cwd"].is_null());
+                    respond_ok(&rpc, &request, serde_json::json!({ "session_id": id }));
+                    let request =
+                        next_rpc_request(&mut rx, "restore resolves model identity").await;
+                    assert_eq!(request["method"], method::CONFIG_LIST);
+                    respond_ok(&rpc, &request, serde_json::json!([]));
+                    let request = next_rpc_request(&mut rx, "restore reloads the transcript").await;
+                    assert_eq!(request["method"], method::SESSION_MESSAGES);
+                    respond_ok(&rpc, &request, serde_json::json!({ "messages": [] }));
+                }
+                let chat = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("restore must finish without attaching the extra saved entry")
+                    .unwrap();
+                assert_eq!(chat.tracked_session_count(), cap);
+                assert_eq!(chat.session_summaries().len(), cap);
+                assert!(rx.try_recv().is_err(), "restore must not attach cap + 1");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn saved_open_sessions_reattach_by_id_at_launch() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
