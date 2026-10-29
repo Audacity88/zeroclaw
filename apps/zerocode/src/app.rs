@@ -1382,6 +1382,43 @@ pub(crate) fn draw_app_frame(
     }
 }
 
+/// Test-only access to the production Config chrome and contextual help renderer.
+/// This does not run the application's terminal event loop.
+#[cfg(test)]
+pub(crate) fn draw_config_evidence_frame(
+    frame: &mut ratatui::Frame,
+    manager: &mut config_manager::App,
+    rpc: Arc<RpcClient>,
+    show_help: bool,
+) {
+    let mut chat = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+    let mut code = acp::Acp::new(rpc.clone());
+    draw_app_frame(
+        frame,
+        Mode::Config,
+        &mut chat,
+        &mut code,
+        |frame, areas, _, _| {
+            draw_mode_bar(frame, areas[0], Mode::Config, None);
+            manager.draw_into(frame, areas[1]);
+            draw_status_bar(
+                frame,
+                areas[2],
+                &rpc.connection_state(),
+                rpc.tui_id(),
+                CtxBar::new(None, None, None, None),
+                false,
+                false,
+            );
+        },
+    );
+    if show_help {
+        let mut node = HelpNode::entries(global_help_entries());
+        node.children.push(manager.help_context());
+        draw_help_modal(frame, frame.area(), &node, &mut HelpOverlayState::default());
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ModeBarEntry {
     mode: Mode,
