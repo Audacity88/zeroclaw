@@ -8538,18 +8538,20 @@ impl RpcDispatcher {
                     self.ctx.session_backend.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
+                // Chat rewrites currently replace every row's timestamp (#11420).
+                // Omit those times until the backend preserves message times.
                 backend
-                    .load_with_timestamps(&key)
+                    .load(&key)
                     .into_iter()
-                    .map(|stamped| MessageEntry {
-                        role: stamped.message.role,
-                        content: stamped.message.content,
+                    .map(|message| MessageEntry {
+                        role: message.role,
+                        content: message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
-                        created_at: stamped.created_at.map(|at| at.to_rfc3339()),
+                        created_at: None,
                     })
                     .collect()
             }
@@ -33107,17 +33109,35 @@ mod tests {
         chat_backend
             .append("rpc-plain", &ChatMessage::assistant("world"))
             .unwrap();
+        chat_backend
+            .rewrite_messages("rpc-plain", &chat_backend.load("rpc-plain"))
+            .unwrap();
+        assert!(
+            chat_backend
+                .load_with_timestamps("rpc-plain")
+                .iter()
+                .all(|entry| entry.created_at.is_some()),
+            "the SQLite fixture has timestamps which must stay off the wire"
+        );
 
         let result = dispatcher
             .handle_session_messages_for_test(&json!({ "session_id": "rpc-plain" }))
             .await
             .expect("plain session/messages should succeed");
+        assert!(
+            result["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.get("created_at").is_none())
+        );
         let parsed: SessionMessagesResult = from_value(result).unwrap();
         assert_eq!(parsed.total, 2);
         assert!(parsed.messages.iter().all(|entry| {
             entry.kind == MessageEntryKind::Message
                 && entry.tool_call_id.is_none()
                 && entry.tool_output.is_none()
+                && entry.created_at.is_none()
         }));
     }
 
