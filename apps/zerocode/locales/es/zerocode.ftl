@@ -622,7 +622,6 @@ zc-config-footer-action-back-to-files = volver a archivos
 zc-config-footer-action-back-to-skills = volver a habilidades
 zc-config-footer-action-help = ayuda
 zc-config-footer-action-new-line = nueva línea
-zc-config-field-edit-hint = { $keys } → presiona para editar
 zc-doctor-log-path = log: { $path }
 
 zc-oidc-enroll-visit = Para iniciar sesión, abre { $uri } e introduce el código { $code }

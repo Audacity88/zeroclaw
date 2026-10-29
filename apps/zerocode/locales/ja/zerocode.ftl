@@ -622,7 +622,6 @@ zc-config-footer-action-back-to-files = ファイルに戻る
 zc-config-footer-action-back-to-skills = スキルに戻る
 zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
-zc-config-field-edit-hint = { $keys } → 押して編集
 zc-doctor-log-path = log: { $path }
 
 zc-oidc-enroll-visit = サインインするには { $uri } を開き、コード { $code } を入力してください

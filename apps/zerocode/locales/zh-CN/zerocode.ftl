@@ -622,7 +622,6 @@ zc-config-footer-action-back-to-files = 返回文件
 zc-config-footer-action-back-to-skills = 返回技能
 zc-config-footer-action-help = 帮助
 zc-config-footer-action-new-line = 换行
-zc-config-field-edit-hint = { $keys } → 按下以编辑
 zc-doctor-log-path = 日志：{ $path }
 
 zc-oidc-enroll-visit = 要登录,请打开 { $uri } 并输入代码 { $code }
