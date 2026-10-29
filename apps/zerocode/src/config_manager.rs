@@ -461,6 +461,13 @@ fn shorten_home(path: &Path) -> String {
 
 // ── App state ────────────────────────────────────────────────────
 
+struct ArraySelection {
+    entries: Vec<String>,
+    // The resolver supplies the configured prefix of select_items. Saved-only
+    // rows follow it, so their origin survives toggling without a second list.
+    configured_len: usize,
+}
+
 pub(crate) struct App {
     rpc: Arc<RpcClient>,
     /// Cached display string for the active config directory, computed once at
@@ -510,7 +517,7 @@ pub(crate) struct App {
     select_cursor: usize,
     select_items: Vec<String>,
     // Attempt-local ordered selection; None retains the scalar/text editor.
-    array_selection: Option<Vec<String>>,
+    array_selection: Option<ArraySelection>,
     status_msg: Option<String>,
     application_feedback: crate::config_application::ApplicationFeedback,
     // Filter state: None = inactive, Some(buf) = active filter
@@ -791,7 +798,7 @@ impl App {
 
     fn field_draft(&self) -> String {
         if let Some(selected) = &self.array_selection {
-            serde_json::json!(selected).to_string()
+            serde_json::json!(selected.entries).to_string()
         } else if self.is_select_edit() {
             let idx = if self.filter.is_some() {
                 self.filtered_indices(&self.select_items)
@@ -834,7 +841,7 @@ impl App {
         if matches!(self.screen, Screen::FieldEdit { .. }) {
             if let Some(selected) = &mut self.array_selection {
                 if let Ok(loaded) = serde_json::from_str(&self.field_draft_loaded) {
-                    *selected = loaded;
+                    selected.entries = loaded;
                 }
             } else if self.is_select_edit() {
                 self.select_cursor = self
@@ -4222,12 +4229,16 @@ impl App {
                     let Some(selected) = string_array_entries(current) else {
                         return;
                     };
+                    let configured_len = values.len();
                     for entry in &selected {
                         if !values.contains(entry) {
                             values.push(entry.clone());
                         }
                     }
-                    self.array_selection = Some(selected);
+                    self.array_selection = Some(ArraySelection {
+                        entries: selected,
+                        configured_len,
+                    });
                     self.select_cursor = 0;
                 } else {
                     let current = self.fields[idx].value.as_ref().and_then(|v| v.as_str());
@@ -4811,10 +4822,10 @@ impl App {
     async fn commit_select(&mut self, orig_idx: usize) -> Result<()> {
         if let Some(selected) = &mut self.array_selection {
             if let Some(chosen) = self.select_items.get(orig_idx) {
-                if selected.contains(chosen) {
-                    selected.retain(|entry| entry != chosen);
+                if selected.entries.contains(chosen) {
+                    selected.entries.retain(|entry| entry != chosen);
                 } else {
-                    selected.push(chosen.clone());
+                    selected.entries.push(chosen.clone());
                 }
             }
             return Ok(());
@@ -4849,7 +4860,7 @@ impl App {
             && let Screen::FieldEdit { field_idx, .. } = &self.screen
         {
             let prop = self.fields[*field_idx].path.clone();
-            let value = serde_json::json!(selected);
+            let value = serde_json::json!(selected.entries);
             match self.rpc.config_set(&prop, value).await {
                 Ok(revision) => {
                     self.application_feedback
@@ -5846,13 +5857,21 @@ impl App {
                     ListItem::new(Line::from(Span::styled(
                         match &self.array_selection {
                             Some(selected) => format!(
-                                "[{}] {}",
-                                if selected.contains(&self.select_items[i]) {
+                                "[{}] {}{}",
+                                if selected.entries.contains(&self.select_items[i]) {
                                     "x"
                                 } else {
                                     " "
                                 },
-                                self.select_items[i]
+                                self.select_items[i],
+                                if i >= selected.configured_len {
+                                    format!(
+                                        " ({})",
+                                        crate::i18n::t("zc-config-array-not-configured")
+                                    )
+                                } else {
+                                    String::new()
+                                }
                             ),
                             None => self.select_items[i].clone(),
                         },
@@ -5878,20 +5897,38 @@ impl App {
                 _ => format!(" {short_name} "),
             };
 
+            let list_area = if self
+                .array_selection
+                .as_ref()
+                .is_some_and(|selected| selected.entries.is_empty())
+            {
+                let areas = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(r.main);
+                frame.render_widget(
+                    Paragraph::new(crate::i18n::t("zc-config-array-empty-selection"))
+                        .style(theme::dim_style()),
+                    areas[1],
+                );
+                areas[0]
+            } else {
+                r.main
+            };
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&title))
                     .highlight_style(theme::selection_highlight(true, false))
                     .highlight_symbol("\u{203a} "),
-                r.main,
+                list_area,
                 &mut state,
             );
-            self.last_main_area = r.main;
+            self.last_main_area = list_area;
             self.last_list_offset = state.offset();
             self.last_tab_area = None;
 
             if self.detail_filter().is_some() && visible.is_empty() {
-                render_no_matches(frame, r.main);
+                render_no_matches(frame, list_area);
             }
             self.draw_status(frame, r);
         } else {
@@ -10005,6 +10042,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn array_picker_marks_unresolved_rows_and_explains_empty_selection() {
+        let (mut manager, _) = array_picker_manager(
+            &["missing", "a.live"],
+            Some(vec!["a.live".into(), "b.new".into()]),
+        )
+        .await;
+        manager.sections = vec![typed_section("a")];
+        manager.loaded_section = Some(0);
+        let rendered = render_config_120(&mut manager);
+        assert!(
+            rendered.contains("[x] missing (not configured)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[x] a.live"), "{rendered}");
+        assert!(rendered.contains("[ ] b.new"), "{rendered}");
+        assert!(!rendered.contains("a.live (not configured)"));
+        assert!(!rendered.contains("No entries selected"));
+
+        // Saved-only rows keep their marker even when unchecked or filtered.
+        manager.select_cursor = 2;
+        manager
+            .handle_field_edit(key(KeyCode::Enter))
+            .await
+            .unwrap();
+        let rendered = render_config_120(&mut manager);
+        assert!(
+            rendered.contains("[ ] missing (not configured)"),
+            "{rendered}"
+        );
+        manager.select_cursor = 0;
+        manager
+            .handle_field_edit(key(KeyCode::Enter))
+            .await
+            .unwrap();
+        manager
+            .handle_field_edit(key(KeyCode::Char('/')))
+            .await
+            .unwrap();
+        for c in "missing".chars() {
+            manager
+                .handle_field_edit(key(KeyCode::Char(c)))
+                .await
+                .unwrap();
+        }
+        let rendered = render_config_120(&mut manager);
+        assert!(
+            rendered.contains("[ ] missing (not configured)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("No entries selected; saving clears this list"),
+            "{rendered}"
+        );
+        manager
+            .handle_field_edit(key(KeyCode::Char('!')))
+            .await
+            .unwrap();
+        let rendered = render_config_120(&mut manager);
+        assert!(rendered.contains("No matches"), "{rendered}");
+        assert!(rendered.contains("No entries selected; saving clears this list"));
+    }
+
+    #[tokio::test]
     async fn array_picker_mouse_toggle_keeps_search() {
         let (mut manager, _calls) = array_picker_manager(
             &["z.old"],
@@ -10021,7 +10121,7 @@ mod tests {
             .unwrap();
         manager.activate_select_row().await.unwrap();
         assert_eq!(
-            manager.array_selection.as_ref().unwrap(),
+            &manager.array_selection.as_ref().unwrap().entries,
             &["z.old", "b.new"]
         );
         assert_eq!(manager.detail_filter().map(String::as_str), Some("b"));
@@ -10051,7 +10151,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            manager.array_selection.as_ref().unwrap(),
+            &manager.array_selection.as_ref().unwrap().entries,
             &["z.old", "a.live", "missing", "b.new"]
         );
         assert_eq!(*calls.lock().unwrap(), vec!["config/resolve-alias-source"]);
@@ -10078,7 +10178,7 @@ mod tests {
         manager.prepare_edit_at(1);
         manager.resolve_field_aliases(1).await;
         assert_eq!(
-            manager.array_selection.as_ref().unwrap(),
+            &manager.array_selection.as_ref().unwrap().entries,
             &["z.old", "a.live", "missing", "b.new"]
         );
     }
@@ -10106,7 +10206,10 @@ mod tests {
         manager.fields[1].alias_source = Some(crate::wire::AliasSource::Channels);
         manager.prepare_edit_at(1);
         manager.resolve_field_aliases(1).await;
-        assert_eq!(manager.array_selection.as_ref().unwrap(), &["a.live"]);
+        assert_eq!(
+            &manager.array_selection.as_ref().unwrap().entries,
+            &["a.live"]
+        );
     }
 
     #[tokio::test]
