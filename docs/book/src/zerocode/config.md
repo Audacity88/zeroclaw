@@ -34,7 +34,7 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
 
 ## Field labels and full details
 
-Config field rows use readable labels and keep long values to a one-line preview. Open Help while a field is selected to read its exact configuration path, complete description, and current value. The help view scrolls, including long array values and paths. Filtering continues to match the configuration path.
+Config field rows use readable labels and keep long values to a one-line preview. Open Help while a field is selected to read its exact configuration path, complete description, and current value. The help view scrolls, including long array values and paths. Filtering matches the relative configuration path or the full readable label, ignoring case.
 
 An unset field is shown as `<unset>`, secret values remain hidden, and environment overrides are marked. Unit and default explanations come from the field description. A current value does not establish whether you explicitly configured it or inherited a default.
 

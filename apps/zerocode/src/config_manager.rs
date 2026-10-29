@@ -1833,30 +1833,20 @@ impl App {
         }
     }
 
-    /// Compute the display label for each tab-visible field. Labels are paths
-    /// relative to the current screen prefix so nested fields stay distinct
-    /// (e.g. `tool_receipts.enabled` instead of just `enabled`).
-    fn field_labels_for_tab(&self, tab_indices: &[usize]) -> Vec<String> {
-        let screen_prefix: &str = match &self.screen {
-            Screen::FieldList { prefix, .. } => prefix.as_str(),
-            _ => "",
-        };
+    /// Match tab-visible fields by relative path or the full readable row label.
+    /// Return positions within `tab_indices` so every selection path uses the same order.
+    fn filtered_field_indices(&self, tab_indices: &[usize]) -> Vec<usize> {
+        let needle = self.detail_filter().map(|query| query.to_lowercase());
         tab_indices
             .iter()
-            .map(|&i| {
-                let path = self.fields[i].path.as_str();
-                let rel = if !screen_prefix.is_empty() {
-                    path.strip_prefix(screen_prefix)
-                        .and_then(|s| s.strip_prefix('.'))
-                        .unwrap_or(path)
-                } else {
-                    path
-                };
-                if rel.is_empty() {
-                    path.rsplit('.').next().unwrap_or(path).to_string()
-                } else {
-                    rel.to_string()
-                }
+            .enumerate()
+            .filter_map(|(position, &index)| {
+                let path = self.relative_field_path(&self.fields[index]);
+                let matches = needle.as_ref().is_none_or(|needle| {
+                    path.to_lowercase().contains(needle)
+                        || readable_field_label(path).to_lowercase().contains(needle)
+                });
+                matches.then_some(position)
             })
             .collect()
     }
@@ -1879,8 +1869,7 @@ impl App {
             Screen::FieldEdit { field_idx, .. } => Some(*field_idx),
             Screen::FieldList { .. } if !self.is_composite_tab() => {
                 let tab_indices = self.tab_field_indices();
-                let paths = self.field_labels_for_tab(&tab_indices);
-                let visible = self.filtered_indices(&paths);
+                let visible = self.filtered_field_indices(&tab_indices);
                 visible
                     .get(self.visible_field_cursor())
                     .and_then(|&index| tab_indices.get(index))
@@ -1921,8 +1910,7 @@ impl App {
     /// Helper: visible field count for the regular (non-composite) field list.
     fn visible_field_count(&self) -> usize {
         let tab_indices = self.tab_field_indices();
-        let tab_names = self.field_labels_for_tab(&tab_indices);
-        let filter_vis = self.filtered_indices(&tab_names);
+        let filter_vis = self.filtered_field_indices(&tab_indices);
         filter_vis.len()
     }
 
@@ -1989,8 +1977,7 @@ impl App {
             return self.filter_cursor;
         }
         let tab_indices = self.tab_field_indices();
-        let tab_names = self.field_labels_for_tab(&tab_indices);
-        let filter_vis = self.filtered_indices(&tab_names);
+        let filter_vis = self.filtered_field_indices(&tab_indices);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
         visible
             .iter()
@@ -2068,8 +2055,7 @@ impl App {
     /// Helper: set field cursor from visible position.
     fn set_visible_field_cursor(&mut self, pos: usize) {
         let tab_indices = self.tab_field_indices();
-        let tab_names = self.field_labels_for_tab(&tab_indices);
-        let filter_vis = self.filtered_indices(&tab_names);
+        let filter_vis = self.filtered_field_indices(&tab_indices);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
         if self.detail_filter().is_some() {
             self.filter_cursor = pos.min(filter_vis.len().saturating_sub(1));
@@ -2116,8 +2102,7 @@ impl App {
                     // handler. For now, no-op on composite tabs.
                 } else {
                     let tab_indices = self.tab_field_indices();
-                    let labels = self.field_labels_for_tab(&tab_indices);
-                    let visible = self.filtered_indices(&labels);
+                    let visible = self.filtered_field_indices(&tab_indices);
                     if let Some(&pos) = visible.get(self.visible_field_cursor()) {
                         let idx = tab_indices[pos];
                         self.deactivate_filter();
@@ -3604,8 +3589,7 @@ impl App {
 
         // Fields visible under active tab, then filtered by `/` query.
         let tab_indices = self.tab_field_indices();
-        let tab_names = self.field_labels_for_tab(&tab_indices);
-        let filter_vis = self.filtered_indices(&tab_names);
+        let filter_vis = self.filtered_field_indices(&tab_indices);
         // Map back to original field indices.
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
 
@@ -5511,8 +5495,7 @@ impl App {
 
         // Fields visible under active tab, then filtered by `/` query.
         let tab_indices = self.tab_field_indices();
-        let tab_names = self.field_labels_for_tab(&tab_indices);
-        let filter_vis = self.filtered_indices(&tab_names);
+        let filter_vis = self.filtered_field_indices(&tab_indices);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
 
         if let Some(buf) = self.detail_filter() {
@@ -7829,6 +7812,74 @@ mod tests {
             group_key: String::new(),
             shape: None,
             cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn field_filter_matches_readable_labels_and_paths_for_help_and_editing() {
+        use crate::widgets::HelpContext;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for (query, selected) in [
+            ("Forbidden Paths", 2),
+            ("fOrBiDdEn PaThS", 2),
+            ("forbidden_paths", 2),
+            ("Precheck timeout (seconds)", 3),
+            ("precheck.timeout_secs", 3),
+        ] {
+            let mut manager = test_manager();
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: "agents.demo".into(),
+                breadcrumb: vec!["agents".into(), "demo".into()],
+            };
+            manager.zeroclaw_pane = ZeroclawPane::Detail;
+            manager.fields = vec![
+                field("agents.demo.other_forbidden_paths"),
+                field("agents.demo.enabled"),
+                field("agents.demo.forbidden_paths"),
+                field("agents.demo.precheck.timeout_secs"),
+            ];
+            manager.fields[0].tab = ConfigTab::Advanced;
+            for field in &mut manager.fields[1..] {
+                field.tab = ConfigTab::Settings;
+            }
+            manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Advanced];
+            manager.field_cursor = 1;
+            manager.activate_filter(manager.visible_field_count());
+            manager.filter = Some(query.into());
+            manager.set_visible_field_cursor(0);
+
+            assert_eq!(manager.visible_field_count(), 1, "{query}");
+            assert_eq!(manager.selected_field_index(), Some(selected), "{query}");
+            let path = manager.fields[selected].path.clone();
+            assert!(manager.help_context().description.unwrap().contains(&path));
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal
+                .draw(|frame| manager.draw_field_list(frame, frame.area(), 0, &[]))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let label =
+                readable_field_label(manager.relative_field_path(&manager.fields[selected]));
+            assert!(text.contains(&format!("{label} =")), "{query}: {text}");
+            assert!(!text.contains("Enabled ="), "{query}: {text}");
+
+            let mut term = filter_test_term();
+            manager
+                .handle_field_list(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.filter.is_none());
+            assert!(matches!(
+                manager.screen,
+                Screen::FieldEdit { field_idx, .. } if field_idx == selected
+            ));
         }
     }
 
