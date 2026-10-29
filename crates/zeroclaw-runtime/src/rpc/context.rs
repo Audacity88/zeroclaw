@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn pending_map_insert_and_resolve() {
         let map = ApprovalPendingMap::default();
-        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, mut rx) = oneshot::channel::<AttributedApprovalResponse>();
         map.insert("req-1".to_string(), "sess-1".to_string(), tx);
         assert!(map.resolve("req-1", "sess-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn pending_map_binds_approvals_to_their_session() {
         let map = ApprovalPendingMap::default();
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<AttributedApprovalResponse>();
         map.insert("req-9".to_string(), "sess-42".to_string(), tx);
         assert_eq!(map.session_for("req-9").as_deref(), Some("sess-42"));
         assert_eq!(map.session_for("other"), None);
@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn pending_map_insert_then_drop_is_safe() {
         let map = ApprovalPendingMap::default();
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<AttributedApprovalResponse>();
         map.insert("req-2".to_string(), "sess-2".to_string(), tx);
         // _rx is dropped — resolve sends to a closed channel; must not panic
         assert!(map.resolve("req-2", "sess-2", ChannelApprovalResponse::Approve));
@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn pending_map_remove_drops_stale_request() {
         let map = ApprovalPendingMap::default();
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<AttributedApprovalResponse>();
         map.insert("req-3".to_string(), "sess-3".to_string(), tx);
         assert!(map.contains("req-3"));
         assert!(map.remove("req-3"));
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn pending_guard_drop_removes_registered_request() {
         let map = Arc::new(ApprovalPendingMap::default());
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<AttributedApprovalResponse>();
         let guard = map.register("req-4".to_string(), "sess-4".to_string(), tx);
         assert!(map.contains("req-4"));
         drop(guard);
@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn pending_guard_can_be_disarmed_after_resolution() {
         let map = Arc::new(ApprovalPendingMap::default());
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<AttributedApprovalResponse>();
         let mut guard = map.register("req-5".to_string(), "sess-5".to_string(), tx);
         assert!(map.resolve("req-5", "sess-5", ChannelApprovalResponse::Approve));
         guard.disarm();
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn pending_map_rejects_foreign_session_without_consuming_request() {
         let map = ApprovalPendingMap::default();
-        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, mut rx) = oneshot::channel::<AttributedApprovalResponse>();
         map.insert("req-6".to_string(), "sess-owner".to_string(), tx);
 
         assert!(!map.resolve("req-6", "sess-foreign", ChannelApprovalResponse::Approve));
