@@ -192,7 +192,7 @@ impl EvidenceApp {
         self.event(KeyEvent::new(code, KeyModifiers::NONE)).await;
     }
 
-    async fn save(&mut self) {
+    async fn press_save(&mut self) {
         self.event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
         assert!(matches!(self.manager.screen, Screen::FieldList { .. }));
@@ -357,7 +357,7 @@ async fn evidence_frame_saved_and_reopened() {
     let mut app = EvidenceApp::skills(&["gamma", "alpha"]).await;
     app.key(KeyCode::Down).await;
     app.key(KeyCode::Enter).await;
-    app.save().await;
+    app.press_save().await;
     assert_eq!(app.writes(), vec![json!(["gamma", "alpha", "beta"])]);
     app.key(KeyCode::Enter).await;
     assert_eq!(
@@ -382,7 +382,7 @@ async fn evidence_frame_empty_selection_saved_and_reopened() {
             "Pending edits",
         ],
     );
-    app.save().await;
+    app.press_save().await;
     assert_eq!(app.writes(), vec![json!([])]);
     app.key(KeyCode::Enter).await;
     app.frame(
