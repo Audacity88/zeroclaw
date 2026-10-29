@@ -1,6 +1,7 @@
 //! Review evidence from real Config input/RPC handling and app-frame rendering.
 //! Fixtures contain synthetic names only. Run with --nocapture --test-threads=1.
 
+#[cfg(test)] // test-only module: lets the keymap guard skip review-evidence key input
 use super::*;
 use crate::jsonrpc::{JsonRpcError, RpcOutbound};
 use crate::wire::AliasSource;
