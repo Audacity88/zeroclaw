@@ -2,6 +2,7 @@
 //! The RPC peer supplies fixture data; it does not replace any UI renderer.
 
 #[cfg(test)]
+#[cfg(test)] // test-only module: lets the keymap guard skip review-evidence key input
 use super::*;
 
 use crate::jsonrpc::RpcOutbound;
