@@ -7787,7 +7787,8 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), approved_rx)
                     .await
                     .expect("sync ingress should resolve the authorized approval")
-                    .expect("sync ingress should resolve the authorized approval"),
+                    .expect("sync ingress should resolve the authorized approval")
+                    .response,
                 ChannelApprovalResponse::Approve
             );
             assert!(

@@ -6674,7 +6674,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), approved_rx)
                 .await
                 .expect("authorized callback should resolve")
-                .expect("approval sender should stay open"),
+                .expect("approval sender should stay open")
+                .response,
             ChannelApprovalResponse::Approve
         );
         let approvals = ch.pending_approvals.lock().await;

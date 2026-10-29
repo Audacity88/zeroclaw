@@ -4075,8 +4075,7 @@ impl SlackChannel {
                 self.is_user_allowed(&responder),
                 &channel,
             )
-            .await
-            .0;
+            .await;
             return true;
         }
 
@@ -9678,7 +9677,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(6), approved_rx)
                 .await
                 .expect("polling ingress should resolve the authorized approval")
-                .expect("approval manager sender should stay open"),
+                .expect("approval manager sender should stay open")
+                .response,
             ChannelApprovalResponse::Approve
         );
         assert!(

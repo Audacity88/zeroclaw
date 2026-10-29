@@ -8679,7 +8679,8 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
                 .await
                 .expect("the self-chat approval must resolve, not time out")
-                .expect("the responder must still be open"),
+                .expect("the responder must still be open")
+                .response,
             ChannelApprovalResponse::Approve,
             "an enabled personal self-chat must resolve its own approval"
         );
