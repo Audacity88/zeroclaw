@@ -244,10 +244,58 @@ enum State {
     KeyboardDeparture,
 }
 
+/// `i18n::init` caches both locale and config directory in process-wide
+/// OnceLocks. A mutex cannot restore them for sibling tests after our temporary
+/// directory disappears, so initialize the real UI in a fresh test process.
+#[allow(clippy::print_stdout)]
+fn run_in_isolated_process() -> bool {
+    const CHILD: &str = "ZEROCLAW_EVIDENCE_FRAME_CHILD";
+    let thread = std::thread::current();
+    let test_name = thread
+        .name()
+        .expect("libtest names the current test thread");
+    let child = {
+        let _environment = crate::test_support::env_test_lock();
+        std::env::var_os(CHILD)
+    };
+    if child.as_deref() == Some(std::ffi::OsStr::new(test_name)) {
+        return false;
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let output = {
+        // Match the lock taken by synchronous env tests and the async Chat
+        // helper while the child inherits its environment. Release it before
+        // reporting a child failure, so no parent shared lock is poisoned.
+        let _environment = crate::test_support::env_test_lock();
+        std::process::Command::new(executable)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test_name)
+            .output()
+    }
+    .expect("run isolated evidence test");
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "isolated evidence test {test_name} failed: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("=== EVIDENCE BEGIN ") && stdout.contains("=== EVIDENCE END "),
+        "isolated test {test_name} must execute and emit a real frame"
+    );
+    true
+}
+
 // These current-thread tests serialize process-global environment/keymap/theme
-// reads through the same guards as the existing production-boundary tests.
+// reads in the child through the existing production-boundary test guards.
 #[allow(clippy::await_holding_lock)]
 async fn render_state(state: State) {
+    if run_in_isolated_process() {
+        return;
+    }
     let _environment = crate::test_support::env_test_lock();
     let _keys = overrides::TEST_GUARD
         .lock()
@@ -577,13 +625,18 @@ async fn render_state(state: State) {
             ui.press(KeyCode::Char('/')).await;
             ui.type_text("clear input").await;
             if matches!(state, State::MouseDeparture) {
-                // Draw first, then locate the actual section label in that
-                // frame. The click uses production hit-test geometry.
+                // Restrict the search to the left section list. The right
+                // panel title also says Keybindings, above the Theme row.
                 let rows = ui.rows(120, 30);
                 let row = rows
                     .iter()
-                    .position(|row| row.starts_with('│') && row.contains("Keybindings"))
-                    .unwrap();
+                    .position(|row| {
+                        row.chars()
+                            .take(22)
+                            .collect::<String>()
+                            .contains("Keybindings")
+                    })
+                    .expect("Keybindings row in the real left section list");
                 ui.config
                     .handle_mouse(
                         MouseEvent {
