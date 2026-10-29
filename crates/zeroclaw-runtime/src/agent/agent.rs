@@ -1783,12 +1783,18 @@ impl Agent {
             // during a temporary gap must be retried on the next build.
             return Ok(false);
         }
-        // Without a previous snapshot, no cached identity is being replaced.
-        // Read errors above leave the prior snapshot intact.
-        let changed = self
-            .identity_snapshot
-            .get()
-            .is_some_and(|previous| previous.text != fresh.text);
+        // An empty initial render is not pinned, but its system message is
+        // still the context being replaced when files become available.
+        // Reuse that message as the evidence of a prior build.
+        let changed = self.identity_snapshot.get().map_or_else(
+            || {
+                matches!(
+                    self.history.first(),
+                    Some(ConversationMessage::Chat(message)) if message.role == "system"
+                )
+            },
+            |previous| previous.text != fresh.text,
+        );
         let previous = self.identity_snapshot.take();
         let _ = self.identity_snapshot.set(fresh);
         if changed {
@@ -9090,6 +9096,24 @@ mod tests {
                 .unwrap(),
             recovered
         );
+    }
+
+    #[test]
+    fn reload_context_reports_new_files_after_an_empty_initial_prompt() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        let first = prime_personality_snapshot(&mut agent);
+        assert!(agent.identity_snapshot.get().is_none());
+        assert!(!agent.reload_personality().unwrap());
+
+        std::fs::write(workspace.path().join("AGENTS.md"), "RECOVERED_IDENTITY").unwrap();
+        assert!(agent.reload_personality().unwrap());
+        let ConversationMessage::Chat(system) = &agent.history[0] else {
+            panic!("system message");
+        };
+        assert_ne!(system.content, first);
+        assert!(system.content.contains("RECOVERED_IDENTITY"));
+        assert!(!agent.reload_personality().unwrap());
     }
 
     #[test]
