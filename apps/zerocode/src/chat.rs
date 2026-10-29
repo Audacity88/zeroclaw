@@ -3368,18 +3368,21 @@ impl Chat {
                                 state.todo_tracker.toggle();
                             }
                         }
-                        crate::i18n::t("zc-chat-refreshed")
+                        crate::widgets::InfoMessage::note(crate::i18n::t("zc-chat-refreshed"))
                     }
-                    Err(error) => {
-                        crate::i18n::t_args("zc-chat-refresh-failed", &[("error", &error)])
-                    }
+                    Err(error) => crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                        "zc-chat-refresh-failed",
+                        &[("error", &error)],
+                    )),
                 },
-                Err(SessionRefreshError::Busy) => crate::i18n::t("zc-chat-refresh-busy"),
-                Err(SessionRefreshError::Failed(error)) => {
-                    crate::i18n::t_args("zc-chat-refresh-failed", &[("error", &error)])
+                Err(SessionRefreshError::Busy) => {
+                    crate::widgets::InfoMessage::note(crate::i18n::t("zc-chat-refresh-busy"))
                 }
+                Err(SessionRefreshError::Failed(error)) => crate::widgets::InfoMessage::error(
+                    crate::i18n::t_args("zc-chat-refresh-failed", &[("error", &error)]),
+                ),
             };
-            state.set_info_notice(notice);
+            state.info_message = Some(notice);
         }
     }
 
@@ -3965,6 +3968,7 @@ impl Chat {
             || !self.prompt_completion_rx.is_empty()
             || !self.session_resync_rx.is_empty()
             || !self.session_reattach_rx.is_empty()
+            || !self.session_refresh_rx.is_empty()
     }
 
     #[cfg(test)]
@@ -4263,19 +4267,6 @@ impl Chat {
             ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
         }
 
-        // Refresh must preserve transcript selection, but cannot take a chord
-        // owned by the focused composer's live input bindings.
-        let refresh_yields_to_composer = matches!(&self.phase, ChatPhase::Active(state)
-            if state.composer_owns_text_input()
-                && crate::keymap::InputBarAction::from_chord(&key).is_some());
-        if crate::keymap::ChatTabAction::from_chord(&key)
-            == Some(crate::keymap::ChatTabAction::RefreshSession)
-            && !refresh_yields_to_composer
-        {
-            self.begin_session_refresh();
-            return false;
-        }
-
         // Active phase — borrow state directly to avoid double &mut self.
         let ChatPhase::Active(ref mut state) = self.phase else {
             return false;
@@ -4458,6 +4449,22 @@ impl Chat {
         // overlays above have already had first refusal; handle them before
         // queue, browse, and other pane-level shortcuts.
         if state.handle_input_bar_overlay_key(key) {
+            return false;
+        }
+
+        // Refresh preserves transcript selection, but yields to modal overlays,
+        // ordinary typing, and the focused composer's live input bindings.
+        let refresh_yields_to_composer = state.composer_owns_text_input()
+            && (crate::keymap::InputBarAction::from_chord(&key).is_some()
+                || !crate::keymap::action_bypasses_text_input(
+                    crate::keymap::ChatTabAction::RefreshSession,
+                    &key,
+                ));
+        if crate::keymap::ChatTabAction::from_chord(&key)
+            == Some(crate::keymap::ChatTabAction::RefreshSession)
+            && !refresh_yields_to_composer
+        {
+            self.begin_session_refresh();
             return false;
         }
 
@@ -16529,6 +16536,7 @@ mod tests {
         })
         .await
         .expect("refresh result");
+        assert!(chat.has_pending_transport_events());
         chat.tick_transport_events();
         assert!(chat.session_refresh.is_none());
     }
@@ -16553,6 +16561,66 @@ mod tests {
         let final_state = next_rpc_request(rx, "recheck lifecycle").await;
         assert_eq!(final_state["method"], method::SESSION_STATE);
         respond_ok(rpc, &final_state, serde_json::json!({"state": after}));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_refresh_yields_to_typing_composer_bindings_and_modals() {
+        use crate::keymap::{ChatTabAction, Chord, InputBarAction, overrides};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let mut term = key_term();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(Arc::new(RpcClient::with_rpc(rpc)), kind);
+            let mut prior = state();
+            prior.input_bar.insert_text("draft");
+            chat.phase = ChatPhase::Active(Box::new(prior));
+
+            overrides::set_row(
+                ChatTabAction::TAG,
+                "refresh_session",
+                vec![Chord::char('r')],
+            );
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            assert_eq!(active_state(&mut chat).input_bar.input(), "draftr");
+            assert!(chat.session_refresh.is_none());
+            assert!(rx.try_recv().is_err());
+
+            overrides::reset();
+            overrides::set_row(
+                InputBarAction::TAG,
+                "cursor_left",
+                vec![Chord::key(KeyCode::F(5))],
+            );
+            chat.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut term)
+                .await;
+            assert_eq!(active_state(&mut chat).input_bar.cursor(), "draft".len());
+            assert!(chat.session_refresh.is_none());
+            assert!(rx.try_recv().is_err());
+
+            overrides::reset();
+            active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+            chat.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut term)
+                .await;
+            assert!(matches!(
+                active_state(&mut chat).model_picker,
+                ModelPickerOverlay::Loading
+            ));
+            assert_eq!(active_state(&mut chat).input_bar.input(), "draftr");
+            assert!(chat.session_refresh.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        overrides::reset();
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -16768,6 +16836,12 @@ mod tests {
             }
             finish_refresh(&mut chat).await;
             assert_eq!(active_state(&mut chat).entries, expected, "{scenario}");
+            if scenario == "failed" {
+                assert!(matches!(
+                    active_state(&mut chat).info_message.as_ref().unwrap().kind,
+                    crate::widgets::InfoKind::Error
+                ));
+            }
             assert!(
                 rx.try_recv().is_err(),
                 "{scenario}: no cancel, retry, or prompt"
