@@ -1,6 +1,7 @@
 //! Review evidence from real input dispatch, RPC decoding, and app rendering.
 //! History replies are synthetic daemon data, not proof of store persistence.
 
+#[cfg(test)] // test-only module: lets the keymap guard skip review-evidence key input
 use super::*;
 use crossterm::event::{KeyCode, KeyModifiers};
 
