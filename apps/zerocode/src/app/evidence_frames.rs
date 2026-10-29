@@ -1,6 +1,7 @@
 //! Review evidence from production Config input/RPC/render paths.
 //! These are text frames, not screenshots of a terminal or a live daemon.
 
+#[cfg(test)] // test-only module: lets the keymap guard skip review-evidence key input
 use super::*;
 use crate::client::method;
 use crate::jsonrpc::RpcOutbound;
