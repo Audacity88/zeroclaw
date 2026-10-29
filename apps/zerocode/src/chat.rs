@@ -2459,9 +2459,7 @@ impl Chat {
                     retained.push(entry);
                     continue;
                 }
-                // Retained entries already count toward the bound. Attaching
-                // one only changes its representation, so equality is valid.
-                if self.tracked_session_count() > self.max_tracked_sessions_per_pane {
+                if self.tracked_session_count() >= self.max_tracked_sessions_per_pane {
                     retained.push(entry);
                     continue;
                 }
@@ -21121,6 +21119,77 @@ mod tests {
             rows,
             vec![("sess-f".to_string(), true), ("sess-bg".to_string(), false)]
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_holds_excess_resume_entries_at_configured_cap() {
+        for pane_kind in [PaneKind::Chat, PaneKind::Acp] {
+            for cap in [1, 3] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let rpc = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+                let mut chat = Chat::new_with_max_tracked_sessions(client, pane_kind, cap);
+                chat.phase = ChatPhase::Active(Box::new(state_for("sess-f", "beta")));
+                chat.session_order.push("sess-f".to_string());
+                for idx in 1..=cap + 1 {
+                    let session_id = format!("sess-bg-{idx}");
+                    chat.session_order.push(session_id.clone());
+                    chat.resume_backgrounds
+                        .push(resume_entry(&session_id, "alpha", false));
+                }
+
+                let resume = tokio::spawn(async move {
+                    chat.after_session_start().await;
+                    chat
+                });
+
+                for idx in 1..cap {
+                    let session_id = format!("sess-bg-{idx}");
+                    let request = next_rpc_request(&mut rx, "background resume below cap").await;
+                    assert_eq!(request["method"], method::SESSION_NEW);
+                    assert_eq!(request["params"]["session_id"], session_id);
+                    respond_ok(
+                        &rpc,
+                        &request,
+                        serde_json::json!({ "session_id": session_id, "workspace_dir": "/w" }),
+                    );
+                    let request = next_rpc_request(&mut rx, "background model identity").await;
+                    assert_eq!(request["method"], method::CONFIG_LIST);
+                    respond_ok(&rpc, &request, serde_json::json!([]));
+                    let request = next_rpc_request(&mut rx, "background history replay").await;
+                    assert_eq!(request["method"], method::SESSION_MESSAGES);
+                    respond_ok(&rpc, &request, serde_json::json!({ "messages": [] }));
+                }
+
+                let chat = tokio::time::timeout(Duration::from_secs(2), resume)
+                    .await
+                    .expect("resume must finish without attaching beyond the cap")
+                    .unwrap();
+                assert!(rx.try_recv().is_err(), "excess entries must not send RPCs");
+                assert_eq!(chat.current_session_id(), Some("sess-f"));
+                assert_eq!(chat.background.len() + 1, cap);
+                assert_eq!(
+                    chat.resume_backgrounds
+                        .iter()
+                        .map(|entry| entry.session_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![format!("sess-bg-{cap}"), format!("sess-bg-{}", cap + 1)]
+                );
+                let rows = chat.session_summaries();
+                assert_eq!(rows.len(), cap + 2, "retained entries stay visible");
+                assert_eq!(
+                    rows.iter().filter(|row| row.focused).count(),
+                    1,
+                    "background resume must preserve focus"
+                );
+                assert!(rows[0].focused);
+                assert!(
+                    rows[cap..]
+                        .iter()
+                        .all(|row| row.status == SidebarStatus::Errored)
+                );
+            }
+        }
     }
 
     #[tokio::test]
