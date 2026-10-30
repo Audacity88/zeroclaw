@@ -977,6 +977,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_identity_renderer_tolerates_aieos_load_failure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let identity = workspace.path().join("identity.json");
+        std::fs::write(workspace.path().join("AGENTS.md"), "SURVIVING_MARKDOWN").unwrap();
+        let config = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+
+        for failure in ["missing", "malformed", "directory"] {
+            match failure {
+                "missing" => {}
+                "malformed" => std::fs::write(&identity, "{invalid JSON").unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&identity).unwrap();
+                    std::fs::create_dir(&identity).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let rendered = render_identity_section(Some(&config), workspace.path(), true);
+            assert!(rendered.contains("SURVIVING_MARKDOWN"));
+            assert!(rendered.contains("The following workspace files define your identity"));
+        }
+    }
+
+    #[test]
     fn prompt_builder_assembles_sections() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {

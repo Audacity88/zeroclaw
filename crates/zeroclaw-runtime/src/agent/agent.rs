@@ -9139,6 +9139,126 @@ mod tests {
     }
 
     #[test]
+    fn mixed_aieos_markdown_reload_failure_keeps_previous_snapshot() {
+        for failure in ["malformed", "directory", "missing"] {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let identity = workspace.path().join("identity.json");
+            std::fs::write(
+                &identity,
+                r#"{"identity":{"names":{"first":"AIEOS_ORIGINAL_IDENTITY"}}}"#,
+            )
+            .unwrap();
+            std::fs::write(workspace.path().join("AGENTS.md"), "SURVIVING_MARKDOWN").unwrap();
+            let mut agent = personality_snapshot_test_agent(workspace.path());
+            agent.identity_config = zeroclaw_config::schema::IdentityConfig {
+                format: "aieos".into(),
+                aieos_path: Some("identity.json".into()),
+                aieos_inline: None,
+            };
+            let previous = prime_personality_snapshot(&mut agent);
+            let previous_snapshot = agent.identity_snapshot.get().unwrap().text.clone();
+            assert!(previous_snapshot.contains("AIEOS_ORIGINAL_IDENTITY"));
+            assert!(previous_snapshot.contains("SURVIVING_MARKDOWN"));
+
+            std::fs::remove_file(&identity).unwrap();
+            match failure {
+                "malformed" => std::fs::write(&identity, "{invalid JSON").unwrap(),
+                "directory" => std::fs::create_dir(&identity).unwrap(),
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            let error = agent.reload_personality().expect_err(failure);
+            assert!(error.to_string().contains("Could not load AIEOS identity"));
+            assert_eq!(
+                agent.identity_snapshot.get().unwrap().text,
+                previous_snapshot
+            );
+            assert_personality_prompt_unchanged(&agent, &previous);
+
+            if failure == "directory" {
+                std::fs::remove_dir(&identity).unwrap();
+            }
+            std::fs::write(
+                &identity,
+                r#"{"identity":{"names":{"first":"AIEOS_RECOVERED_IDENTITY"}}}"#,
+            )
+            .unwrap();
+            assert_personality_prompt_unchanged(&agent, &previous);
+            assert!(agent.reload_personality().unwrap());
+            let fresh = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .unwrap();
+            let snapshot = agent.identity_snapshot.get().unwrap();
+            assert!(snapshot.text.contains("AIEOS_RECOVERED_IDENTITY"));
+            assert!(snapshot.text.contains("SURVIVING_MARKDOWN"));
+            assert!(!snapshot.text.contains("AIEOS_ORIGINAL_IDENTITY"));
+            assert!(fresh.contains("AIEOS_RECOVERED_IDENTITY"));
+            assert!(!fresh.contains("AIEOS_ORIGINAL_IDENTITY"));
+            assert_ne!(fresh, previous);
+            let ConversationMessage::Chat(system) = &agent.history[0] else {
+                panic!("system message");
+            };
+            assert!(system.content.contains("AIEOS_RECOVERED_IDENTITY"));
+            assert!(!system.content.contains("AIEOS_ORIGINAL_IDENTITY"));
+            assert_eq!(
+                agent
+                    .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                    .unwrap(),
+                fresh
+            );
+            assert!(!agent.reload_personality().unwrap());
+        }
+    }
+
+    #[test]
+    fn mixed_aieos_markdown_failed_first_capture_is_not_pinned() {
+        for failure in ["malformed", "directory", "missing"] {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let identity = workspace.path().join("identity.json");
+            match failure {
+                "malformed" => std::fs::write(&identity, "{invalid JSON").unwrap(),
+                "directory" => std::fs::create_dir(&identity).unwrap(),
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            std::fs::write(workspace.path().join("AGENTS.md"), "SURVIVING_MARKDOWN").unwrap();
+            let mut agent = personality_snapshot_test_agent(workspace.path());
+            agent.identity_config = zeroclaw_config::schema::IdentityConfig {
+                format: "aieos".into(),
+                aieos_path: Some("identity.json".into()),
+                aieos_inline: None,
+            };
+
+            let error = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .expect_err(failure);
+            assert!(error.to_string().contains("Could not load AIEOS identity"));
+            assert!(agent.identity_snapshot.get().is_none());
+            assert!(agent.history.is_empty());
+            assert!(agent.reload_personality().is_err());
+            assert!(agent.identity_snapshot.get().is_none());
+
+            if failure == "directory" {
+                std::fs::remove_dir(&identity).unwrap();
+            }
+            std::fs::write(
+                &identity,
+                r#"{"identity":{"names":{"first":"AIEOS_RECOVERED_IDENTITY"}}}"#,
+            )
+            .unwrap();
+            let recovered = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .unwrap();
+            assert!(recovered.contains("AIEOS_RECOVERED_IDENTITY"));
+            assert!(recovered.contains("SURVIVING_MARKDOWN"));
+            let snapshot = agent.identity_snapshot.get().unwrap();
+            assert!(snapshot.text.contains("AIEOS_RECOVERED_IDENTITY"));
+            assert!(snapshot.text.contains("SURVIVING_MARKDOWN"));
+            assert!(!agent.reload_personality().unwrap());
+        }
+    }
+
+    #[test]
     fn reload_context_allows_deliberate_single_file_removal() {
         for filename in ["TOOLS.md", "BOOTSTRAP.md"] {
             let workspace = tempfile::TempDir::new().unwrap();
