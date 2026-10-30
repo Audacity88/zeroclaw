@@ -1382,32 +1382,6 @@ pub(crate) fn draw_app_frame(
     }
 }
 
-/// Draw the Code pane with the production app frame and chrome, without a
-/// terminal session or app-loop side effects. Used only by review evidence tests.
-#[cfg(test)]
-pub(crate) fn draw_code_evidence_frame(
-    frame: &mut ratatui::Frame,
-    chat: &mut chat::Chat,
-    code: &mut acp::Acp,
-    connection: &ConnectionState,
-) {
-    draw_app_frame(frame, Mode::Acp, chat, code, |frame, areas, _, code| {
-        draw_mode_bar(frame, areas[0], Mode::Acp, None);
-        code.draw_with_dock(frame, areas[1], None, None);
-        code.draw_dock_overlay(frame);
-        let (input, source, max, window) = code.ctx_tokens();
-        draw_status_bar(
-            frame,
-            areas[2],
-            connection,
-            None,
-            CtxBar::new(input, source, max, window),
-            false,
-            code.in_browse_mode(),
-        );
-    });
-}
-
 #[derive(Debug, Clone)]
 struct ModeBarEntry {
     mode: Mode,
