@@ -73,7 +73,7 @@ Native shell and skill shell tools can opt into a resident-memory threshold thro
 shell_max_memory_mb = 1024
 ```
 
-Select this runtime profile on the agent that runs the tools. Linux, macOS, and Windows sample the aggregate resident memory of the command and its visible descendants while the command's root process runs. Crossing the threshold stops the owned command group or Windows Job Object and returns a tool failure. Output capture remains capped at 1 MiB per stream. A monitoring failure also stops the command rather than silently dropping the configured watchdog.
+Select this runtime profile on the agent that runs the tools. Linux, macOS, and Windows sample the aggregate resident memory of the command and its visible descendants while the command's root process runs. Crossing the threshold stops the owned command group or Windows Job Object and returns a tool failure. Output capture remains capped at 1 MiB per stream. A monitoring failure also stops the command rather than silently dropping the configured watchdog. On macOS, a command that starts a descendant under a different user, for example `sudo` or a setuid helper, is stopped with a monitoring failure, because ZeroClaw cannot read that process's memory.
 
 This watchdog is not a hard allocation ceiling or a guarantee against host OOM. Memory use can overshoot between samples, shared resident pages may count more than once, and detached or reparented processes may escape sampling. Virtual-address reservations alone do not count toward the threshold. The watchdog does not set `RLIMIT_AS`. With monitoring enabled on Windows, closing the command's Job Object at root completion also stops any remaining job descendants.
 

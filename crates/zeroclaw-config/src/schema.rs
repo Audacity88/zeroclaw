@@ -14776,7 +14776,10 @@ pub struct RuntimeProfileConfig {
     /// monitoring. Visible descendants are sampled while the command runs;
     /// this is not a hard allocation ceiling and can overshoot between samples.
     /// Shared resident pages may be counted more than once. Container runtimes
-    /// must use their own memory limits. Parent-subset enforced for subagents.
+    /// must use their own memory limits. A monitoring failure stops the
+    /// command; on macOS that includes a command that starts a descendant
+    /// under another user (for example `sudo` or a setuid helper), whose
+    /// memory cannot be read. Parent-subset enforced for subagents.
     pub shell_max_memory_mb: u64,
     // ── Delegation tuning ──
     /// Maximum delegation recursion depth. `0` inherits the default.
