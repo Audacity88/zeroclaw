@@ -9,7 +9,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CopyOutcome {
     /// A local writer confirmed the copy; only Linux has one today.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(target_os = "linux", test))]
     Copied,
     /// OSC 52 was emitted, but terminals do not acknowledge clipboard delivery.
     TerminalRequested,
@@ -18,6 +18,7 @@ pub(crate) enum CopyOutcome {
 impl CopyOutcome {
     pub(crate) fn notice(self) -> String {
         crate::i18n::t(match self {
+            #[cfg(any(target_os = "linux", test))]
             Self::Copied => "zc-chat-copied-clipboard",
             Self::TerminalRequested => "zc-clipboard-requested",
         })
@@ -25,6 +26,7 @@ impl CopyOutcome {
 
     pub(crate) fn label(self) -> String {
         crate::i18n::t(match self {
+            #[cfg(any(target_os = "linux", test))]
             Self::Copied => "zc-chat-copy-message-copied",
             Self::TerminalRequested => "zc-clipboard-requested-label",
         })
