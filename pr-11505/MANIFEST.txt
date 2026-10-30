@@ -1,0 +1,14 @@
+11505-01-keybindings-sections-100x30.png 2026-10-30T04:41:27+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=100x30
+11505-02-keybindings-detail-idle-100x30.png 2026-10-30T04:42:08+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=100x30
+11505-03-keybindings-query-editing-120x30.png 2026-10-30T04:42:24+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-04-keybindings-no-matches-100x30.png 2026-10-30T04:42:42+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=100x30
+11505-05-capture-modal-cancel-120x30.png 2026-10-30T04:43:02+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-06-agent-themes-picking-120x30.png 2026-10-30T04:43:29+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-07-agent-themes-assigning-120x30.png 2026-10-30T04:43:44+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-08-connection-bool-100x30.png 2026-10-30T04:44:34+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=100x30
+11505-09-connection-uri-120x30.png 2026-10-30T04:44:55+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-10-connection-routes-120x30.png 2026-10-30T04:45:16+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-11b-narrow-footer-80x30.png 2026-10-30T04:45:20+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=80x30
+11505-11-narrow-footer-60x30.png 2026-10-30T04:45:23+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=60x30
+11505-12-locale-panel-120x30.png 2026-10-30T04:45:51+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
+11505-13-todo-panel-120x30.png 2026-10-30T04:46:07+0800 zerocode=zerocode-11505-fd1b0623d6 daemon=zeroclaw-11505-fd1b0623d6 size=120x30
