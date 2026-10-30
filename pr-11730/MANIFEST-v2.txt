@@ -1,0 +1,4 @@
+PR #11730 real macOS Terminal.app window captures (screencapture -l), ZeroCode Chat 150x42, head db3d91e2f9, zeroclaw-pr-test --isolated, live bonsai-mini.
+Config: default agent risk profile allows delegate (delegation_policy allow, delegates=[checkpoint]); checkpoint is agentic with file_read only.
+01: live turn, delegate card shows Waiting for response and 3 child tool calls while the child runs.
+02: card expanded after the child finished: 4 child tool calls listed (checkpoint: file_read ...), each failed because the files were not in the child's workspace.
