@@ -678,6 +678,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_choice_some_on_structured_only_channel_returns_selected_answer() {
+        let ch = Arc::new(StructuredOnlyChannel::new("rpc", Ok(Some("Yes".into()))));
+        let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
+
+        let result = tool
+            .execute(json!({
+                "question": "Continue?",
+                "choices": ["Yes", "No"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(result.error.is_none());
+        assert_eq!(result.output, "Yes");
+        assert!(!*ch.listen_called.lock());
+    }
+
+    #[tokio::test]
+    async fn request_choice_error_on_structured_only_channel_remains_failure() {
+        let ch = Arc::new(StructuredOnlyChannel::new(
+            "rpc",
+            Err("RPC elicitation/create timed out".into()),
+        ));
+        let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
+
+        let result = tool
+            .execute(json!({
+                "question": "Continue?",
+                "choices": ["Yes", "No"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.output, "");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Failed to ask question on channel 'rpc': RPC elicitation/create timed out")
+        );
+        assert!(!*ch.listen_called.lock());
+    }
+
+    #[tokio::test]
     async fn request_choice_none_on_structured_only_channel_returns_dismissed_at_once() {
         // Regression: Ok(None) from request_choice used to fall through to
         // send+listen. On ACP/RPC channels listen never delivers a reply, so
