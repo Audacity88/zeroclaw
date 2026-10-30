@@ -4473,10 +4473,10 @@ impl Chat {
                             self.after_enqueue(enq);
                             return false;
                         }
-                        // The pane changed session while the request was out.
-                        // An undelivered message must not land in another
-                        // session's queue; drop its temp files like any
-                        // discarded draft.
+                        // Unreachable while the blocking await holds `&mut self`.
+                        // The async key-action follow-up must restore or flag
+                        // non-accepted text here without sending it to a different
+                        // session's queue.
                         if !steered {
                             let _ = cleanup_attachment_temps(&attachments);
                         }
@@ -9857,6 +9857,9 @@ pub struct ChatState {
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
     turn_had_streaming_text: bool,
+    /// The daemon accepted steering for this turn, but has not confirmed
+    /// consumption. Owned here so an early terminal outcome can warn the user.
+    turn_took_accepted_steer: bool,
     /// Agent-message entry committed by prompt-response fallback while its
     /// terminal notification may still be in flight. Continuation chunks for
     /// the same local generation extend this entry instead of creating a
@@ -10018,6 +10021,7 @@ impl ChatState {
             turn_generation: 0,
             optimistic_user_message: None,
             turn_had_streaming_text: false,
+            turn_took_accepted_steer: false,
             prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
@@ -11803,6 +11807,7 @@ impl ChatState {
                         self.commit_turn(content, true);
                     }
                     TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
+                        let took_accepted_steer = self.turn_took_accepted_steer;
                         if outcome == TurnEndOutcome::Failed {
                             self.last_error = Some(classify_turn_failure(&content));
                         }
@@ -11810,6 +11815,9 @@ impl ChatState {
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
                         self.mark_dirty_append();
                         self.commit_turn(String::new(), false);
+                        if took_accepted_steer {
+                            self.set_info_notice(crate::i18n::t("zc-steer-ended-early"));
+                        }
                     }
                 }
             }
@@ -11850,6 +11858,7 @@ impl ChatState {
             self.mark_dirty_append();
         }
         self.turn_had_streaming_text = false;
+        self.turn_took_accepted_steer = false;
         self.turn_had_tool_calls = false;
         // A terminal notification resolves the earlier uncertainty, but the
         // queued backlog still waits for the user's deliberate resume.
@@ -11875,7 +11884,7 @@ impl ChatState {
             self.freeze_prompt_settled_stream();
         }
         // Preserve per-turn provenance for a delayed terminal notification;
-        // the next turn resets both flags when its user message is committed.
+        // the next turn resets it when its user message is committed.
         self.mark_dirty_append();
         self.settle_turn_lifecycle(false, pause_reason);
     }
@@ -11966,6 +11975,7 @@ impl ChatState {
         self.optimistic_user_message =
             Some((self.turn_generation, entry_index, prior_message_count));
         self.turn_had_streaming_text = false;
+        self.turn_took_accepted_steer = false;
         self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
         // first chunk (thought / message / tool-call) tells us otherwise.
@@ -12086,8 +12096,9 @@ impl ChatState {
     /// [`Self::push_user_message`] this starts no turn: the generation,
     /// in-flight flag and error state belong to the turn being steered. Text
     /// streamed so far is committed first so the message sits where it was
-    /// sent; the daemon folds it in at that turn's next round boundary.
+    /// sent. Acceptance does not confirm that the daemon consumed the text.
     pub(crate) fn push_steered_user_message(&mut self, text: String) {
+        self.turn_took_accepted_steer = true;
         self.flush_streaming_thought();
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
@@ -12407,6 +12418,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_had_streaming_text = false;
+        self.turn_took_accepted_steer = false;
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -12660,6 +12672,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.message_count = 0;
         self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.turn_took_accepted_steer = false;
         self.prompt_settled_stream_entry = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -17996,6 +18009,85 @@ mod tests {
         // The turn's own completion still settles it.
         s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
         assert!(!s.turn_in_flight);
+    }
+
+    #[test]
+    fn an_accepted_steer_then_cancelled_turn_shows_delivery_notice() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Cancelled,
+            "[interrupted by user]",
+        ));
+
+        assert!(!s.turn_in_flight);
+        assert!(!s.turn_took_accepted_steer);
+        assert_eq!(
+            s.info_message.as_ref().map(|notice| notice.text.as_str()),
+            Some(crate::i18n::t("zc-steer-ended-early").as_str()),
+        );
+        assert_eq!(s.queue_len(), 0, "uncertain delivery must not resend");
+    }
+
+    #[test]
+    fn an_accepted_steer_then_failed_turn_shows_delivery_notice() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Failed,
+            "Provider request failed",
+        ));
+
+        assert!(!s.turn_in_flight);
+        assert!(!s.turn_took_accepted_steer);
+        assert!(s.last_error.is_some());
+        assert_eq!(
+            s.info_message.as_ref().map(|notice| notice.text.as_str()),
+            Some(crate::i18n::t("zc-steer-ended-early").as_str()),
+        );
+    }
+
+    #[test]
+    fn an_accepted_steer_then_completed_turn_has_no_delivery_notice() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+
+        assert!(!s.turn_in_flight);
+        assert!(!s.turn_took_accepted_steer);
+        assert!(s.info_message.is_none());
+    }
+
+    #[test]
+    fn a_turn_after_cancelled_steering_starts_without_delivery_uncertainty() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        s.push_steered_user_message("also X".into());
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Cancelled,
+            "[interrupted by user]",
+        ));
+        assert!(s.info_message.is_some());
+
+        // Submit clears the previous notice before dispatching a fresh turn.
+        s.clear_info_notice();
+        s.push_user_message(Some("next".into()), Vec::new());
+        assert!(!s.turn_took_accepted_steer);
+        s.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Cancelled,
+            "[interrupted by user]",
+        ));
+        assert!(s.info_message.is_none(), "no steer belongs to this turn");
     }
 
     #[test]
@@ -32676,28 +32768,41 @@ mod tests {
         }
     }
 
-    /// Capture the existing UI for the known early-end review blocker. This
-    /// records the accepted row and terminal marker, not a delivery warning:
-    /// this head has no such warning and this evidence task must not invent it.
+    /// Drive accepted steering and early completion through the key/RPC path,
+    /// then observe the delivery warning in the final terminal-cell output.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn evidence_frame_accepted_steer_then_early_end_current_head() {
+    async fn evidence_frame_accepted_steer_then_early_end_shows_notice() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let _env = env_test_lock_async().await;
         let _keys = crate::keymap::overrides::TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::keymap::overrides::reset();
-        for (outcome, marker, slug) in [
+        for (outcome, marker, slug, width) in [
             (
                 "cancelled",
                 "[interrupted by user]",
-                "cancel-after-accepted-steer-current-head",
+                "cancel-after-accepted-steer-with-notice",
+                100,
+            ),
+            (
+                "cancelled",
+                "[interrupted by user]",
+                "cancel-after-accepted-steer-with-notice",
+                160,
             ),
             (
                 "failed",
                 "Provider request failed",
-                "failure-after-accepted-steer-current-head",
+                "failure-after-accepted-steer-with-notice",
+                100,
+            ),
+            (
+                "failed",
+                "Provider request failed",
+                "failure-after-accepted-steer-with-notice",
+                160,
             ),
         ] {
             let (mut chat, mut rx) = evidence_running_code_chat();
@@ -32742,7 +32847,7 @@ mod tests {
             assert!(!active_state(&mut chat).turn_in_flight);
             assert_eq!(active_state(&mut chat).queue_len(), 0);
             assert!(rx.try_recv().is_err(), "no resend after the early end");
-            let (frame, conversation, queue) = evidence_code_frame(chat, 100, 30);
+            let (frame, conversation, queue) = evidence_code_frame(chat, width, 30);
             let text = overlay_text(&frame, conversation);
             let steer = text
                 .find("also count them")
@@ -32755,7 +32860,15 @@ mod tests {
                 overlay_text(&frame, queue.unwrap())
                     .contains(&crate::i18n::t("zc-queue-empty-list"))
             );
-            print_evidence_frame(&frame, slug, 100, 30);
+            let notice_row = overlay_text(&frame, Rect::new(0, 28, width, 1));
+            assert!(notice_row.contains("This turn ended early; a message you sent into it"));
+            if width == 160 {
+                assert!(
+                    notice_row.contains(&crate::i18n::t("zc-steer-ended-early")),
+                    "the full delivery warning must be visible",
+                );
+            }
+            print_evidence_frame(&frame, slug, width, 30);
         }
     }
 

@@ -2865,10 +2865,9 @@ impl RpcClient {
         .await
     }
 
-    /// Fold `content` into the session's running turn as its own user turn
-    /// (`session/steer`). The daemon answers `accepted` when a turn took it;
-    /// an error (no active turn, full steering queue, or a daemon without the
-    /// method) means the message was not delivered and the caller still owns it.
+    /// Offer `content` to the session's running turn (`session/steer`).
+    /// `accepted` confirms enqueueing, not consumption. Explicit refusals
+    /// leave the caller owning the text; a timeout leaves delivery unknown.
     pub async fn session_steer(
         &self,
         session_id: &str,
