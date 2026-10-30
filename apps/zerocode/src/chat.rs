@@ -7293,21 +7293,58 @@ fn render_tool_entry(
                     FILE_TOOL_PREVIEW_LINES
                 };
                 let mut remaining_bytes = TOOL_EXPANDED_MAX_BYTES;
+                let mut remaining_lines = limit;
                 let mut shown = 0;
-                for (i, choice) in choices.iter().take(limit).enumerate() {
+                for (i, choice) in choices.iter().enumerate() {
+                    if remaining_lines == 0 {
+                        break;
+                    }
                     let Some(choice) = choice.as_str() else {
                         continue;
                     };
-                    let row = format!("    {}. {}", i + 1, preview(choice, 200));
-                    if row.len() > remaining_bytes {
+                    let prefix = format!("    {}. ", i + 1);
+                    if !full {
+                        let row = format!("{prefix}{}", preview(choice, 200));
+                        if row.len() > remaining_bytes {
+                            break;
+                        }
+                        remaining_bytes -= row.len();
+                        remaining_lines -= 1;
+                        lines.push(Line::from(Span::styled(
+                            row,
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        shown += 1;
+                        continue;
+                    }
+                    // Expanded cards are the only place a closed question's
+                    // choices can be read in full, so each choice gets the
+                    // shared expanded byte and line limits rather than the
+                    // one-line preview, with continuation lines indented
+                    // under the choice's first line.
+                    let (text, cut) = terminal_safe_tool_text_limited(
+                        choice,
+                        remaining_bytes.saturating_sub(prefix.len()),
+                        remaining_lines,
+                    );
+                    if cut && text.is_empty() {
                         break;
                     }
-                    remaining_bytes -= row.len();
-                    lines.push(Line::from(Span::styled(
-                        row,
-                        theme::dim_style().add_modifier(sel_mod),
-                    )));
+                    let indent = " ".repeat(prefix.len());
+                    for (row_index, row) in text.split('\n').enumerate() {
+                        let lead = if row_index == 0 { &prefix } else { &indent };
+                        lines.push(Line::from(Span::styled(
+                            format!("{lead}{row}"),
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        remaining_lines = remaining_lines.saturating_sub(1);
+                    }
+                    remaining_bytes = remaining_bytes.saturating_sub(prefix.len() + text.len());
                     shown += 1;
+                    if cut {
+                        display_limited = true;
+                        break;
+                    }
                 }
                 if shown < count {
                     footer = Some(count - shown);
@@ -31802,6 +31839,72 @@ mod tests {
         assert!(
             text.find("question:") < text.find("result:"),
             "question before the outcome: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_ask_user_card_shows_whole_choices_within_shared_limits() {
+        let long = format!("{} end-of-long-choice", "word ".repeat(60));
+        let input = serde_json::json!({
+            "choices": [long, "first line\nsecond line of the choice", "short"],
+            "question": "Which one?"
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            None,
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert!(text.contains("end-of-long-choice"), "{text}");
+        assert!(text.contains("    2. first line"), "{text}");
+        assert!(text.contains("       second line of the choice"), "{text}");
+        assert!(text.contains("    3. short"), "{text}");
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "ask_user",
+            &input,
+            None,
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed = rendered_text(&collapsed);
+        assert!(!collapsed.contains("end-of-long-choice"), "{collapsed}");
+        assert!(
+            !collapsed.contains("second line of the choice"),
+            "{collapsed}"
+        );
+    }
+
+    #[test]
+    fn expanded_ask_user_choices_stop_at_the_shared_line_limit() {
+        let choices: Vec<String> = (0..TOOL_EXPANDED_MAX_LINES)
+            .map(|i| format!("choice {i}\nmore {i}"))
+            .collect();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "poll",
+            &serde_json::json!({ "options": choices, "question": "Pick" }).to_string(),
+            None,
+            false,
+            ToolDisclosure::Full,
+        );
+        let choice_rows = rendered_text(&lines)
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.trim_start().is_empty())
+            .filter(|line| line.contains("choice ") || line.contains("more "))
+            .count();
+        assert_eq!(choice_rows, TOOL_EXPANDED_MAX_LINES);
+        assert!(
+            rendered_text(&lines).contains(&crate::i18n::t("zc-chat-tool-show-less")),
+            "the cut-off list keeps its footer"
         );
     }
 
