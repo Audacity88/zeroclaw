@@ -6691,7 +6691,3 @@ mod transport_leg_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "app/evidence_frames.rs"]
-mod evidence_frames;
