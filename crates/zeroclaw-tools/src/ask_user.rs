@@ -16,10 +16,6 @@ pub type ChannelMapHandle = Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>;
 /// Default timeout in seconds when waiting for a user response.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
-/// Result when a structured-only channel returns no choice: the user closed
-/// the prompt without picking (or, rarely, the client cannot show choices).
-const DISMISSED_OUTPUT: &str = "DISMISSED: the user closed the question without choosing.";
-
 /// Agent-callable tool for sending a question to a user and waiting for their response.
 pub struct AskUserTool {
     security: Arc<SecurityPolicy>,
@@ -219,7 +215,10 @@ impl Tool for AskUserTool {
                 Ok(None) => {
                     return Ok(ToolResult {
                         success: true,
-                        output: DISMISSED_OUTPUT.to_string().into(),
+                        output: crate::i18n::get_required_tool_string(
+                            "tool-ask-user-result-dismissed",
+                        )
+                        .into(),
                         error: None,
                     });
                 }
@@ -752,7 +751,10 @@ mod tests {
             result.error
         );
         assert!(result.error.is_none());
-        assert_eq!(result.output, DISMISSED_OUTPUT);
+        assert_eq!(
+            result.output,
+            "DISMISSED: the user closed the question without choosing."
+        );
         assert!(
             !*ch.listen_called.lock(),
             "must not fall through to listen on a structured-only channel"
