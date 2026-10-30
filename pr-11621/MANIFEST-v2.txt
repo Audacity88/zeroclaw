@@ -1,0 +1,4 @@
+PR #11621 real window captures (macOS Terminal.app, screencapture -l), ZeroCode Chat pane, 150x42.
+Build: debug build of 46f3999a52 (PR head), via zeroclaw-pr-test build/daemon/ui --isolated, live local bonsai-mini model, agent "checkpoint".
+11621-01-steer-accepted-queue-empty-150x42.png: "also count them" sent with Enter while the turn is thinking; it appears as "You: also count them" inside the running turn, Queue (0).
+11621-02-cancel-after-steer-notice-150x42.png: Esc cancels the turn; status line shows "This turn ended early; a message you sent into it may not have been read. Check before sending it again."
