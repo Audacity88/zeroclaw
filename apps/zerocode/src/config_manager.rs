@@ -4877,10 +4877,8 @@ impl App {
                 Ok(revision) => {
                     self.application_feedback
                         .record_saved(prop.clone(), revision);
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-field-set",
-                        &[("prop", &prop)],
-                    ));
+                    // The application summary below names the saved field.
+                    self.status_msg = None;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -10194,6 +10192,36 @@ mod tests {
             &manager.array_selection.as_ref().unwrap().entries,
             &["z.old", "a.live", "missing", "b.new"]
         );
+    }
+
+    #[tokio::test]
+    async fn array_picker_save_reports_saved_path_without_status_message() {
+        let (mut manager, calls) =
+            array_picker_manager(&["a.live"], Some(vec!["a.live".into(), "b.new".into()])).await;
+        assert!(manager.application_feedback.summary().is_empty());
+        manager.select_cursor = 1;
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["config/resolve-alias-source", "config/set", "config/list"]
+        );
+        assert_eq!(
+            string_array_entries(manager.fields[1].value.as_ref().unwrap().as_str().unwrap()),
+            Some(vec!["a.live".into(), "b.new".into()])
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        let summary = manager.application_feedback.summary();
+        assert!(summary.contains("a.second"), "{summary}");
+        // Successful saves name the field only in the application summary.
+        assert_eq!(manager.status_msg, None);
     }
 
     #[tokio::test]
