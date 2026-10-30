@@ -1,0 +1,17 @@
+PR #11589 live interface evidence at head d01ad8eb1ad9 (d0297b2c4 narrow-pane fix + clean master 1c1cd118a merge).
+Real X11 window captures (ffmpeg x11grab) of xfce4-terminal windows on Linux x86_64, 2026-10-30 23:27-23:32 UTC.
+The daemon (`zeroclaw daemon`) and every ZeroCode client come from one debug build of that head (target/debug/zeroclaw, target/debug/zerocode).
+Provider: stub.py, a local OpenAI-compatible endpoint that bills 5000 input + 100 output tokens per call (priced at $10/Mtok, so $0.051 per call).
+SPAWN in the last user message makes it return a `shell` tool call that runs child.sh. stub-requests.log lists every provider request it received.
+Config: config-excerpt.toml ([cost] enabled, daily_limit_usd 0.04 then 0.08, allow_override = true, [cost.enforcement] mode = "block").
+
+L01: MAIN client (independent; launched from the desktop shell). The turn pauses on COST LIMIT REACHED with Stop (Enter/Esc) and Override and continue (Ctrl+o) side by side.
+L02: Enter = Stop. The turn ends with "Budget exceeded: $0.0510 of $0.04 Day limit", and no further provider request was made (stub-requests.log).
+L03: The daemon's shell tool runs child.sh, which opens a CHILD ZeroCode client. Its Overview shows it connected as unix:pid=3991336. child-ancestry.txt shows that pid -> xfce4-terminal -> child.sh -> zeroclaw daemon (3991162).
+L04: The CHILD session sends a message and gets the cost-limit prompt ($0.10 of $0.08).
+L05: Ctrl+O in the CHILD is refused. The pending turn stops with the budget error, and no provider call is made. Trace: trace-child-refusal.jsonl, "RPC cost override refused: independent operator process required", reason cost_override_untrusted_process, peer_pid 3991336.
+L06: A SECOND independent client and the CHILD each have a turn waiting on the prompt.
+L07: Ctrl+O in SECOND is accepted. SECOND's turn continues, the CHILD's waiting prompt closes, and its turn continues too (two provider requests at 19:30:28 EDT in stub-requests.log). Only one Approve audit event was emitted (trace-grant.jsonl: decided_by rpc, decided_by_user uid:1000, session 8bab177a).
+L08: After the CHILD window closed, the MAIN turn that was parked in the shell tool continued under the same grant without another prompt.
+L09: After a daemon restart (grant cleared), a pane about 42 columns wide shows Stop and Override and continue stacked on separate rows, each fully visible inside the modal.
+L10: Clicking the stacked Override button grants the override (the second Approve event, after the restart), and the turn completes.

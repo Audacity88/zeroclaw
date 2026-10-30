@@ -1,0 +1,6 @@
+19:27:44 POST /v1/chat/completions stream=True last=user fin=tool_calls
+19:28:43 POST /v1/chat/completions stream=True last=user fin=tool_calls
+19:30:28 POST /v1/chat/completions stream=True last=user fin=stop
+19:30:28 POST /v1/chat/completions stream=True last=user fin=stop
+19:30:45 POST /v1/chat/completions stream=True last=tool fin=stop
+19:32:04 POST /v1/chat/completions stream=True last=user fin=stop

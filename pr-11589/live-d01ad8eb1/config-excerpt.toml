@@ -1,0 +1,40 @@
+schema_version = 3
+
+[tools]
+optional = ["*"]
+
+[providers.models.custom.stub]
+uri = "http://127.0.0.1:18089/v1"
+model = "stub-model"
+wire_api = "chat_completions"
+native_tools = true
+
+[cost]
+enabled = true
+daily_limit_usd = 0.08
+allow_override = true
+
+[cost.enforcement]
+mode = "block"
+
+[cost.rates.providers.models.custom.stub-model]
+input_per_mtok = 10.0
+output_per_mtok = 10.0
+
+[risk_profiles.ev]
+level = "full"
+workspace_only = false
+allowed_tools = ["shell"]
+shell_env_passthrough = ["DISPLAY"]
+allowed_commands = ["/workspace/zeroclaw/ev11589/child.sh", "child.sh"]
+sandbox_enabled = false
+
+[runtime_profiles.ev]
+agentic = true
+max_tool_iterations = 4
+shell_timeout_secs = 600
+
+[agents.stub]
+model_provider = "custom.stub"
+risk_profile = "ev"
+runtime_profile = "ev"

@@ -1,0 +1,26 @@
+== zerocode pid 3991223
+3991223      52 xfce4-terminal --disable-server --hide-menubar --hide-toolbar --hide-scrollbar --title MAIN zerocode, independent client --g
+     52       7 /usr/bin/python3 /usr/local/bin/sand-exit-watch --telemetry-log /tmp/sand-box-telemetry.log --exec-owner 277 --supervise-own
+      7       1 /pod-daemon --ssh-auth-sock-path /run/host-services/ssh-auth.sock --ssh-auth-vsock-port 52
+== zerocode pid 3991230
+3991230 3991223 /workspace/zeroclaw/rrbox/t11589/debug/zerocode --config-dir /workspace/zeroclaw/ev11589/cfg
+3991223      52 xfce4-terminal --disable-server --hide-menubar --hide-toolbar --hide-scrollbar --title MAIN zerocode, independent client --g
+     52       7 /usr/bin/python3 /usr/local/bin/sand-exit-watch --telemetry-log /tmp/sand-box-telemetry.log --exec-owner 277 --supervise-own
+      7       1 /pod-daemon --ssh-auth-sock-path /run/host-services/ssh-auth.sock --ssh-auth-vsock-port 52
+== zerocode pid 3991329
+3991329 3991328 xfce4-terminal --disable-server --title CHILD zerocode, started by the daemon shell tool --geometry 120x34+40+40 -x /workspa
+3991328 3991162 /bin/bash /workspace/zeroclaw/ev11589/child.sh
+3991162 3991160 /workspace/zeroclaw/rrbox/t11589/debug/zeroclaw --config-dir /workspace/zeroclaw/ev11589/cfg daemon
+3991160 3988921 bash -c /workspace/zeroclaw/rrbox/t11589/debug/zeroclaw --config-dir /workspace/zeroclaw/ev11589/cfg daemon 2>&1 | tee daemo
+3988921      52 tmux -L ev11589 new-session -d -s stub python3 /workspace/zeroclaw/ev11589/stub.py 2>&1 | tee stub.err
+     52       7 /usr/bin/python3 /usr/local/bin/sand-exit-watch --telemetry-log /tmp/sand-box-telemetry.log --exec-owner 277 --supervise-own
+      7       1 /pod-daemon --ssh-auth-sock-path /run/host-services/ssh-auth.sock --ssh-auth-vsock-port 52
+== zerocode pid 3991336
+3991336 3991329 /workspace/zeroclaw/rrbox/t11589/debug/zerocode --config-dir /workspace/zeroclaw/ev11589/cfg
+3991329 3991328 xfce4-terminal --disable-server --title CHILD zerocode, started by the daemon shell tool --geometry 120x34+40+40 -x /workspa
+3991328 3991162 /bin/bash /workspace/zeroclaw/ev11589/child.sh
+3991162 3991160 /workspace/zeroclaw/rrbox/t11589/debug/zeroclaw --config-dir /workspace/zeroclaw/ev11589/cfg daemon
+3991160 3988921 bash -c /workspace/zeroclaw/rrbox/t11589/debug/zeroclaw --config-dir /workspace/zeroclaw/ev11589/cfg daemon 2>&1 | tee daemo
+3988921      52 tmux -L ev11589 new-session -d -s stub python3 /workspace/zeroclaw/ev11589/stub.py 2>&1 | tee stub.err
+     52       7 /usr/bin/python3 /usr/local/bin/sand-exit-watch --telemetry-log /tmp/sand-box-telemetry.log --exec-owner 277 --supervise-own
+      7       1 /pod-daemon --ssh-auth-sock-path /run/host-services/ssh-auth.sock --ssh-auth-vsock-port 52
