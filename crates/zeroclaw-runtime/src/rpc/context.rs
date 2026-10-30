@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 use zeroclaw_api::channel::{AttributedApprovalResponse, ChannelApprovalResponse};
 use zeroclaw_api::jsonrpc::RpcOutbound;
+use zeroclaw_config::cost::override_grant::OperatorBinding;
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
@@ -35,7 +36,7 @@ struct PendingApprovalEntry {
     session_id: String,
     tx: oneshot::Sender<AttributedApprovalResponse>,
     /// Created when the cost prompt is delivered, not supplied by the approver.
-    operator_surface: Option<Arc<RpcOutbound>>,
+    operator_binding: OperatorBinding<RpcOutbound>,
 }
 
 pub struct PendingApproval {
@@ -84,7 +85,7 @@ impl ApprovalPendingMap {
             PendingApprovalEntry {
                 session_id,
                 tx,
-                operator_surface: None,
+                operator_binding: OperatorBinding::new(None),
             },
         );
     }
@@ -102,7 +103,7 @@ impl ApprovalPendingMap {
             PendingApprovalEntry {
                 session_id,
                 tx,
-                operator_surface,
+                operator_binding: OperatorBinding::new(operator_surface),
             },
         );
         PendingApproval {
@@ -117,7 +118,9 @@ impl ApprovalPendingMap {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(request_id)
-            .is_some_and(|entry| entry.session_id == session_id && entry.operator_surface.is_some())
+            .is_some_and(|entry| {
+                entry.session_id == session_id && entry.operator_binding.is_bound()
+            })
     }
 
     pub fn resolve(
@@ -148,10 +151,7 @@ impl ApprovalPendingMap {
     ) -> bool {
         let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if pending.get(request_id).is_none_or(|entry| {
-            entry.session_id != session_id
-                || entry.operator_surface.as_ref().is_some_and(|expected| {
-                    surface.is_none_or(|actual| !Arc::ptr_eq(expected, actual))
-                })
+            entry.session_id != session_id || !entry.operator_binding.admits(surface)
         }) {
             return false;
         }

@@ -20,6 +20,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::cost::override_grant::{
+    CostOverrideAnswer, cost_override_answer, independent_operator_process,
+};
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
@@ -1128,48 +1131,23 @@ async fn refresh_live_channel_handles_between_configs_detached(
 /// Check the actual process tree at decision time. A reparented process may no
 /// longer expose its former ancestry; this is a bounded check, not OS isolation.
 fn cost_override_peer_is_independent(peer: Option<u32>) -> bool {
-    let Some(peer) = peer.filter(|pid| *pid > 0) else {
-        return false;
-    };
-    if !sysinfo::IS_SUPPORTED_SYSTEM {
-        return false;
-    }
     let mut system = sysinfo::System::new();
-    independent_operator_process(peer, std::process::id(), |pid| {
-        let pid = sysinfo::Pid::from_u32(pid);
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[pid]),
-            true,
-            sysinfo::ProcessRefreshKind::nothing(),
-        );
-        system
-            .process(pid)
-            .and_then(|process| process.parent().map(|parent| parent.as_u32()))
-    })
-}
-
-fn independent_operator_process(
-    mut peer: u32,
-    daemon: u32,
-    mut parent: impl FnMut(u32) -> Option<u32>,
-) -> bool {
-    for _ in 0..128 {
-        if peer == daemon || peer == 0 {
-            return false;
-        }
-        // PID 1 is the root of the visible process tree.
-        if peer == 1 {
-            return true;
-        }
-        let Some(next) = parent(peer) else {
-            return false;
-        };
-        if next == 0 {
-            return false;
-        }
-        peer = next;
-    }
-    false
+    independent_operator_process(
+        peer,
+        std::process::id(),
+        sysinfo::IS_SUPPORTED_SYSTEM,
+        |pid| {
+            let pid = sysinfo::Pid::from_u32(pid);
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            system
+                .process(pid)
+                .and_then(|process| process.parent().map(|parent| parent.as_u32()))
+        },
+    )
 }
 
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
@@ -8921,11 +8899,15 @@ impl RpcDispatcher {
             .is_cost_override(&p.request_id, &p.session_id);
         if cost_override {
             let peer_pid = self.peer_process_id;
-            let independent = self.transport_kind == super::transport::TransportKind::Local
-                && tokio::task::spawn_blocking(move || cost_override_peer_is_independent(peer_pid))
+            let is_local_transport = self.transport_kind == super::transport::TransportKind::Local;
+            let independent = if is_local_transport {
+                tokio::task::spawn_blocking(move || cost_override_peer_is_independent(peer_pid))
                     .await
-                    .unwrap_or(false);
-            if !independent {
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if cost_override_answer(is_local_transport, independent) == CostOverrideAnswer::Refuse {
                 // Stop only if this is the connection the prompt was sent to.
                 // A foreign connection cannot consume someone else's prompt.
                 self.ctx.approval_pending.resolve_from_operator(
@@ -27229,25 +27211,6 @@ mod tests {
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
-    }
-
-    #[test]
-    fn cost_override_rejects_daemon_descendants_and_unknown_ancestry() {
-        let parent = |pid| match pid {
-            40 => Some(30),
-            30 => Some(20),
-            20 => Some(1),
-            50 => Some(1),
-            _ => None,
-        };
-        assert!(!independent_operator_process(20, 20, parent));
-        assert!(!independent_operator_process(30, 20, parent));
-        assert!(!independent_operator_process(40, 20, parent));
-        assert!(independent_operator_process(50, 20, parent));
-        assert!(!independent_operator_process(99, 20, parent));
-        assert!(!independent_operator_process(99, 20, Some));
-        assert!(!cost_override_peer_is_independent(None));
-        assert!(!cost_override_peer_is_independent(Some(std::process::id())));
     }
 
     #[tokio::test]
