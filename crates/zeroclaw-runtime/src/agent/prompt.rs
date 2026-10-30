@@ -197,11 +197,22 @@ pub(crate) fn render_identity_snapshot(
     if let Some((name, error)) = errors.into_iter().next() {
         anyhow::bail!("Could not read personality file {name}: {error}");
     }
-    Ok(render_identity_with_profile(
-        identity_config,
-        agent_workspace_dir,
-        &profile,
-    ))
+    let aieos = if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+    {
+        match identity::load_aieos_identity(config, agent_workspace_dir) {
+            Ok(Some(aieos)) => Some(aieos),
+            // The configuration guard excludes the loader's unconfigured case.
+            // A configured identity must load before a session can cache it.
+            Ok(None) => {
+                anyhow::bail!("Could not load AIEOS identity: no configured identity loaded")
+            }
+            Err(error) => anyhow::bail!("Could not load AIEOS identity: {error}"),
+        }
+    } else {
+        None
+    };
+    Ok(render_identity_with_aieos(&profile, aieos.as_ref()))
 }
 
 fn render_identity_with_profile(
@@ -209,13 +220,26 @@ fn render_identity_with_profile(
     agent_workspace_dir: &Path,
     profile: &personality::PersonalityProfile,
 ) -> IdentitySnapshot {
+    let aieos = if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+    {
+        identity::load_aieos_identity(config, agent_workspace_dir)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    render_identity_with_aieos(profile, aieos.as_ref())
+}
+
+fn render_identity_with_aieos(
+    profile: &personality::PersonalityProfile,
+    aieos: Option<&identity::AieosIdentity>,
+) -> IdentitySnapshot {
     let mut prompt = String::from("## Project Context\n\n");
     let mut has_aieos = false;
-    if let Some(config) = identity_config
-        && identity::is_aieos_configured(config)
-        && let Ok(Some(aieos)) = identity::load_aieos_identity(config, agent_workspace_dir)
-    {
-        let rendered = identity::aieos_to_system_prompt(&aieos);
+    if let Some(aieos) = aieos {
+        let rendered = identity::aieos_to_system_prompt(aieos);
         if !rendered.is_empty() {
             prompt.push_str(&rendered);
             prompt.push_str("\n\n");
