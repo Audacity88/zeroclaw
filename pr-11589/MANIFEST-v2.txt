@@ -1,0 +1,6 @@
+PR #11589 real window captures (macOS Terminal.app, screencapture -l), ZeroCode Chat pane, 150x42.
+Build: debug build of ab919d606c (PR head), via zeroclaw-pr-test build/daemon/ui --isolated, live local bonsai-mini model.
+Config additions: [cost] enabled, daily_limit_usd=0.05, allow_override=true; [cost.enforcement] mode=block; bonsai-mini priced at $20/Mtok in and out.
+11589-01-cost-limit-prompt-150x42.png: second turn pauses on COST LIMIT REACHED ($0.15 spent of $0.05 daily), Stop (Enter/Esc) and Override and continue (Ctrl+o).
+11589-02-after-override-turn-continues-150x42.png: after Ctrl+O the prompt closes and the same waiting turn resumes (model thinking streams).
+11589-03-turn-completed-after-override-150x42.png: the turn completes with the agent's reply; input returns to "Type to chat".
