@@ -29,10 +29,6 @@ use crate::theme;
 
 pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 
-#[cfg(test)]
-#[path = "config_manager_evidence_tests.rs"]
-mod evidence_tests;
-
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
