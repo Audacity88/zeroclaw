@@ -1,0 +1,4 @@
+11501-master-01-long-value-row-100x30.png 2026-10-30T11:39:20+0800 commit=5a51398dd5 720x469px capture=screencapture-l-window
+11501-master-02-long-value-help-100x30.png 2026-10-30T11:39:21+0800 commit=5a51398dd5 720x469px capture=screencapture-l-window
+11501-master-05-secret-set-row-100x30.png 2026-10-30T11:40:45+0800 commit=5a51398dd5 720x469px capture=screencapture-l-window
+11501-master-06-secret-set-help-100x30.png 2026-10-30T11:40:47+0800 commit=5a51398dd5 720x469px capture=screencapture-l-window

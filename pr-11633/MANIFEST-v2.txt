@@ -1,0 +1,8 @@
+11633-01-wrapped-path-links-80x30.png 2026-10-30T11:29:46+0800 commit=e0ca66ae08 580x469px capture=screencapture-l-window
+11633-02-left-click-continuation-row-opened-in-textedit.png 2026-10-30T11:30:15+0800 commit=e0ca66ae08 1061x662px capture=screencapture-l-window
+11633-03-command-click-revealed-notice-80x30.png 2026-10-30T11:33:44+0800 commit=e0ca66ae08 580x469px capture=screencapture-l-window
+11633-04-command-click-finder-reveal.png 2026-10-30T11:32:02+0800 commit=e0ca66ae08 920x464px capture=screencapture-l-window
+11633-05-symlink-click-revealed-notice-80x30.png 2026-10-30T11:32:30+0800 commit=e0ca66ae08 580x469px capture=screencapture-l-window
+11633-06-symlink-click-finder-reveal.png 2026-10-30T11:32:45+0800 commit=e0ca66ae08 920x464px capture=screencapture-l-window
+11633-07-right-click-continuation-row-menu-80x30.png 2026-10-30T11:33:05+0800 commit=e0ca66ae08 580x469px capture=screencapture-l-window
+11633-08-add-path-to-chat-composer-80x30.png 2026-10-30T11:33:22+0800 commit=e0ca66ae08 580x469px capture=screencapture-l-window

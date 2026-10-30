@@ -1,0 +1,4 @@
+11698-01-reload-context-unchanged-100x30.png 2026-10-30T11:43:17+0800 commit=725dcbbf69 720x469px capture=screencapture-l-window
+11698-02-reload-context-changed-after-agents-md-edit-100x30.png 2026-10-30T11:43:35+0800 commit=725dcbbf69 720x469px capture=screencapture-l-window
+11698-03-next-turn-follows-reloaded-agents-md-100x30.png 2026-10-30T11:45:08+0800 commit=725dcbbf69 720x469px capture=screencapture-l-window
+11698-04-reload-context-failed-unreadable-agents-md-100x30.png 2026-10-30T11:45:11+0800 commit=725dcbbf69 720x469px capture=screencapture-l-window

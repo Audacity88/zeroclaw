@@ -1,0 +1,5 @@
+11502-01-picker-missing-entry-100x30.png 2026-10-30T11:22:44+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
+11502-02-staged-toggle-100x30.png 2026-10-30T11:22:46+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
+11502-03-after-ctrl-s-saved-100x30.png 2026-10-30T11:22:58+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
+11502-04-reopened-after-save-100x30.png 2026-10-30T11:23:11+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
+11502-05-escape-discard-confirm-100x30.png 2026-10-30T11:23:15+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window

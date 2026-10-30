@@ -1,0 +1,6 @@
+11510-01-required-int-no-reset-offered-100x30.png 2026-10-30T11:24:44+0800 commit=7564c57fe8 720x469px capture=screencapture-l-window
+11510-02-required-int-reset-unavailable-notice-100x30.png 2026-10-30T11:24:46+0800 commit=7564c57fe8 720x469px capture=screencapture-l-window
+11510-03-optional-int-reset-offered-100x30.png 2026-10-30T11:25:08+0800 commit=7564c57fe8 720x469px capture=screencapture-l-window
+11510-04-optional-int-reset-confirm-100x30.png 2026-10-30T11:25:10+0800 commit=7564c57fe8 720x469px capture=screencapture-l-window
+11510-05-optional-int-reset-result-100x30.png 2026-10-30T11:25:13+0800 commit=7564c57fe8 720x469px capture=screencapture-l-window
+11510-06-reset-unavailable-notice-es-100x30.png 2026-10-30T11:27:16+0800 commit=7564c57fe8 720x469px capture=screencapture-l-window
