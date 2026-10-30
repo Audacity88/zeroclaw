@@ -192,10 +192,17 @@ pub(crate) fn render_identity_snapshot(
     } else {
         personality::personality_files_without_memory()
     };
-    let (profile, errors) =
-        personality::load_personality_files_with_errors(agent_workspace_dir, &filenames);
-    if let Some((name, error)) = errors.into_iter().next() {
-        anyhow::bail!("Could not read personality file {name}: {error}");
+    let profile = personality::load_personality_files(agent_workspace_dir, &filenames);
+    // The shared loader treats an unreadable file like a missing one. Recheck
+    // only the files it skipped, so a file that exists but cannot be read
+    // fails the capture instead of being frozen out of the session.
+    for name in &profile.missing {
+        match std::fs::read_to_string(agent_workspace_dir.join(name)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                anyhow::bail!("Could not read personality file {name}: {error}");
+            }
+            _ => {}
+        }
     }
     let aieos = if let Some(config) = identity_config
         && identity::is_aieos_configured(config)
