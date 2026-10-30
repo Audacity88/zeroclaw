@@ -8859,10 +8859,13 @@ impl RpcDispatcher {
         // registered binding), never the client-supplied session_id. An
         // unknown request_id falls through to the no-op resolve below,
         // identically for every caller.
-        if let Some(bound_session) = self.ctx.approval_pending.session_for(&p.request_id) {
-            self.authorize_session_owner(&bound_session, Method::SessionApprove)
-                .await?;
-        }
+        let bound_session = self.ctx.approval_pending.session_for(&p.request_id);
+        let admitted = if let Some(bound_session) = bound_session.as_deref() {
+            self.authorize_session_owner(bound_session, Method::SessionApprove)
+                .await?
+        } else {
+            None
+        };
 
         let response = match p.decision.as_str() {
             "allow_once" => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
@@ -8897,7 +8900,7 @@ impl RpcDispatcher {
             .ctx
             .approval_pending
             .is_cost_override(&p.request_id, &p.session_id);
-        if cost_override {
+        let approval_authority = if cost_override {
             let peer_pid = self.peer_process_id;
             let is_local_transport = self.transport_kind == super::transport::TransportKind::Local;
             let independent = if is_local_transport {
@@ -8907,6 +8910,33 @@ impl RpcDispatcher {
             } else {
                 false
             };
+            let current = self
+                .revalidate_admitted_session(&p.session_id, admitted.as_ref())
+                .await?;
+            // The process lookup and session reads can outlive the caller's
+            // grants. Hold current authority through synchronous delivery so
+            // neither approval nor refusal consumes a prompt after revocation.
+            let lease = self.ctx.auth.hold_authority();
+            let grants = self
+                .auth
+                .as_ref()
+                .map(|auth| {
+                    current_authority_under(&lease, auth, Method::SessionApprove).map_err(
+                        |denied| {
+                            self.audit_auth_denial(Method::SessionApprove, &denied);
+                            rpc_err(denied.code, denied.message)
+                        },
+                    )
+                })
+                .transpose()?;
+            self.require_ownership_under(grants.as_ref(), current.as_ref())?;
+            if self.ctx.approval_pending.session_for(&p.request_id) != bound_session {
+                return to_result(SessionApproveResult {
+                    session_id: p.session_id,
+                    request_id: p.request_id,
+                    acknowledged: false,
+                });
+            }
             if cost_override_answer(is_local_transport, independent) == CostOverrideAnswer::Refuse {
                 // Stop only if this is the connection the prompt was sent to.
                 // A foreign connection cannot consume someone else's prompt.
@@ -8935,13 +8965,17 @@ impl RpcDispatcher {
                     crate::i18n::get_required_cli_string("rpc-cost-override-independent-operator"),
                 ));
             }
-        }
+            Some(lease)
+        } else {
+            None
+        };
         let acknowledged = self.ctx.approval_pending.resolve_from_operator(
             &p.request_id,
             &p.session_id,
             zeroclaw_api::channel::AttributedApprovalResponse::operator(response).with_user(user),
             &self.rpc,
         );
+        drop(approval_authority);
 
         if cost_override && !acknowledged {
             ::zeroclaw_log::record!(
