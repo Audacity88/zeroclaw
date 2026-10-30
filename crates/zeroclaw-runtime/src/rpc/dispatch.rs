@@ -1176,6 +1176,8 @@ pub struct RpcDispatcher {
     peer_label: String,
     /// Kernel-reported local client PID. Unknown transports cannot lift cost caps.
     peer_process_id: Option<u32>,
+    #[cfg(test)]
+    cost_override_peer_lookup: Option<Arc<dyn Fn(Option<u32>) -> bool + Send + Sync>>,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
     /// Generation token for the transport connection that accepted work.
     /// Every detached prompt is linked to it and drained before teardown.
@@ -1332,6 +1334,8 @@ impl RpcDispatcher {
             tui_epoch: None,
             peer_label,
             peer_process_id: None,
+            #[cfg(test)]
+            cost_override_peer_lookup: None,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
             connection_cancel,
             owns_connection: true,
@@ -3109,6 +3113,8 @@ impl RpcDispatcher {
             tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
             peer_process_id: self.peer_process_id,
+            #[cfg(test)]
+            cost_override_peer_lookup: self.cost_override_peer_lookup.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
             connection_cancel: self.connection_cancel.clone(),
             owns_connection: false,
@@ -8904,9 +8910,17 @@ impl RpcDispatcher {
             let peer_pid = self.peer_process_id;
             let is_local_transport = self.transport_kind == super::transport::TransportKind::Local;
             let independent = if is_local_transport {
-                tokio::task::spawn_blocking(move || cost_override_peer_is_independent(peer_pid))
-                    .await
-                    .unwrap_or(false)
+                #[cfg(test)]
+                let lookup = self.cost_override_peer_lookup.clone();
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(lookup) = lookup {
+                        return lookup(peer_pid);
+                    }
+                    cost_override_peer_is_independent(peer_pid)
+                })
+                .await
+                .unwrap_or(false)
             } else {
                 false
             };
@@ -27270,6 +27284,182 @@ mod tests {
             zeroclaw_api::channel::ChannelApprovalResponse::Deny
         );
         assert!(answer.source.is_runtime_fail_closed());
+    }
+
+    async fn cost_override_approve_during_peer_lookup(revoke: bool) {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::agent::turn::TurnCtx;
+        use crate::agent::turn::provider_call::gate_tool_loop_budget;
+        use crate::cost::CostTracker;
+        use crate::cost::types::{BudgetCheck, TokenUsage};
+        use crate::rpc::approval_channel::RpcApprovalChannel;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{CostConfig, PacingConfig, StreamReasoningMode};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-cost-override-peer-lookup";
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+        let (mut dispatcher, mut rx) = roster_peer(&ctx, 4242).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let lookup_entered = Arc::clone(&entered);
+        dispatcher.cost_override_peer_lookup = Some(Arc::new(move |_| {
+            lookup_entered.notify_one();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release the paused peer lookup");
+            true
+        }));
+
+        let tracker = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    daily_limit_usd: 1.0,
+                    allow_override: true,
+                    ..Default::default()
+                },
+                &tmp.path().join("cost"),
+            )
+            .unwrap(),
+        );
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        assert!(tracker.override_offer().is_some());
+        let channel = RpcApprovalChannel::new(
+            "rpc",
+            sid,
+            Arc::clone(&dispatcher.rpc),
+            Arc::clone(&ctx.approval_pending),
+            Default::default(),
+        );
+        let scope = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::default());
+        let gate = zeroclaw_spawn::spawn!(async move {
+            let observer = crate::observability::NoopObserver;
+            let pacing = PacingConfig::default();
+            let turn = TurnCtx {
+                observer: &observer,
+                provider_name: "stub",
+                model: "stub-model",
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 32_000,
+                    context_token_budget: 32_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                temperature: None,
+                approval: None,
+                channel_name: "rpc",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                event_tx: None,
+                hooks: None,
+                dedup_exempt_tools: &[],
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                channel: Some(&channel),
+                draft_reasoning: StreamReasoningMode::Status,
+                turn_id: "cost-override-peer-lookup",
+                agent_alias: None,
+                parent_agent_alias: None,
+                serving_provider_name: None,
+                serving_model: None,
+            };
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(scope), gate_tool_loop_budget(&turn))
+                .await
+        });
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("cost prompt arrives")
+            .expect("connection stays open");
+        let notice: Value = serde_json::from_str(&notice).unwrap();
+        assert_eq!(notice["params"]["type"], "approval_request");
+        assert_eq!(
+            notice["params"]["tool_name"],
+            zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+        );
+        let request_id = notice["params"]["request_id"].as_str().unwrap();
+        let approve = rpc(
+            &mut dispatcher,
+            &mut rx,
+            1,
+            "session/approve",
+            json!({"session_id": sid, "request_id": request_id, "decision": "allow_once"}),
+        );
+        let change = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+                .await
+                .expect("initial authorization reaches the peer lookup");
+            assert!(ctx.approval_pending.contains(request_id));
+            assert!(!gate.is_finished(), "the cost prompt is still waiting");
+            if revoke {
+                republish_session_scoped(&ctx, |profile| {
+                    profile.grants.insert(Resource::Sessions, vec![Verb::Read]);
+                });
+            }
+            release_tx.send(()).unwrap();
+        };
+        let (response, ()) = tokio::join!(approve, change);
+        if revoke {
+            assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+            assert!(response.get("result").is_none(), "no acknowledgement");
+            assert_eq!(
+                ctx.approval_pending.session_for(request_id).as_deref(),
+                Some(sid)
+            );
+            assert!(!gate.is_finished(), "the prompt must remain unanswered");
+            assert!(matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ));
+            assert!(
+                tracker.override_offer().is_some(),
+                "no override was granted"
+            );
+            gate.abort();
+            assert!(gate.await.unwrap_err().is_cancelled());
+        } else {
+            assert_eq!(response["result"]["acknowledged"], true, "{response}");
+            // The real budget gate accepts only an operator-attributed Approve.
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate)
+                .await
+                .expect("the waiting prompt receives Approve")
+                .expect("budget task completes")
+                .expect("the approved budget gate continues");
+            assert!(!ctx.approval_pending.contains(request_id));
+            assert!(
+                tracker.override_offer().is_none(),
+                "the override was granted"
+            );
+            assert!(!matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_override_approve_rechecks_authority_after_peer_lookup() {
+        cost_override_approve_during_peer_lookup(true).await;
+    }
+
+    #[tokio::test]
+    async fn cost_override_approve_accepts_unchanged_authority_after_peer_lookup() {
+        cost_override_approve_during_peer_lookup(false).await;
     }
 
     #[tokio::test]
