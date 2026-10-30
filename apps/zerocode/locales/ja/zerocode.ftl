@@ -708,3 +708,7 @@ zc-config-section-peer-groups-help = チャンネル、参加エージェント�
 zc-config-section-cron-help = スケジュール、プロンプト、チャンネル、対象を結び付ける定期タスクを設定します。
 zc-config-section-tunnel-help = Cloudflare または ngrok でゲートウェイを公開するか、ローカル専用のままにします。
 zc-config-section-onboard-state-help = クイックスタートのライフサイクル状態と、互換性のために残されたセクション別完了記録です。
+
+zc-chat-restore-environment-refused = このターミナル環境から保存済みセッションに再接続することはできません。以前の会話はデーモンに保持されています。新しい会話を開始すると、このタブは空の会話に置き換わります。
+zc-chat-restore-start-new = { $key } を押すと、新しい会話を開始します。
+zc-chat-restore-new-conversation = 新しい会話を開始

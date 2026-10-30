@@ -892,3 +892,7 @@ zc-config-setup-create = Enter a name. { $confirm } saves it and opens fields. {
 zc-config-setup-required = required
 zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
+
+zc-chat-restore-environment-refused = This saved session cannot be reattached from this terminal environment. The daemon still keeps the old conversation. Starting a new conversation will replace this tab with an empty conversation.
+zc-chat-restore-start-new = Press { $key } to start a new conversation.
+zc-chat-restore-new-conversation = Start a new conversation

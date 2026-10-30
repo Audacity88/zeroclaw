@@ -132,6 +132,18 @@ impl AgentSidebar {
         self.row_order = order;
     }
 
+    /// Preserve the displayed slot when its pane explicitly replaces an ID.
+    pub(crate) fn replace_session_id(&mut self, pane: PaneKind, old: &str, new: String) {
+        if let Some((_, sid)) = self
+            .row_order
+            .iter_mut()
+            .find(|(kind, sid)| *kind == pane && sid.as_str() == old)
+        {
+            *sid = new;
+        }
+        self.cancel_drag();
+    }
+
     pub(crate) fn close_picker(&mut self) {
         self.picker = None;
         self.cancel_drag();

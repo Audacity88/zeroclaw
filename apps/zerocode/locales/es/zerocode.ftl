@@ -709,3 +709,7 @@ zc-config-section-peer-groups-help = Grupos con nombre que vinculan un canal, ag
 zc-config-section-cron-help = Tareas programadas que vinculan un horario con un prompt, un canal y un destino.
 zc-config-section-tunnel-help = Expón opcionalmente la puerta de enlace mediante Cloudflare o ngrok, o mantenla solo local.
 zc-config-section-onboard-state-help = Estado del ciclo de vida del inicio rápido y su registro heredado de finalización por sección.
+
+zc-chat-restore-environment-refused = No se puede volver a conectar esta sesión guardada desde el entorno de este terminal. El demonio conserva la conversación anterior. Al iniciar una conversación nueva, esta pestaña se sustituirá por una conversación vacía.
+zc-chat-restore-start-new = Pulsa { $key } para iniciar una conversación nueva.
+zc-chat-restore-new-conversation = Iniciar una conversación nueva

@@ -2089,6 +2089,12 @@ pub async fn run(
             theme::set_active(t);
         }
 
+        for (old, new) in acp_pane.take_session_replacements() {
+            sidebar.replace_session_id(chat::PaneKind::Acp, &old, new);
+        }
+        for (old, new) in chat_pane.take_session_replacements() {
+            sidebar.replace_session_id(chat::PaneKind::Chat, &old, new);
+        }
         // The panes own membership; the sidebar owns display order, including
         // Code/Chat interleaving from dragging or a restored snapshot.
         let sidebar_rows = session_summaries_in_sidebar_order(
