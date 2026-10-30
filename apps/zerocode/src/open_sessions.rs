@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::chat::{PaneKind, ResumeEntry, SidebarSessionSummary};
 use crate::client::{RpcClient, SessionEntry, Transport};
+use crate::jsonrpc::JsonRpcError;
 
 const DIR_NAME: &str = "open-sessions";
 const FORMAT_VERSION: u32 = 1;
@@ -134,37 +135,31 @@ impl Snapshot {
 }
 
 impl Snapshot {
-    /// Drop saved sessions the daemon no longer has. `None` for a pane means
-    /// its list could not be fetched: keep that pane's entries and let the
-    /// resume path retry them. Returns how many were dropped.
-    pub(crate) fn retain_known(
-        &mut self,
-        code: Option<&[SessionEntry]>,
-        chat: Option<&[SessionEntry]>,
-    ) -> usize {
+    /// Drop Code sessions absent from the ACP list. If the list could not be
+    /// fetched, keep them for the resume path. Chat needs a transcript probe
+    /// instead of a listing. Returns how many Code sessions were dropped.
+    pub(crate) fn retain_known(&mut self, code: Option<&[SessionEntry]>) -> usize {
         let before = self.sessions.len();
         self.sessions.retain(|saved| {
-            let known = match saved.pane {
-                SavedPane::Code => code,
-                SavedPane::Chat => chat,
-            };
-            known.is_none_or(|list| {
-                list.iter().any(|entry| {
-                    entry.session_id == saved.session_id
-                        && entry
-                            .agent_alias
-                            .as_deref()
-                            .is_none_or(|alias| alias == saved.agent_alias)
+            saved.pane == SavedPane::Chat
+                || code.is_none_or(|list| {
+                    list.iter().any(|entry| {
+                        entry.session_id == saved.session_id
+                            && entry
+                                .agent_alias
+                                .as_deref()
+                                .is_none_or(|alias| alias == saved.agent_alias)
+                    })
                 })
-            })
         });
         before - self.sessions.len()
     }
 }
 
-/// Prune missing Code sessions using the dedicated ACP store. Chat listing
-/// is not an existence check: JSONL sessions lack the alias/channel metadata
-/// required by `session/list`. Keep Chat entries for the normal resume path.
+/// Prune Code sessions using the ACP list and Chat sessions using stored
+/// history. Chat listing is not an existence check: JSONL sessions lack the
+/// alias/channel metadata required by `session/list`. Keep entries on probe
+/// errors except the daemon's specific missing-or-unowned session refusal.
 async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize) {
     let wants = |pane| saved.sessions.iter().any(|s| s.pane == pane);
     let code = if wants(SavedPane::Code) {
@@ -172,7 +167,32 @@ async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize
     } else {
         None
     };
-    let dropped = saved.retain_known(code.as_deref(), None);
+    let mut dropped = saved.retain_known(code.as_deref());
+    let mut kept = Vec::with_capacity(saved.sessions.len());
+    for session in saved.sessions {
+        let missing = if session.pane == SavedPane::Chat {
+            match rpc
+                .session_messages_page(&session.session_id, Some(1), None)
+                .await
+            {
+                Ok(page) => page.total == 0,
+                Err(error) => error.downcast_ref::<JsonRpcError>().is_some_and(|error| {
+                    error.code == -32012
+                        && error
+                            .message
+                            .contains("Session not found or not owned by this principal")
+                }),
+            }
+        } else {
+            false
+        };
+        if missing {
+            dropped += 1;
+        } else {
+            kept.push(session);
+        }
+    }
+    saved.sessions = kept;
     (saved, dropped)
 }
 
@@ -236,7 +256,8 @@ pub(crate) struct Restore {
     pub snapshot: Option<Snapshot>,
     /// Open in another running window.
     pub elsewhere: usize,
-    /// Code sessions no longer known to the daemon.
+    /// Code sessions absent from the ACP list, plus Chat sessions with no
+    /// stored history or the daemon's missing-or-unowned session refusal.
     pub dropped: usize,
     /// The early write of this window's list failed. The restore still goes
     /// ahead, and the file keeps its previous contents; the next change to
@@ -645,8 +666,7 @@ mod tests {
             listed("kept", Some("fable")),
             listed("reassigned", Some("ox")),
         ];
-        let chat = [listed("chat-kept", None)];
-        assert_eq!(snapshot.retain_known(Some(&code), Some(&chat)), 2);
+        assert_eq!(snapshot.retain_known(Some(&code)), 2);
         let ids: Vec<_> = snapshot
             .sessions
             .iter()
@@ -656,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_daemon_list_keeps_that_panes_sessions() {
+    fn an_unreadable_acp_list_keeps_code_and_leaves_chat_for_probing() {
         let mut snapshot = Snapshot::from_rows(
             &[
                 row(PaneKind::Acp, "code", "a", true),
@@ -664,8 +684,9 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(snapshot.retain_known(None, Some(&[])), 1);
-        assert_eq!(snapshot.sessions[0].session_id, "code");
+        let saved = snapshot.clone();
+        assert_eq!(snapshot.retain_known(None), 0);
+        assert_eq!(snapshot, saved);
     }
 
     fn rpc_on(
@@ -713,16 +734,16 @@ mod tests {
         assert_eq!(pruned.sessions[0].session_id, "alive");
         assert!(
             rx.try_recv().is_err(),
-            "no Chat list is fetched without Chat rows"
+            "no Chat history is probed without Chat rows"
         );
     }
 
     #[tokio::test]
-    async fn chat_sessions_survive_startup_without_a_complete_daemon_listing() {
+    async fn deleted_chat_session_is_skipped_at_restore() {
         let dir = tempfile::tempdir().unwrap();
         let target = "local:/run/chat-restore.sock";
         let saved = Snapshot::from_rows(
-            &[row(PaneKind::Chat, "jsonl-chat", "alpha", true)],
+            &[row(PaneKind::Chat, "deleted-chat", "alpha", true)],
             Some(PaneKind::Chat),
         );
         owned(dir.path(), target).save_if_changed(&saved).unwrap();
@@ -734,19 +755,67 @@ mod tests {
         });
         let (mut window, outcome) = tokio::select! {
             result = &mut startup => result.unwrap(),
-            line = rx.recv() => {
-                // JSONL sessions have no alias/channel metadata, so session/list
-                // succeeds with an empty list even when their transcripts exist.
-                let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
-                assert_eq!(request["method"], crate::client::method::SESSION_LIST);
+            Some(line) = rx.recv() => {
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], crate::client::method::SESSION_MESSAGES);
+                assert_eq!(request["params"]["session_id"], "deleted-chat");
+                assert_eq!(request["params"]["limit"], 1);
+                assert!(request["params"].get("before_index").is_none());
                 out.dispatch_response(
                     request["id"].as_str().unwrap(),
-                    Some(serde_json::json!({ "sessions": [] })),
+                    Some(serde_json::json!({ "messages": [], "total": 0, "start": 0 })),
                     None,
                 );
                 startup.await.unwrap()
             }
         };
+        assert_eq!(outcome.dropped, 1);
+        assert!(outcome.snapshot.unwrap().sessions.is_empty());
+        assert!(window.load().unwrap().sessions.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_sessions_survive_startup_without_a_complete_daemon_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = "local:/run/chat-restore.sock";
+        let saved = Snapshot::from_rows(
+            &[
+                row(PaneKind::Chat, "jsonl-chat", "alpha", true),
+                row(PaneKind::Chat, "older-chat", "alpha", false),
+            ],
+            Some(PaneKind::Chat),
+        );
+        owned(dir.path(), target).save_if_changed(&saved).unwrap();
+        let mut window = owned(dir.path(), target);
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let startup = tokio::spawn(async move {
+            let outcome = window.start(&client, true).await;
+            (window, outcome)
+        });
+        for _ in 0..2 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("restore should probe Chat history")
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            // JSONL sessions lack alias/channel metadata, so session/list can
+            // be empty even when their transcripts exist. Never use it here.
+            assert_eq!(request["method"], crate::client::method::SESSION_MESSAGES);
+            assert_eq!(request["params"]["limit"], 1);
+            assert!(request["params"].get("before_index").is_none());
+            let id = request["params"]["session_id"].as_str().unwrap();
+            assert!(matches!(id, "jsonl-chat" | "older-chat"));
+            out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({
+                    "messages": [{ "role": "user", "content": "stored history" }],
+                    "total": 3, "start": 2
+                })),
+                None,
+            );
+        }
+        let (mut window, outcome) = startup.await.unwrap();
         assert_eq!(outcome.dropped, 0);
         assert_eq!(outcome.snapshot.as_ref(), Some(&saved));
         assert_eq!(window.load(), Some(saved));
@@ -754,8 +823,125 @@ mod tests {
             .snapshot
             .unwrap()
             .resume_entries(crate::chat::MAX_TRACKED_SESSIONS_PER_PANE);
-        assert_eq!(chat[0].session_id, "jsonl-chat");
+        let ids: Vec<_> = chat.iter().map(|entry| entry.session_id.as_str()).collect();
+        assert_eq!(ids, ["jsonl-chat", "older-chat"]);
         assert!(code.is_empty());
+        assert!(rx.try_recv().is_err(), "Chat restore never fetches a list");
+    }
+
+    #[tokio::test]
+    async fn chat_restore_drops_only_the_specific_missing_session_refusal() {
+        use crate::jsonrpc::error_codes;
+
+        for (code, message, expected_dropped) in [
+            (
+                -32012,
+                "Session not found or not owned by this principal",
+                1,
+            ),
+            (
+                error_codes::INTERNAL_ERROR,
+                "Session not found or not owned by this principal",
+                0,
+            ),
+            (-32012, "Session environment differs", 0),
+            (
+                error_codes::INTERNAL_ERROR,
+                "Session persistence disabled",
+                0,
+            ),
+            (error_codes::SESSION_BUSY, "Session is busy", 0),
+        ] {
+            let (out, client, mut rx) = rpc_on(Transport::Local);
+            let saved = Snapshot::from_rows(
+                &[row(PaneKind::Chat, "chat", "alpha", true)],
+                Some(PaneKind::Chat),
+            );
+            let original = saved.clone();
+            let task = tokio::spawn(async move { prune_missing(&client, saved).await });
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("restore should probe Chat history")
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], crate::client::method::SESSION_MESSAGES);
+            out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                None,
+                Some(JsonRpcError {
+                    code,
+                    message: message.to_string(),
+                    data: None,
+                }),
+            );
+            let (restored, dropped) = task.await.unwrap();
+            assert_eq!(dropped, expected_dropped, "{code}: {message}");
+            if expected_dropped == 0 {
+                assert_eq!(restored, original, "{code}: {message}");
+            } else {
+                assert!(restored.sessions.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_restore_prunes_code_by_list_and_chat_by_history_in_order() {
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let saved = Snapshot::from_rows(
+            &[
+                row(PaneKind::Chat, "chat-first", "alpha", false),
+                row(PaneKind::Acp, "code-gone", "alpha", false),
+                row(PaneKind::Acp, "code-kept", "alpha", true),
+                row(PaneKind::Chat, "chat-gone", "alpha", false),
+                row(PaneKind::Chat, "chat-last", "alpha", true),
+            ],
+            Some(PaneKind::Acp),
+        );
+        let task = tokio::spawn(async move { prune_missing(&client, saved).await });
+        for _ in 0..4 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("restore should list Code or probe Chat")
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                crate::client::method::SESSION_LIST_ACP => serde_json::json!({
+                    "sessions": [{
+                        "session_id": "code-kept", "session_key": "code-kept",
+                        "created_at": "", "last_activity": "", "message_count": 2,
+                        "agent_alias": "alpha"
+                    }]
+                }),
+                crate::client::method::SESSION_MESSAGES => {
+                    assert_eq!(request["params"]["limit"], 1);
+                    assert!(request["params"].get("before_index").is_none());
+                    match request["params"]["session_id"].as_str().unwrap() {
+                        "chat-gone" => serde_json::json!({
+                            "messages": [], "total": 0, "start": 0
+                        }),
+                        "chat-first" | "chat-last" => serde_json::json!({
+                            "messages": [{ "role": "user", "content": "stored history" }],
+                            "total": 2, "start": 1
+                        }),
+                        id => panic!("unexpected Chat probe: {id}"),
+                    }
+                }
+                method => panic!("unexpected restore request: {method}"),
+            };
+            out.dispatch_response(request["id"].as_str().unwrap(), Some(result), None);
+        }
+        let (restored, dropped) = task.await.unwrap();
+        assert_eq!(dropped, 2);
+        let ids: Vec<_> = restored
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["chat-first", "code-kept", "chat-last"]);
+        assert_eq!(restored.start_pane(), Some(PaneKind::Acp));
+        assert!(restored.sessions[1].focused);
+        assert!(restored.sessions[2].focused);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

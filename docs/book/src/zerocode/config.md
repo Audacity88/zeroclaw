@@ -75,9 +75,13 @@ width = 24     # target width in terminal columns
 zerocode reopens the sessions that were open when it last quit, in the same
 order and with the same session focused, on the pane you left. The list is kept
 per daemon under `<config-dir>/open-sessions/`, and holds only session ids and
-agent aliases; transcripts stay with the daemon. Sessions the daemon no longer
-has are skipped with a notice. Queued messages and unsent drafts are not
-saved, and a turn that was running when zerocode quit is not resumed or rerun.
+agent aliases; transcripts stay with the daemon. Only Code sessions are pruned
+against the daemon's session list, with a notice for skipped sessions. Chat
+listings can be incomplete, so saved Chat sessions are checked against their
+stored transcripts instead. A Chat session with no stored history, for example
+one deleted while zerocode was closed, is skipped with the same notice.
+Queued messages and unsent drafts are not saved, and a turn that was running
+when zerocode quit is not resumed or rerun.
 Each zerocode window on a daemon keeps its own list. A second window starts
 empty the first time; close it and open it again while the first is still
 running, and it reopens the sessions the second window had. A session another
