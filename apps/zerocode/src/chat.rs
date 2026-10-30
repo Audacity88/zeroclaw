@@ -10106,8 +10106,15 @@ impl ChatState {
             .context_menu
             .take()
             .filter(|menu| matches!(menu.target, ChatContextMenuTarget::Queue(_)));
+        // Copy has already cleared its selection. A redraw may only be moving
+        // the viewport for the new info notice; validate feedback against the
+        // next snapshot rather than discarding it before that comparison.
+        let feedback = self
+            .copy_feedback
+            .filter(|_| self.transcript_selection.is_none());
         self.clear_transcript_selection();
         self.context_menu = queue_menu;
+        self.copy_feedback = feedback;
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
@@ -10291,7 +10298,40 @@ impl ChatState {
             .as_ref()
             .is_some_and(|current| current != &snapshot)
         {
+            let feedback = self.copy_feedback.and_then(|mut feedback| {
+                let current = self.transcript_snapshot.as_ref()?;
+                // Compare transcript-global rows, not their screen positions.
+                // Width or content changes invalidate the original copy target.
+                if current.area.width != snapshot.area.width
+                    || current.total_rows != snapshot.total_rows
+                    || !current
+                        .cells
+                        .keys()
+                        .any(|row| snapshot.cells.contains_key(row))
+                    || current.cells.iter().any(|(row, cells)| {
+                        snapshot.cells.get(row).is_some_and(|next| next != cells)
+                    })
+                {
+                    return None;
+                }
+                if let CopyFeedbackTarget::Overlay(mut rect) = feedback.target {
+                    let x =
+                        i32::from(rect.x) + i32::from(snapshot.area.x) - i32::from(current.area.x);
+                    let y = i32::from(rect.y) + i32::from(snapshot.area.y)
+                        - i32::from(current.area.y)
+                        + i32::from(current.scroll)
+                        - i32::from(snapshot.scroll);
+                    rect.x = u16::try_from(x).ok()?;
+                    rect.y = u16::try_from(y).ok()?;
+                    if rect.intersection(snapshot.area) != rect {
+                        return None;
+                    }
+                    feedback.target = CopyFeedbackTarget::Overlay(rect);
+                }
+                Some(feedback)
+            });
             self.clear_transcript_selection_for_render_change();
+            self.copy_feedback = feedback;
         }
         self.transcript_snapshot = Some(snapshot);
     }
@@ -14581,6 +14621,66 @@ mod tests {
                 "rendered: {rendered:?}"
             );
             assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_copy_badge_survives_app_notice_resize() {
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for outcome in [
+                crate::clipboard::CopyOutcome::Copied,
+                crate::clipboard::CopyOutcome::TerminalRequested,
+            ] {
+                for code_block in [false, true] {
+                    let (mut chat, _rx) = test_chat();
+                    chat.pane_kind = kind;
+                    let mut code = crate::acp::Acp::new(chat.rpc.clone());
+                    let mut active = state();
+                    for _ in 0..60 {
+                        active.entries.push(ChatEntry::AgentMessage(Arc::from(
+                            "message text\n\n```rust\nlet value = 1;\n```",
+                        )));
+                    }
+                    active.mark_dirty_full();
+                    chat.phase = ChatPhase::Active(Box::new(active));
+                    let (_, before) =
+                        draw_app_notice_frame(crate::app::Mode::Chat, &mut chat, &mut code);
+                    let active = active_state(&mut chat);
+                    let target = if code_block {
+                        let region = active
+                            .copy_hit_regions
+                            .iter()
+                            .rev()
+                            .find(|region| region.kind == CopyHitKind::Code)
+                            .expect("visible code copy target");
+                        CopyFeedbackTarget::Code(region.group)
+                    } else {
+                        let (_, rect) = active.entry_rects.last().expect("visible message");
+                        CopyFeedbackTarget::Overlay(
+                            centered_copy_feedback_rect(&outcome.label(), *rect)
+                                .expect("message feedback rect"),
+                        )
+                    };
+                    crate::clipboard::with_copy_result(Ok(outcome), || {
+                        assert_eq!(
+                            active.copy_text_and_clear_selection("copy payload"),
+                            Some(outcome)
+                        );
+                    });
+                    active.set_copy_feedback(target, outcome);
+                    let (rows, after) =
+                        draw_app_notice_frame(crate::app::Mode::Chat, &mut chat, &mut code);
+                    assert!(
+                        after.height < before.height,
+                        "notice must resize the transcript"
+                    );
+                    assert!(
+                        rows.iter().any(|row| row.contains(&outcome.label())),
+                        "first copy badge missing: {rows:?}"
+                    );
+                    assert!(active_state(&mut chat).copy_feedback.is_some());
+                }
+            }
         }
     }
 
