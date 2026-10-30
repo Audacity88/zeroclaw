@@ -596,10 +596,14 @@ async fn execute_one_tool_with_provenance(
 
     // This event has no model/history/observer projection. Release the bounded
     // previous-content observation only after the ordinary result is complete.
+    // Drop the pair if UI credential scrubbing would change either side, so
+    // the client falls back to its labelled preview without a misleading diff.
     if let Some(tx) = event_tx
         && let Ok(out) = &outcome
         && out.success
         && let Some(diff) = local_file_diff_capture.and_then(|capture| capture.take())
+        && scrub_credentials(diff.previous()) == diff.previous()
+        && scrub_credentials(diff.written()) == diff.written()
     {
         let _ = tx
             .send(TurnEvent::LocalFileDiff {
@@ -941,6 +945,99 @@ mod tests {
                 assert!(matches!(events[2], TurnEvent::LocalFileDiff { .. }));
             }
         }
+    }
+
+    async fn assert_local_file_diff_dropped_for_credentials(previous: &str, written: &str) {
+        use crate::approval::ApprovalManager;
+        use crate::tools::{FileReadTool, FileWriteTool};
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_api::local_file_diff::{LOCAL_FILE_DIFFS_ALLOWED, LocalFileDiff};
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        std::fs::write(workspace.join("note.txt"), previous).unwrap();
+        assert!(LocalFileDiff::new(previous.into(), written.into()).is_some());
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(FileWriteTool::new(security.clone())),
+            Box::new(FileReadTool::new(security)),
+        ];
+        let approval = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            auto_approve: vec!["file_read".into()],
+            ..RiskProfileConfig::default()
+        });
+        let observer = RecordingObserver::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let outcome = LOCAL_FILE_DIFFS_ALLOWED
+            .scope(
+                true,
+                execute_one_tool(
+                    "file_write",
+                    serde_json::json!({"path": "note.txt", "content": written}),
+                    Some("credential-write"),
+                    ToolDispatchContext {
+                        tools_registry: &tools,
+                        activated_tools: None,
+                        excluded_tools: &[],
+                        approval: Some(&approval),
+                        model_switch_callback: None,
+                    },
+                    &test_turn_meta(),
+                    &observer,
+                    None,
+                    None,
+                    Some(&tx),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.success, "{}", outcome.output);
+        assert!(outcome.error_reason.is_none());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            written
+        );
+        assert!(!outcome.output.contains("supersecretvalue"));
+        assert!(!observer.last_result().unwrap().contains("supersecretvalue"));
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, TurnEvent::LocalFileDiff { .. }));
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], TurnEvent::ToolCall { id, .. } if id == "credential-write"));
+        assert!(matches!(
+            &events[1],
+            TurnEvent::ToolResult { id, output, .. }
+                if id == "credential-write"
+                    && output.contains("Before write: existing file")
+                    && !output.contains("supersecretvalue")
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_executor_drops_previous_credentials() {
+        assert_local_file_diff_dropped_for_credentials(
+            "token=supersecretvalue\nunchanged\n",
+            "replacement\nunchanged\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_executor_drops_written_credentials() {
+        assert_local_file_diff_dropped_for_credentials(
+            "previous\nunchanged\n",
+            "token=supersecretvalue\nunchanged\n",
+        )
+        .await;
     }
 
     struct CaptureProbeTool {
