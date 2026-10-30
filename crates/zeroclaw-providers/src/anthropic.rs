@@ -9467,40 +9467,50 @@ data: {\"type\":\"message_stop\"}\n\n";
         // Serialized against the test that makes the extra-header client
         // fail to build through an invalid runtime proxy.
         let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
-        let (addr, captured, server) = spawn_capturing_server().await;
-        let provider = AnthropicModelProvider::builder("test")
-            .credential(Some("sk-ant-api-key"))
-            .base_url(&format!("http://{addr}"))
-            .extra_headers(&gateway_headers(&[
-                ("x-gateway-key", "gateway-secret"),
-                // A configured header the provider also sets: the provider's
-                // own credential must stay the only x-api-key value.
-                ("x-api-key", "should-not-win"),
-            ]))
-            .build();
+        for (credential, auth_header, expected_auth) in [
+            ("sk-ant-api-key", "x-api-key", "sk-ant-api-key"),
+            (
+                "sk-ant-oat01-test-token",
+                "authorization",
+                "Bearer sk-ant-oat01-test-token",
+            ),
+        ] {
+            let (addr, captured, server) = spawn_capturing_server().await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some(credential))
+                .base_url(&format!("http://{addr}"))
+                .extra_headers(&gateway_headers(&[
+                    ("x-gateway-key", "gateway-secret"),
+                    // Only the header actually set by the provider wins over
+                    // a configured default, in either credential mode.
+                    (auth_header, "should-not-win"),
+                ]))
+                .build();
 
-        let result = provider
-            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
-            .await;
-        server.abort();
-        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+            let result = provider
+                .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+                .await;
+            server.abort();
+            assert!(result.is_ok(), "chat failed: {:?}", result.err());
 
-        let (headers, _body) = captured
-            .lock()
-            .unwrap()
-            .take()
-            .expect("no request captured");
-        assert_eq!(
-            headers.get("x-gateway-key").and_then(|v| v.to_str().ok()),
-            Some("gateway-secret")
-        );
-        let api_keys: Vec<_> = headers.get_all("x-api-key").iter().collect();
-        assert_eq!(api_keys.len(), 1, "expected exactly one x-api-key header");
-        assert_eq!(api_keys[0].to_str().unwrap(), "sk-ant-api-key");
+            let (headers, _body) = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no request captured");
+            assert_eq!(
+                headers.get("x-gateway-key").and_then(|v| v.to_str().ok()),
+                Some("gateway-secret")
+            );
+            let auth_values: Vec<_> = headers.get_all(auth_header).iter().collect();
+            assert_eq!(auth_values.len(), 1, "expected exactly one {auth_header}");
+            assert_eq!(auth_values[0].to_str().unwrap(), expected_auth);
+        }
     }
 
     #[tokio::test]
     async fn extra_headers_reach_streaming_requests() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let (addr, captured, server) = spawn_capturing_server().await;
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("sk-ant-api-key"))
@@ -9808,6 +9818,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn extra_headers_streaming_redirects_stay_on_the_configured_host() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let servers = spawn_redirect_servers().await;
         let same = stream_hello(servers.provider("/same")).await;
         let cross = stream_hello(servers.provider("/cross")).await;
@@ -9872,6 +9883,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn extra_headers_streaming_redirects_stop_at_another_hostname_on_the_same_port() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let servers = spawn_redirect_servers().await;
         let same = stream_hello(servers.localhost_provider("/same")).await;
         let cross = stream_hello(servers.localhost_provider("/cross-host")).await;

@@ -3253,6 +3253,17 @@ mod tests {
                 &opts,
             )
             .expect("native anthropic provider constructs");
+        assert!(
+            !provider.supports_single_tool_rounds("claude-sonnet-4-5"),
+            "extra headers must preserve the custom-endpoint capability restriction"
+        );
+        let official_provider = AnthropicModelProviderConfig::default()
+            .create_provider("anthropic", Some("test-key"), None, &opts)
+            .expect("official anthropic provider constructs with extra headers");
+        assert!(
+            official_provider.supports_single_tool_rounds("claude-sonnet-4-5"),
+            "extra headers must preserve the official-endpoint capability"
+        );
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
             .chat(
