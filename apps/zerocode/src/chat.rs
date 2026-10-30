@@ -8472,7 +8472,15 @@ fn render_cost_limit_overlay(
     // Measure the same word wrapping used to render the complete disclosure
     // and timeout. A character-count estimate can hide their final lines.
     let body_rows = body_paragraph.line_count(width.saturating_sub(4).max(1));
-    let height = body_rows.saturating_add(5).min(usize::from(area.height)) as u16;
+    let override_w = crate::display_width::display_width(&override_label) as u16;
+    let stop_w = crate::display_width::display_width(&stop_label) as u16;
+    // Side by side when both labels fit with their gap; otherwise Stop
+    // above Override, so a narrow pane never clips either button.
+    let stacked = stop_w + 3 + override_w > width.saturating_sub(4);
+    let button_rows = if stacked { 2 } else { 1 };
+    let height = body_rows
+        .saturating_add(4 + button_rows)
+        .min(usize::from(area.height)) as u16;
     let modal = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -8495,25 +8503,37 @@ fn render_cost_limit_overlay(
         x: inner.x + 1,
         y: inner.y + 1,
         width: inner.width.saturating_sub(2),
-        height: inner.height.saturating_sub(3),
+        height: inner.height.saturating_sub(2 + button_rows as u16),
     };
     f.render_widget(body_paragraph, body);
 
     let row = inner.y + inner.height.saturating_sub(2);
-    let override_w = crate::display_width::display_width(&override_label) as u16;
-    let stop_w = crate::display_width::display_width(&stop_label) as u16;
+    let button_room = inner.width.saturating_sub(2);
     let stop_rect = Rect {
         x: inner.x + 1,
-        y: row,
-        width: stop_w.min(inner.width.saturating_sub(1)),
+        y: if stacked {
+            row.saturating_sub(1).max(inner.y)
+        } else {
+            row
+        },
+        width: stop_w.min(button_room),
         height: 1,
     };
-    let override_rect = Rect {
-        x: (stop_rect.x + stop_rect.width + 3).min(inner.x + inner.width),
-        y: row,
-        width: override_w
-            .min((inner.x + inner.width).saturating_sub(stop_rect.x + stop_rect.width + 3)),
-        height: 1,
+    let override_rect = if stacked {
+        Rect {
+            x: inner.x + 1,
+            y: row,
+            width: override_w.min(button_room),
+            height: 1,
+        }
+    } else {
+        Rect {
+            x: (stop_rect.x + stop_rect.width + 3).min(inner.x + inner.width),
+            y: row,
+            width: override_w
+                .min((inner.x + inner.width).saturating_sub(stop_rect.x + stop_rect.width + 3)),
+            height: 1,
+        }
     };
     f.render_widget(
         Paragraph::new(Span::styled(override_label, red)),
@@ -27304,7 +27324,7 @@ mod tests {
     fn cost_limit_notice_keeps_full_scope_timeout_and_buttons_visible() {
         use ratatui::{Terminal, backend::TestBackend};
 
-        for width in [76, 100] {
+        for width in [30, 40, 76, 100] {
             for period in ["day", "month"] {
                 let summary = format!(
                     "Cost limit is reached: $3.00 spent of $1.00. Override removes the shared \
@@ -27342,15 +27362,61 @@ mod tests {
                 );
                 let wait = crate::i18n::t_args("zc-chat-cost-limit-wait", &[("minutes", "10")]);
                 assert!(text.contains(&wait), "timeout at width {width}: {text}");
-                for (rect, key) in [
-                    (buttons.stop_rect, "zc-chat-cost-limit-stop"),
-                    (buttons.override_rect, "zc-chat-cost-limit-override"),
-                ] {
+                let full_labels = [
+                    format!(
+                        "{} ({})",
+                        crate::i18n::t("zc-chat-cost-limit-stop"),
+                        cost_limit_stop_key_labels().join("/")
+                    ),
+                    format!(
+                        "{} ({})",
+                        crate::i18n::t("zc-chat-cost-limit-override"),
+                        COST_LIMIT_OVERRIDE_CHORD.display()
+                    ),
+                ];
+                for (rect, expected) in [buttons.stop_rect, buttons.override_rect]
+                    .into_iter()
+                    .zip(&full_labels)
+                {
                     let label = (rect.x..rect.x + rect.width)
                         .map(|x| buffer[(x, rect.y)].symbol())
                         .collect::<String>();
-                    assert!(label.contains(&crate::i18n::t(key)), "{label}");
+                    // A label wider than the whole modal can only be cut at
+                    // its end; anything that fits must be shown whole.
+                    let fits = crate::display_width::display_width(expected) as u16 + 2
+                        <= modal_width.saturating_sub(4);
+                    let shown = if fits {
+                        expected.as_str()
+                    } else {
+                        expected
+                            .split(" (")
+                            .next()
+                            .unwrap_or(expected)
+                            .split(' ')
+                            .next()
+                            .unwrap_or(expected)
+                    };
+                    assert!(
+                        label.contains(shown),
+                        "whole button at width {width}: {label}"
+                    );
+                    assert!(rect.x + rect.width <= width, "button inside the pane");
                 }
+                let (stop, over) = (buttons.stop_rect, buttons.override_rect);
+                assert!(
+                    stop.y != over.y || stop.x + stop.width <= over.x,
+                    "buttons overlap at width {width}"
+                );
+                let pair = full_labels
+                    .iter()
+                    .map(|l| crate::display_width::display_width(l) as u16 + 2)
+                    .sum::<u16>()
+                    + 3;
+                assert_eq!(
+                    stop.y != over.y,
+                    pair > modal_width.saturating_sub(4),
+                    "stacked only when the pair cannot share a row (width {width})"
+                );
             }
         }
     }
