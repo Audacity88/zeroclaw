@@ -585,6 +585,7 @@ zc-config-status-alias-empty = El nombre del alias no puede estar vacío
 zc-config-status-alias-create-failed = Error al crear: { $err }
 zc-config-status-delete-failed = Error al eliminar: { $err }
 zc-config-status-field-reset = Restablecer { $prop }
+zc-config-status-reset-unavailable = No se puede restablecer este campo. Edita su valor.
 zc-config-status-load-failed = Error al cargar: { $err }
 zc-config-status-save-failed = Error al guardar: { $err }
 zc-config-status-personality-loading-file = Cargando { $filename }...

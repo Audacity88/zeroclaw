@@ -738,6 +738,7 @@ zc-config-alias-rename-confirm-target = { $path }: { $from } → { $to }
 zc-config-status-alias-create-failed = Create failed: { $err }
 zc-config-status-delete-failed = Delete failed: { $err }
 zc-config-status-field-reset = Reset { $prop }
+zc-config-status-reset-unavailable = Reset is unavailable for this field. Edit its value instead.
 zc-config-status-load-failed = Load failed: { $err }
 zc-config-status-save-failed = Save failed: { $err }
 zc-config-status-personality-loading-file = Loading { $filename }...

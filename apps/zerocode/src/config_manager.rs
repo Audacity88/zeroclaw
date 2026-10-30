@@ -1122,12 +1122,26 @@ impl App {
                     } else {
                         String::new()
                     };
+                    let reset_key = tab_key(T::Reset);
+                    let reset = if !reset_key.is_empty()
+                        && self
+                            .fields
+                            .get(self.field_cursor)
+                            .is_some_and(|field| self.field_reset_available(field))
+                    {
+                        format!(
+                            "  {}={}",
+                            reset_key,
+                            crate::i18n::t("zc-config-footer-action-reset"),
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        " {}={}  {}={}{}  ?={}",
+                        " {}={}{}{}  ?={}",
                         tab_key(T::Enter),
                         crate::i18n::t("zc-config-footer-action-edit"),
-                        tab_key(T::Reset),
-                        crate::i18n::t("zc-config-footer-action-reset"),
+                        reset,
                         rename,
                         help,
                     )
@@ -2311,6 +2325,28 @@ impl App {
 
     fn provider_alias_rename_available(&self) -> bool {
         self.provider_alias_rename_target().is_some()
+    }
+
+    fn field_reset_available(&self, field: &ConfigFieldEntry) -> bool {
+        if field.kind == PropKind::SecretMap {
+            return false;
+        }
+        // Configurable emits the full Rust type in config/list's type_hint.
+        // The daemon clears Option<T> on empty input; required scalars must
+        // instead parse it. Unknown type metadata must not enable a reset.
+        (field.type_hint.starts_with("Option<") && field.type_hint.ends_with('>'))
+            // Secret-map entries are String rows, but empty input removes
+            // their keys. Resolve their container from the same field list.
+            || (field.kind == PropKind::String
+                && field.is_secret
+                && self.fields.iter().any(|parent| {
+                    parent.kind == PropKind::SecretMap
+                        && field
+                            .path
+                            .strip_prefix(parent.path.as_str())
+                            .and_then(|suffix| suffix.strip_prefix('.'))
+                            .is_some_and(|key| !key.is_empty())
+                }))
     }
 
     fn start_alias_rename(&mut self) {
@@ -3630,6 +3666,11 @@ impl App {
             }
             Some(ConfigTabAction::Reset) if visible.contains(&self.field_cursor) => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
+                    if !self.field_reset_available(field) {
+                        self.status_msg =
+                            Some(crate::i18n::t("zc-config-status-reset-unavailable"));
+                        return Ok(());
+                    }
                     let prop = field.path.clone();
                     if let Screen::FieldList { prefix, .. } = &self.screen {
                         let prefix = prefix.clone();
@@ -3884,6 +3925,17 @@ impl App {
                 }
             }
             ConfigMutation::Reset { prop, prefix, tab } => {
+                if !self
+                    .fields
+                    .iter()
+                    .find(|field| field.path == prop)
+                    .is_some_and(|field| self.field_reset_available(field))
+                {
+                    self.show_mutation_outcome(crate::i18n::t(
+                        "zc-config-status-reset-unavailable",
+                    ));
+                    return Ok(());
+                }
                 match self.rpc.config_delete(&prop).await {
                     Ok(result) if result.prop != prop => {
                         self.status_msg = Some(crate::i18n::t("zc-config-confirm-target-mismatch"))
@@ -9854,7 +9906,7 @@ mod tests {
             path: path.to_string(),
             category: String::new(),
             kind: PropKind::String,
-            type_hint: String::new(),
+            type_hint: "Option<String>".into(),
             value: None,
             populated: false,
             is_secret: false,
@@ -10372,6 +10424,256 @@ mod tests {
                 .contains(&crate::i18n::t("zc-config-footer-action-delete"))
         );
         crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_reset_non_clearable_fields_do_not_offer_or_confirm_reset() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for (kind, type_hint, value) in [
+            (PropKind::Integer, "usize", serde_json::json!(20)),
+            (PropKind::Bool, "bool", serde_json::json!(true)),
+            (PropKind::Float, "f64", serde_json::json!(0.7)),
+            (PropKind::Enum, "StreamMode", serde_json::json!("auto")),
+            (PropKind::String, "String", serde_json::json!("configured")),
+            (
+                PropKind::StringArray,
+                "Vec<String>",
+                serde_json::json!(["a"]),
+            ),
+            (PropKind::Integer, "", serde_json::json!(20)),
+        ] {
+            let prop = "runtime_profiles.default.max_tool_iterations";
+            let mut configured = field(prop);
+            configured.kind = kind;
+            configured.type_hint = type_hint.into();
+            configured.value = Some(value);
+            configured.populated = true;
+            configured.is_secret = kind == PropKind::String;
+            let (mut manager, requests) = confirmation_manager(move |request| {
+                assert_eq!(request["method"], "config/list");
+                Ok(serde_json::json!({"entries": [configured.clone()]}))
+            });
+            manager
+                .load_fields("runtime_profiles.default")
+                .await
+                .unwrap();
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: "runtime_profiles.default".into(),
+                breadcrumb: vec!["runtime_profiles".into(), "default".into()],
+            };
+            manager.zeroclaw_pane = ZeroclawPane::Detail;
+            assert!(manager.fields[0].populated);
+            assert!(
+                !manager
+                    .bottom_hint()
+                    .contains(&crate::i18n::t("zc-config-footer-action-reset")),
+                "{kind:?} {type_hint}"
+            );
+            let before = requests.lock().unwrap().len();
+            let mut term = confirmation_term();
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert!(!manager.has_mutation_dialog(), "{kind:?} {type_hint}");
+            assert_eq!(
+                manager.status_msg,
+                Some(crate::i18n::t("zc-config-status-reset-unavailable"))
+            );
+            assert_eq!(manager.fields[0].path, prop);
+            assert!(manager.fields[0].populated);
+            assert_eq!(requests.lock().unwrap().len(), before);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_reset_clearable_fields_confirm_and_delete_once() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for (kind, type_hint, value, secret_map_entry) in [
+            (
+                PropKind::Integer,
+                "Option<usize>",
+                serde_json::json!(20),
+                false,
+            ),
+            (
+                PropKind::String,
+                "Option<String>",
+                serde_json::json!("configured"),
+                false,
+            ),
+            (
+                PropKind::Float,
+                "Option<f64>",
+                serde_json::json!(0.7),
+                false,
+            ),
+            (
+                PropKind::Bool,
+                "Option<bool>",
+                serde_json::json!(true),
+                false,
+            ),
+            // Secret-map keys can contain dots and do not have Option types.
+            (PropKind::String, "String", serde_json::json!("****"), true),
+        ] {
+            let prefix = if secret_map_entry {
+                "mcp.servers.test"
+            } else {
+                "runtime_profiles.default"
+            };
+            let prop = if secret_map_entry {
+                "mcp.servers.test.env.HEADER.NAME"
+            } else {
+                "runtime_profiles.default.limit"
+            };
+            let mut configured = field(prop);
+            configured.kind = kind;
+            configured.type_hint = type_hint.into();
+            configured.value = Some(value);
+            configured.populated = true;
+            configured.is_secret = secret_map_entry;
+            let mut entries = vec![configured];
+            if secret_map_entry {
+                entries.push(secret_map_field("mcp.servers.test.env"));
+            }
+            let (mut manager, requests) = confirmation_manager(move |request| {
+                if request["method"] == "config/list" {
+                    Ok(serde_json::json!({"entries": entries.clone()}))
+                } else {
+                    confirmation_response(request)
+                }
+            });
+            manager.load_fields(prefix).await.unwrap();
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: prefix.into(),
+                breadcrumb: vec![prefix.into()],
+            };
+            manager.zeroclaw_pane = ZeroclawPane::Detail;
+            let reset_hint = format!("d={}", crate::i18n::t("zc-config-footer-action-reset"));
+            assert!(manager.bottom_hint().contains(&reset_hint));
+            crate::keymap::overrides::set_row("config_tab", "delete_row", vec![]);
+            assert!(
+                !manager
+                    .bottom_hint()
+                    .contains(&crate::i18n::t("zc-config-footer-action-reset"))
+            );
+            crate::keymap::overrides::set_row(
+                "config_tab",
+                "delete_row",
+                vec![crate::keymap::Chord::char('z')],
+            );
+            assert!(manager.bottom_hint().contains(&format!(
+                "z={}",
+                crate::i18n::t("zc-config-footer-action-reset")
+            )));
+            let before = requests.lock().unwrap().len();
+            let mut term = confirmation_term();
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                manager.pending_mutation().map(|pending| &pending.action),
+                Some(ConfigMutation::Reset { prop: target, .. }) if target == prop
+            ));
+            assert_eq!(requests.lock().unwrap().len(), before);
+            draw_and_arm_mutation_dialog(&mut manager);
+            manager
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await
+                .unwrap();
+            assert!(matches!(
+                manager.mutation_dialog.as_ref(),
+                Some(ConfigMutationDialog::Outcome { message, .. })
+                    if message == &crate::i18n::t_args("zc-config-status-field-reset", &[("prop", prop)])
+            ));
+            let recorded = requests.lock().unwrap();
+            let deletes: Vec<_> = recorded
+                .iter()
+                .filter(|request| request["method"] == "config/delete")
+                .collect();
+            assert_eq!(deletes.len(), 1);
+            assert_eq!(deletes[0]["params"], serde_json::json!({"prop": prop}));
+            assert_eq!(recorded.len(), before + 2);
+            crate::keymap::overrides::reset();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_reset_confirmation_rechecks_clearability_without_rpc() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for missing in [false, true] {
+            let (mut manager, requests) = confirmation_manager(confirmation_response);
+            prepare_alias_confirmation(&mut manager);
+            let mut configured = field("runtime_profiles.default.max_tool_iterations");
+            configured.kind = PropKind::Integer;
+            configured.type_hint = "Option<usize>".into();
+            configured.value = Some(serde_json::json!(20));
+            configured.populated = true;
+            manager.fields = vec![configured];
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: "runtime_profiles.default".into(),
+                breadcrumb: vec!["runtime_profiles".into(), "default".into()],
+            };
+            let mut term = confirmation_term();
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert!(manager.has_pending_mutation());
+            // A pending intent must not bypass newer field metadata.
+            if missing {
+                manager.fields.clear();
+            } else {
+                manager.fields[0].type_hint = "usize".into();
+            }
+            draw_and_arm_mutation_dialog(&mut manager);
+            let before = requests.lock().unwrap().len();
+            manager
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await
+                .unwrap();
+            assert!(matches!(
+                manager.mutation_dialog.as_ref(),
+                Some(ConfigMutationDialog::Outcome { message, .. })
+                    if message == &crate::i18n::t("zc-config-status-reset-unavailable")
+            ));
+            assert_eq!(requests.lock().unwrap().len(), before);
+        }
     }
 
     #[tokio::test]

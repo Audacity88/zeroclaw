@@ -585,6 +585,7 @@ zc-config-status-alias-empty = エイリアス名は空にできません
 zc-config-status-alias-create-failed = 作成に失敗しました: { $err }
 zc-config-status-delete-failed = 削除に失敗しました: { $err }
 zc-config-status-field-reset = { $prop } をリセットしました
+zc-config-status-reset-unavailable = この項目はリセットできません。値を編集してください。
 zc-config-status-load-failed = 読み込みに失敗しました: { $err }
 zc-config-status-save-failed = 保存に失敗しました: { $err }
 zc-config-status-personality-loading-file = { $filename } を読み込み中...
