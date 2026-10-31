@@ -3621,6 +3621,25 @@ impl Agent {
         ))
     }
 
+    /// Put the system prompt at the head of history when it is missing: a
+    /// new session, or a restored one whose seed-time build failed (seeding
+    /// keeps the conversation either way). A build error fails the turn
+    /// rather than sending the conversation without its instructions.
+    fn ensure_system_prompt(&mut self) -> Result<()> {
+        if matches!(
+            self.history.first(),
+            Some(ConversationMessage::Chat(message)) if message.role == "system"
+        ) {
+            return Ok(());
+        }
+        let system_prompt = self.build_system_prompt()?;
+        self.history.insert(
+            0,
+            ConversationMessage::Chat(ChatMessage::system(system_prompt)),
+        );
+        Ok(())
+    }
+
     fn rebuild_system_prompt_for_dispatcher(
         &mut self,
         dispatcher: &dyn ToolDispatcher,
@@ -4040,13 +4059,7 @@ impl Agent {
             ));
         }
 
-        if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
-        }
+        self.ensure_system_prompt()?;
 
         // Pin one config generation for this whole turn BEFORE resolving a
         // route, so the provider this turn may rebuild and the limits it
@@ -4574,19 +4587,12 @@ impl Agent {
         }
 
         // ── Preamble (identical to turn) ───────────────────────────────
-        if self.history.is_empty() {
-            let system_prompt = self
-                .build_system_prompt()
-                .map_err(|error| StreamedTurnError {
-                    error,
-                    committed_response: String::new(),
-                    new_messages: Vec::new(),
-                })?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
-        }
+        self.ensure_system_prompt()
+            .map_err(|error| StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            })?;
 
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
         // Pin one config generation for this whole turn BEFORE resolving a
@@ -9267,6 +9273,60 @@ mod tests {
             assert!(snapshot.text.contains("SURVIVING_MARKDOWN"));
             assert!(!agent.reload_personality().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn resumed_history_gets_its_system_prompt_once_the_identity_loads() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let identity = workspace.path().join("identity.json");
+        std::fs::write(&identity, "{invalid JSON").unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "SURVIVING_MARKDOWN").unwrap();
+        let mut agent = personality_snapshot_test_agent(workspace.path());
+        agent.identity_config = zeroclaw_config::schema::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+
+        // The seed keeps the conversation even though the prompt build fails.
+        agent.seed_history(&[
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ]);
+        assert_eq!(agent.history.len(), 2);
+        assert!(!matches!(&agent.history[0], ConversationMessage::Chat(m) if m.role == "system"));
+
+        // A turn must not go out without the system instructions.
+        let error = agent
+            .turn("next question")
+            .await
+            .expect_err("the turn must fail while the identity cannot load");
+        assert!(
+            error.to_string().contains("Could not load AIEOS identity"),
+            "{error}"
+        );
+        assert!(
+            !agent
+                .history
+                .iter()
+                .any(|m| matches!(m, ConversationMessage::Chat(m) if m.role == "system"))
+        );
+
+        std::fs::write(
+            &identity,
+            r#"{"identity":{"names":{"first":"AIEOS_RECOVERED_IDENTITY"}}}"#,
+        )
+        .unwrap();
+        agent.ensure_system_prompt().unwrap();
+        let ConversationMessage::Chat(system) = &agent.history[0] else {
+            panic!("system message");
+        };
+        assert_eq!(system.role, "system");
+        assert!(system.content.contains("AIEOS_RECOVERED_IDENTITY"));
+        assert!(matches!(&agent.history[1], ConversationMessage::Chat(m) if m.content == "hello"));
+        let len = agent.history.len();
+        agent.ensure_system_prompt().unwrap();
+        assert_eq!(agent.history.len(), len, "the prompt is added only once");
     }
 
     #[test]

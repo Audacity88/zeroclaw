@@ -192,18 +192,7 @@ pub(crate) fn render_identity_snapshot(
     } else {
         personality::personality_files_without_memory()
     };
-    let profile = personality::load_personality_files(agent_workspace_dir, &filenames);
-    // The shared loader treats an unreadable file like a missing one. Recheck
-    // only the files it skipped, so a file that exists but cannot be read
-    // fails the capture instead of being frozen out of the session.
-    for name in &profile.missing {
-        match std::fs::read_to_string(agent_workspace_dir.join(name)) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                anyhow::bail!("Could not read personality file {name}: {error}");
-            }
-            _ => {}
-        }
-    }
+    let profile = capture_personality_profile(agent_workspace_dir, &filenames)?;
     let aieos = if let Some(config) = identity_config
         && identity::is_aieos_configured(config)
     {
@@ -220,6 +209,52 @@ pub(crate) fn render_identity_snapshot(
         None
     };
     Ok(render_identity_with_aieos(&profile, aieos.as_ref()))
+}
+
+/// How many times a capture is retried when a skipped file turns out to
+/// have text on the recheck (an editor saving it mid-read).
+const PERSONALITY_CAPTURE_ATTEMPTS: usize = 3;
+
+/// The shared loader treats an unreadable or empty file like a missing one.
+/// Recheck only the files it skipped: one that exists but cannot be read
+/// fails the capture, and one that now has text means the file changed
+/// during the read, so the whole profile is read again rather than pinning
+/// a snapshot that lacks it.
+fn capture_personality_profile(
+    agent_workspace_dir: &Path,
+    filenames: &[&str],
+) -> Result<personality::PersonalityProfile> {
+    capture_personality_profile_with(agent_workspace_dir, || {
+        personality::load_personality_files(agent_workspace_dir, filenames)
+    })
+}
+
+fn capture_personality_profile_with(
+    agent_workspace_dir: &Path,
+    mut load: impl FnMut() -> personality::PersonalityProfile,
+) -> Result<personality::PersonalityProfile> {
+    let mut changed = None;
+    for _ in 0..PERSONALITY_CAPTURE_ATTEMPTS {
+        let profile = load();
+        changed = None;
+        for name in &profile.missing {
+            match std::fs::read_to_string(agent_workspace_dir.join(name)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    anyhow::bail!("Could not read personality file {name}: {error}");
+                }
+                Ok(raw) if !raw.trim().is_empty() => {
+                    changed = Some(name.clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if changed.is_none() {
+            return Ok(profile);
+        }
+    }
+    let name = changed.unwrap_or_default();
+    anyhow::bail!("Personality file {name} kept changing while it was being read")
 }
 
 fn render_identity_with_profile(
@@ -708,6 +743,54 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
+
+    #[test]
+    fn personality_capture_rereads_a_file_that_gained_text_during_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "be kind").unwrap();
+        let mut loads = 0;
+        let profile = capture_personality_profile_with(dir.path(), || {
+            loads += 1;
+            if loads == 1 {
+                // The first read saw the file mid-save, empty.
+                personality::PersonalityProfile {
+                    missing: vec!["SOUL.md".to_string()],
+                    ..Default::default()
+                }
+            } else {
+                personality::load_personality_files(dir.path(), &["SOUL.md"])
+            }
+        })
+        .unwrap();
+        assert_eq!(loads, 2);
+        assert!(profile.missing.is_empty());
+        assert_eq!(profile.files[0].content, "be kind");
+    }
+
+    #[test]
+    fn personality_capture_fails_when_a_file_keeps_changing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "be kind").unwrap();
+        let mut loads = 0;
+        let error = capture_personality_profile_with(dir.path(), || {
+            loads += 1;
+            personality::PersonalityProfile {
+                missing: vec!["SOUL.md".to_string()],
+                ..Default::default()
+            }
+        })
+        .unwrap_err();
+        assert_eq!(loads, PERSONALITY_CAPTURE_ATTEMPTS);
+        assert!(error.to_string().contains("SOUL.md"), "{error}");
+    }
+
+    #[test]
+    fn personality_capture_accepts_files_that_are_really_missing_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("USER.md"), "  \n").unwrap();
+        let profile = capture_personality_profile(dir.path(), &["SOUL.md", "USER.md"]).unwrap();
+        assert_eq!(profile.missing, ["SOUL.md", "USER.md"]);
+    }
 
     zeroclaw_api::mock_tool_attribution!(TestTool);
     zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
