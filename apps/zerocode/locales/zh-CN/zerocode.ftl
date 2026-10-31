@@ -456,6 +456,7 @@ zc-chat-elicitation-answered = 你的回答：{ $answer }
 zc-chat-elicitation-cancelled = 你未作答就关闭了该问题。
 zc-chat-elicitation-withdrawn = 在你作答前该问题已关闭（视图已重新加载）。已告知代理该问题被取消。
 zc-chat-elicitation-expired = 代理已不再等待该问题的回答。
+zc-chat-elicitation-outcome-note = { $outcome }（问题：{ $question }）
 zc-chat-session-restarted = 已启动新会话。
 zc-chat-session-cap = 已达到此面板的会话上限（{ $max }）。请先从侧栏关闭一个会话。
 zc-chat-resume-dropped = 有 { $count } 个先前会话无法重新连接，已保留以便重试。

@@ -484,6 +484,19 @@ enum SessionError {
     ResyncFailed,
 }
 
+/// The fallback outcome line, naming the question it settles. A blank
+/// question leaves the outcome alone.
+fn elicitation_outcome_note(question: &str, outcome: &str) -> String {
+    let question = question.trim();
+    if question.is_empty() {
+        return outcome.to_string();
+    }
+    crate::i18n::t_args(
+        "zc-chat-elicitation-outcome-note",
+        &[("outcome", outcome), ("question", question)],
+    )
+}
+
 /// Classify a failed turn's daemon error text for `SessionError`. Single
 /// source of the daemon's session-loss sentinel string (`session_not_found`,
 /// see `handle_session_prompt`): the session must be re-attached before the
@@ -11656,13 +11669,15 @@ impl ChatState {
     /// (the router drains inbound requests before notifications), which is
     /// why nothing is written on arrival. With no matching card (an older
     /// history, a card that never arrived) the line is appended so the
-    /// outcome is still on record.
+    /// outcome is still on record, and it names the question because no
+    /// card shows it.
     fn record_elicitation_outcome(&mut self, question: &str, text: String) {
         if self.elicitation_card_index(question).is_some() {
             return;
         }
-        self.entries
-            .push(ChatEntry::SystemMessage(Arc::<str>::from(text)));
+        self.entries.push(ChatEntry::SystemMessage(Arc::<str>::from(
+            elicitation_outcome_note(question, &text),
+        )));
         self.mark_dirty_append();
     }
 
@@ -31570,14 +31585,14 @@ mod tests {
             raw_output: "Yes".to_string(),
         });
         s.record_elicitation_outcome("Pick one", "new withdrawal".to_string());
-        assert!(system_texts(&s).contains(&"new withdrawal".to_string()));
+        assert!(system_texts(&s).contains(&elicitation_outcome_note("Pick one", "new withdrawal")));
 
         // An unanswered card from a prior user turn cannot match either.
         let mut s = state();
         stream_ask_user_turn(&mut s);
         s.push_user_message(Some("Next turn".to_string()), Vec::new());
         s.record_elicitation_outcome("Pick one", "new expiry".to_string());
-        assert!(system_texts(&s).contains(&"new expiry".to_string()));
+        assert!(system_texts(&s).contains(&elicitation_outcome_note("Pick one", "new expiry")));
     }
 
     #[tokio::test]
@@ -31612,8 +31627,10 @@ mod tests {
         });
         chat.answer_withdrawn_elicitations();
         assert!(
-            system_texts(active_state(&mut chat))
-                .contains(&crate::i18n::t("zc-chat-elicitation-withdrawn"))
+            system_texts(active_state(&mut chat)).contains(&elicitation_outcome_note(
+                "Pick a fruit",
+                &crate::i18n::t("zc-chat-elicitation-withdrawn")
+            ))
         );
         assert!(
             writer_rx.try_recv().is_err(),
@@ -31734,7 +31751,12 @@ mod tests {
         assert_eq!(frame["result"]["action"], "cancel");
         let state = active_state(&mut chat);
         assert!(state.pending_elicitation.is_none());
-        let withdrawn = crate::i18n::t("zc-chat-elicitation-withdrawn");
+        let withdrawn =
+            elicitation_outcome_note("Pick one", &crate::i18n::t("zc-chat-elicitation-withdrawn"));
+        assert!(
+            withdrawn.contains("Pick one"),
+            "the note names the dropped question"
+        );
         assert_eq!(
             system_texts(state).last(),
             Some(&withdrawn),
@@ -31922,7 +31944,10 @@ mod tests {
             "nobody is waiting on a prompt once its turn ends"
         );
         assert!(
-            system_texts(&s).contains(&crate::i18n::t("zc-chat-elicitation-expired")),
+            system_texts(&s).contains(&elicitation_outcome_note(
+                "Pick a fruit",
+                &crate::i18n::t("zc-chat-elicitation-expired")
+            )),
             "the unanswered outcome is recorded"
         );
         let withdrawn = s.take_withdrawn_elicitations();

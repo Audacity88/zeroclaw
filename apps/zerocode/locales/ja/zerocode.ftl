@@ -456,6 +456,7 @@ zc-chat-elicitation-answered = あなたの回答: { $answer }
 zc-chat-elicitation-cancelled = 回答せずに質問を閉じました。
 zc-chat-elicitation-withdrawn = 回答する前に質問が閉じられました（表示が再読み込みされました）。エージェントにはキャンセルとして伝えられました。
 zc-chat-elicitation-expired = エージェントは質問への回答を待つのをやめました。
+zc-chat-elicitation-outcome-note = { $outcome }（質問: { $question }）
 zc-chat-session-restarted = 新しいセッションを開始しました。
 zc-chat-session-cap = このペインのセッション上限（{ $max }）に達しました。先にサイドバーからセッションを閉じてください。
 zc-chat-resume-dropped = 以前のセッション { $count } 件を再接続できなかったため、再試行用に保持しました。

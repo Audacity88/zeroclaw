@@ -456,6 +456,7 @@ zc-chat-elicitation-answered = Respondiste: { $answer }
 zc-chat-elicitation-cancelled = Descartaste la pregunta sin responder.
 zc-chat-elicitation-withdrawn = La pregunta se cerró antes de que respondieras (la vista se recargó). Se le indicó al agente que se canceló.
 zc-chat-elicitation-expired = El agente dejó de esperar una respuesta a su pregunta.
+zc-chat-elicitation-outcome-note = { $outcome } (Pregunta: { $question })
 zc-chat-session-restarted = Nueva sesión iniciada.
 zc-chat-session-cap = Límite de sesiones de este panel alcanzado ({ $max }). Cierra antes una sesión desde la barra lateral.
 zc-chat-resume-dropped = No se pudieron reconectar { $count } sesión(es) anteriores y se conservaron para reintentarlo.
