@@ -1355,6 +1355,14 @@ impl Chat {
                 .iter()
                 .any(|entry| entry.session_id == session_id)
         {
+            if self.focused_environment_refusal()
+                && self
+                    .resume_focused
+                    .as_ref()
+                    .is_some_and(|entry| entry.session_id != session_id)
+            {
+                self.demote_focused_resume_to_background();
+            }
             return self.retry_retained_session(session_id).await;
         }
         let Some(idx) = self
@@ -1364,6 +1372,13 @@ impl Chat {
         else {
             return false;
         };
+        // Leaving a refused restore notice for a working session: the refused
+        // entry stops being the focused one, so closing it later cannot
+        // replace the session the user switched to. A retained entry that is
+        // not on screen (a pending reconnect) keeps its slot.
+        if self.focused_environment_refusal() {
+            self.demote_focused_resume_to_background();
+        }
         let incoming = self.background.remove(idx);
         // Swap with the focused session; a non-Active phase (picker, error)
         // is simply replaced — clicking a session row leaves those flows.
@@ -1458,10 +1473,19 @@ impl Chat {
             .background
             .iter()
             .position(|s| s.session_id == session_id);
-        let retained_was_focused = self
-            .resume_focused
-            .as_ref()
-            .is_some_and(|entry| entry.session_id == session_id);
+        // A refused entry owns the pane only while its notice is on screen.
+        // With a live session focused it is closed like a background row, so
+        // the live session stays put.
+        let retained_unfocused = matches!(self.phase, ChatPhase::Active(_))
+            && self
+                .resume_focused
+                .as_ref()
+                .is_some_and(|entry| entry.session_id == session_id && entry.environment_refused);
+        let retained_was_focused = !retained_unfocused
+            && self
+                .resume_focused
+                .as_ref()
+                .is_some_and(|entry| entry.session_id == session_id);
         let retained_background = self
             .resume_backgrounds
             .iter()
@@ -1469,6 +1493,7 @@ impl Chat {
         if !was_focused
             && in_background.is_none()
             && !retained_was_focused
+            && !retained_unfocused
             && retained_background.is_none()
         {
             return false;
@@ -1526,6 +1551,8 @@ impl Chat {
             self.background.remove(idx);
         } else if let Some(idx) = retained_background {
             self.resume_backgrounds.remove(idx);
+        } else if retained_unfocused {
+            self.resume_focused = None;
         } else {
             if retained_was_focused {
                 self.resume_focused = None;
@@ -23696,6 +23723,58 @@ mod tests {
                 )
                 .await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_refused_entry_after_switching_away_keeps_the_working_session() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            let (mut chat, rpc, mut rx) = restore_with_refused_entry(
+                pane,
+                true,
+                -32012,
+                "Session environment differs from the current terminal",
+            )
+            .await;
+            assert!(matches!(chat.phase, ChatPhase::Error(_)));
+            assert!(chat.focus_session("saved-bg").await);
+            assert_eq!(chat.current_session_id(), Some("saved-bg"));
+            let rows = chat.session_summaries();
+            assert!(
+                rows.iter()
+                    .any(|row| row.session_id == "saved-focused" && !row.focused),
+                "the refused row stays listed but loses focus"
+            );
+
+            let close = tokio::spawn(async move {
+                let closed = chat.close_session("saved-focused").await;
+                (chat, closed)
+            });
+            let request = next_rpc_request(&mut rx, "closing the refused row closes it").await;
+            assert_eq!(request["method"], method::SESSION_CLOSE);
+            assert_eq!(request["params"]["session_id"], "saved-focused");
+            respond_ok(&rpc, &request, serde_json::json!({}));
+            let (mut chat, closed) = tokio::time::timeout(Duration::from_secs(2), close)
+                .await
+                .expect("close completes")
+                .unwrap();
+            assert!(closed);
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("the working session must stay on screen");
+            };
+            assert_eq!(state.session_id, "saved-bg");
+            assert_eq!(
+                chat.session_summaries()
+                    .iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["saved-bg"]
+            );
+            assert_no_rpc_request(&mut rx, "closing the refused row sends nothing else").await;
+            let _ = &mut chat;
         }
     }
 
