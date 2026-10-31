@@ -8471,6 +8471,7 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
 /// there, so the notice comes back with the error and the user can answer
 /// again. A failure without a reply (a timeout) is reported, but the notice
 /// is not restored, because the daemon may already have taken the answer.
+/// A refusal that also stopped the turn is cleared by its `TurnComplete`.
 async fn answer_cost_limit(
     rpc: &RpcClient,
     state: &mut ChatState,
@@ -12041,6 +12042,17 @@ impl ChatState {
                     .is_some_and(|generation| generation != self.turn_generation)
                 {
                     return;
+                }
+                // A cost-limit notice belongs to its turn. One brought back
+                // after a refused answer must not outlive the turn that the
+                // refusal (or anything else) ended.
+                if self
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(PendingApproval::is_cost_limit)
+                {
+                    self.pending_approval = None;
+                    self.cost_limit_buttons = None;
                 }
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
@@ -27614,6 +27626,18 @@ mod tests {
                 .contains("approval rights belong to another client"),
             "{}",
             notice.text
+        );
+
+        // Some refusals also stop the turn: its end clears the notice.
+        let sid = state.session_id.clone();
+        state.apply_update(turn_complete(
+            &sid,
+            TurnEndOutcome::Failed,
+            "cost override refused",
+        ));
+        assert!(
+            state.pending_approval().is_none(),
+            "a finished turn must not leave its cost-limit notice up"
         );
     }
 
