@@ -1,0 +1,9 @@
+PR #11621: live steer-ending evidence. Head 46f3999a5, built on the Linux box (x86_64), 2026-10-30 ~20:11 to 20:16 ET.
+Binaries: zeroclaw and zerocode compiled from the w11621 worktree at 46f3999a5 (the build log shows "Compiling zerocode v0.8.7 (.../w11621/apps/zerocode)" and "Compiling zeroclaw v0.8.7 (.../w11621)").
+Provider: the local OpenAI-compatible stub (stub.py) on 127.0.0.1:18092. "FAILSLOW" on the last user line waits 20 s, then returns HTTP 400. "SLOW" delays a normal answer by 25 s.
+
+S01  "FAILSLOW Summarize notes.txt again" is running; "Keep it under ten words" is steered in and accepted (shown as You: while still working).
+S02  The provider fails the turn (yellow rejection row). The footer shows zc-steer-ended-early: "This turn ended early; a message you sent into it may not have been read. Check before sending it again."
+S03  "SLOW ..." is running. The daemon process is paused (SIGSTOP), and "Mention the release date too" is steered. The steer RPC passes its 5 s timeout (SteerOutcome::Unknown). The text is back in the input, and the footer shows zc-steer-unconfirmed: "Couldn't confirm the running turn got your message; it's back in the input. It may already have arrived, so check before sending again."
+S04  After SIGCONT, the daemon reads the queued steer. The answer covers both lines, which shows why the notice says "it may already have arrived". The text stays in the input so it is not resent automatically.
+The cancel-after-steer state was captured earlier in issuecomment-6514782111. A long-running tool call was not captured: this stub has no tool calls.

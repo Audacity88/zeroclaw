@@ -1,0 +1,8 @@
+20:11:13 POST /v1/chat/completions -> 400 (FAILSLOW)
+20:11:33 POST /v1/chat/completions -> 400 (FAILSLOW)
+20:13:02 POST /v1/chat/completions -> 400 (FAILSLOW)
+20:13:22 POST /v1/chat/completions -> 400 (FAILSLOW)
+20:14:16 POST /v1/chat/completions -> 400 (FAILSLOW)
+20:14:36 POST /v1/chat/completions -> 400 (FAILSLOW)
+20:15:52 POST /v1/chat/completions stream=True last=user fin=stop
+20:15:52 POST /v1/chat/completions stream=True last=user fin=stop

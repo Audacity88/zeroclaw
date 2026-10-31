@@ -1,0 +1,19 @@
+schema_version = 3
+
+[providers.models.custom.stub]
+uri = "http://127.0.0.1:18092/v1"
+model = "stub-model"
+wire_api = "chat_completions"
+native_tools = false
+
+[agents.stub]
+model_provider = "custom.stub"
+risk_profile = "ev"
+runtime_profile = "ev"
+
+[risk_profiles.ev]
+level = "supervised"
+allowed_tools = []
+
+[runtime_profiles.ev]
+agentic = false
