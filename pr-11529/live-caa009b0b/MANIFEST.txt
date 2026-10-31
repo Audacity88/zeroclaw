@@ -1,0 +1,12 @@
+PR #11529: live clipboard-delivery evidence. Linux box (Debian 13, x86_64, X11 DISPLAY=:15), xfce4-terminal 1.1.4 (VTE 0.80.1-1, the terminal library GNOME Terminal uses). 2026-10-30 ~20:28 to 20:38 ET.
+Builds: "after" is zeroclaw + zerocode from PR head caa009b0bd0e (log line "Compiling zerocode v0.8.7 (.../w11529/apps/zerocode)"). "Before" is zerocode from master 5a51398dd5, this PR's merge base, built in a separate target dir. Both clients talk to the same daemon from the PR build. This PR does not change the daemon.
+Writer: xclip 0.13-4. Before each copy the clipboard was primed with a sentinel; it was read back with "xclip -o -selection clipboard" right after the copy.
+Provider: the local stub (stub.py) on 127.0.0.1:18093.
+
+B01 master 5a51398dd, xclip installed, right-click message > Copy: the footer says "Copied to clipboard", but the clipboard still reads [UNCHANGED-SENTINEL-MASTER]. VTE ignores OSC 52. This is #11418.
+A01 PR caa009b0b: the right-click Copy menu on the agent message.
+A02 PR, xclip on PATH: "Copied to clipboard", and the clipboard reads [Answer to: Name one use of a clipboard].
+A03 PR, no xclip/wl-copy on PATH (zcn.sh, a PATH without xclip): the footer says "Copy requested through terminal; delivery is unconfirmed", and the clipboard still reads [UNCHANGED-SENTINEL]. The terminal ignored the request, and the PR says so.
+A04 PR, a failing xclip first on PATH (failing-xclip.sh, exit 1): the footer says "Could not copy: clipboard writer exited with exit status: 1", and the clipboard still reads [UNCHANGED-SENTINEL-2].
+A05 PR, composer: "draft line to cut" selected (top), Ctrl+X (middle: composer empty, "Copied to clipboard", clipboard reads [draft line to cut]), Ctrl+Z (bottom: text restored).
+Not covered here: Wayland/wl-copy, SSH with an OSC 52 terminal, and code-block, Logs and queue copy targets.
