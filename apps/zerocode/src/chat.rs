@@ -1355,15 +1355,25 @@ impl Chat {
                 .iter()
                 .any(|entry| entry.session_id == session_id)
         {
-            if self.focused_environment_refusal()
-                && self
-                    .resume_focused
+            // Switching from a refused notice to another retained entry
+            // demotes the refused one. If the switch fails, it goes back to
+            // being the focused entry, so its notice and recovery still work.
+            let demoted_refusal = if self.focused_environment_refusal() {
+                self.resume_focused
                     .as_ref()
-                    .is_some_and(|entry| entry.session_id != session_id)
-            {
+                    .filter(|entry| entry.session_id != session_id)
+                    .map(|entry| entry.session_id.clone())
+            } else {
+                None
+            };
+            if demoted_refusal.is_some() {
                 self.demote_focused_resume_to_background();
             }
-            return self.retry_retained_session(session_id).await;
+            let switched = self.retry_retained_session(session_id).await;
+            if !switched && let Some(refused_id) = demoted_refusal {
+                self.refocus_demoted_refusal(&refused_id);
+            }
+            return switched;
         }
         let Some(idx) = self
             .background
@@ -1987,6 +1997,23 @@ impl Chat {
         self.cancel_entry_retry();
         self.pick_or_start_session_inner(agent_alias, None, None)
             .await;
+    }
+
+    /// Undo a refusal demotion after a failed switch: the refused entry
+    /// becomes the focused entry again while its notice is still on screen.
+    fn refocus_demoted_refusal(&mut self, session_id: &str) {
+        if self.resume_focused.is_some() || !matches!(self.phase, ChatPhase::Error(_)) {
+            return;
+        }
+        if let Some(idx) = self
+            .resume_backgrounds
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            let mut entry = self.resume_backgrounds.remove(idx);
+            entry.was_focused = true;
+            self.resume_focused = Some(entry);
+        }
     }
 
     /// Give up the focused-resume slot before a session start that must *not*
@@ -23775,6 +23802,56 @@ mod tests {
             );
             assert_no_rpc_request(&mut rx, "closing the refused row sends nothing else").await;
             let _ = &mut chat;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_switch_from_a_refused_notice_keeps_the_refused_entry_focused() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            let (mut chat, rpc, mut rx) = restore_with_refused_entry(
+                pane,
+                true,
+                -32012,
+                "Session environment differs from the current terminal",
+            )
+            .await;
+            assert!(chat.focused_environment_refusal());
+            // Another retained entry that is still waiting to reattach.
+            let mut other = chat.resume_focused.clone().expect("refused entry");
+            other.session_id = "saved-other".into();
+            other.environment_refused = false;
+            other.was_focused = false;
+            chat.resume_backgrounds.push(other);
+
+            let switch = tokio::spawn(async move {
+                let switched = chat.focus_session("saved-other").await;
+                (chat, switched)
+            });
+            let request = next_rpc_request(&mut rx, "the switch tries to attach").await;
+            assert_eq!(request["method"], method::SESSION_NEW);
+            assert_eq!(request["params"]["session_id"], "saved-other");
+            respond_err(&rpc, &request, -32603, "daemon unavailable");
+            let (mut chat, switched) = tokio::time::timeout(Duration::from_secs(2), switch)
+                .await
+                .expect("switch completes")
+                .unwrap();
+            assert!(!switched);
+            assert!(
+                chat.focused_environment_refusal(),
+                "a failed switch must leave the refused entry focused"
+            );
+            let focused = chat.resume_focused.as_ref().unwrap();
+            assert_eq!(focused.session_id, "saved-focused");
+            assert!(focused.was_focused);
+            assert!(
+                chat.resume_backgrounds
+                    .iter()
+                    .any(|entry| entry.session_id == "saved-other")
+            );
+            assert_restore_notice_visible(&mut chat);
         }
     }
 
