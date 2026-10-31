@@ -1,0 +1,17 @@
+PR #11457 live evidence, head 204ca052d1a975cfe0269fc43b010539b93de2c9
+Captured 2026-10-30 19:59-20:03 ET on Linux (Xorg :15, xfce4-terminal 120x34), ffmpeg x11grab of each real terminal window.
+Daemon and both ZeroCode clients: one debug build of 204ca052d (`zeroclaw 0.8.7 (v0.8.7-214-g204ca052d)`).
+Provider: local OpenAI-compatible stub (stub.py) that echoes the last user line; "SLOW" delays the reply 40 s.
+Both clients are launched by zc.sh with the same minimal environment so client B may resume client A's session.
+
+R01 client A, session 7755a80: draft text and a notes.txt attachment in the composer.
+R02 client B switched (Ctrl+S) into the same session and completed a turn there.
+R03 client A before refresh: B's exchange is not shown; draft and attachment intact.
+R04 client A after F5: B's exchange is imported; draft and attachment kept; "Session refreshed. Local draft and queued messages were kept."
+R05 client B starts a slow turn.
+R06 client A presses F5 while that turn runs: "This session is busy. Nothing was cancelled. Refresh again when the turn finishes." Transcript unchanged.
+R07 client B: the slow turn completed normally (not cancelled).
+R08 client A presses F5 again: the slow exchange is imported; draft and attachment still kept.
+
+Note: user rows loaded from the durable transcript show the daemon's stored "[CURRENT DATE & TIME: ...]" prefix.
+Client B's ordinary session switch (R02) loads the same stored form, so this comes from the existing history path, not from this PR.
