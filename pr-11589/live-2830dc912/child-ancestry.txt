@@ -1,0 +1,5 @@
+73997     1 tmux -L grokd2 new-session -d -s stub11589 python3 /tmp/zc11589/stub.py > /tmp/zc11589/stub.out 2>&1
+74287 74000 /opt/homebrew/bin/tmux -L zcchild -f /dev/null -D
+74000 73997 /tmp/zc11589/zeroclaw --config-dir /tmp/zc11589/cfg daemon
+74357 74287 zsh -c cd /tmp/zc11589/work && /tmp/zc11589/zerocode --config-dir /tmp/zc11589/cfg; sleep 30
+74359 74357 /tmp/zc11589/zerocode --config-dir /tmp/zc11589/cfg
