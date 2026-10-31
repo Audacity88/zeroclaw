@@ -4190,12 +4190,7 @@ impl Chat {
             if let Some(decision) = cost_limit_key_decision(&key)
                 && let Some(pa) = state.take_pending_approval()
             {
-                state.cost_limit_buttons = None;
-                state.mark_dirty_full();
-                let _ = self
-                    .rpc
-                    .session_approve(&state.session_id, &pa.request_id, decision)
-                    .await;
+                answer_cost_limit(&self.rpc, state, pa, decision).await;
             }
             return false;
         }
@@ -5514,11 +5509,7 @@ impl Chat {
                 if let Some(decision) = decision
                     && let Some(pa) = state.take_pending_approval()
                 {
-                    state.cost_limit_buttons = None;
-                    let _ = self
-                        .rpc
-                        .session_approve(&state.session_id, &pa.request_id, decision)
-                        .await;
+                    answer_cost_limit(&self.rpc, state, pa, decision).await;
                 }
                 return;
             }
@@ -8472,6 +8463,38 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
         .alignment(Alignment::Center),
         rect,
     );
+}
+
+/// Send the answer to a cost-limit notice. The notice hides while the
+/// answer is in flight. If the daemon refuses it (for example `FORBIDDEN`
+/// after this client lost approval rights), the request is still pending
+/// there, so the notice comes back with the error and the user can answer
+/// again. A failure without a reply (a timeout) is reported, but the notice
+/// is not restored, because the daemon may already have taken the answer.
+async fn answer_cost_limit(
+    rpc: &RpcClient,
+    state: &mut ChatState,
+    pa: PendingApproval,
+    decision: ApprovalDecision,
+) {
+    state.cost_limit_buttons = None;
+    state.mark_dirty_full();
+    let Err(error) = rpc
+        .session_approve(&state.session_id, &pa.request_id, decision)
+        .await
+    else {
+        return;
+    };
+    let refused = error
+        .downcast_ref::<crate::jsonrpc::JsonRpcError>()
+        .is_some();
+    if refused && state.pending_approval.is_none() {
+        state.pending_approval = Some(pa);
+    }
+    state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+        "zc-chat-cost-limit-answer-failed",
+        &[("error", &format!("{error:#}"))],
+    )));
 }
 
 fn cost_limit_stop_key_labels() -> Vec<String> {
@@ -27532,6 +27555,66 @@ mod tests {
                 "cost notice keys must only answer approval"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn refused_cost_limit_answer_restores_the_notice_and_shows_the_error() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(RpcOutbound::new(tx));
+        let mut chat = Chat::new(
+            Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out))),
+            PaneKind::Chat,
+        );
+        let mut s = state();
+        s.apply_update(cost_limit_request());
+        chat.phase = ChatPhase::Active(Box::new(s));
+        let answer = tokio::spawn(async move {
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "override must answer").await;
+        assert_eq!(request["method"], method::SESSION_APPROVE);
+        assert_eq!(request["params"]["decision"], "allow_once");
+        respond_err(
+            &rpc_out,
+            &request,
+            -32012, // the daemon's FORBIDDEN code
+            "approval rights belong to another client",
+        );
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), answer)
+            .await
+            .expect("key handled")
+            .unwrap();
+        let state = active_state(&mut chat);
+        let pending = state
+            .pending_approval()
+            .expect("a refused answer must bring the notice back");
+        assert!(pending.is_cost_limit());
+        assert_eq!(pending.request_id, "req-cost");
+        let notice = state
+            .info_message
+            .as_ref()
+            .expect("a refused answer must say why");
+        assert!(
+            notice
+                .text
+                .contains("approval rights belong to another client"),
+            "{}",
+            notice.text
+        );
     }
 
     #[tokio::test]

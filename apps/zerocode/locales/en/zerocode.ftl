@@ -615,6 +615,7 @@ zc-chat-cost-limit-title = COST LIMIT REACHED
 zc-chat-cost-limit-override = Override and continue
 zc-chat-cost-limit-stop = Stop
 zc-chat-cost-limit-wait = If you do not answer within { $minutes } min, this turn stops.
+zc-chat-cost-limit-answer-failed = Couldn't send your cost-limit answer: { $error }
 
 
 zc-chat-clipboard-you = You: { $text }
