@@ -65,7 +65,7 @@ use crate::screenshot::ScreenshotTool;
 use crate::send_via::SendViaTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    SessionsListTool, SessionsMessageTool, SessionsSendTool,
 };
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
@@ -135,6 +135,7 @@ tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
 tool_attribution!(SessionsHistoryTool, ToolKind::Plugin);
 tool_attribution!(SessionsListTool, ToolKind::Plugin);
+tool_attribution!(SessionsMessageTool, ToolKind::Plugin);
 tool_attribution!(SessionsSendTool, ToolKind::Plugin);
 tool_attribution!(TextBrowserTool, ToolKind::Plugin);
 tool_attribution!(ToolSearchTool, ToolKind::Search);
