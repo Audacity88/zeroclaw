@@ -1864,7 +1864,7 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let outcome = execute_turn(
+        let turn_future = execute_turn(
             agent,
             prompt.clone(),
             cancel,
@@ -1904,6 +1904,11 @@ impl RpcDispatcher {
                     }
                 }
             },
+        );
+        // Scope the session_prompt runner so the turn's tool loop can prompt other sessions.
+        let outcome = crate::tools::sessions_prompt::scope_session_prompt_runner(
+            Some(self.session_prompt_runner()),
+            turn_future,
         )
         .await;
 
@@ -4681,6 +4686,104 @@ impl RpcDispatcher {
             "quickstart: daemon reload signalled"
         );
         self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
+    }
+
+    /// Check if the calling agent can prompt the target agent's sessions:
+    /// true when they are the same agent or when the target is a reachable
+    /// delegate of the caller.
+    fn agent_prompt_reaches(&self, caller_alias: &str, target_alias: &str) -> bool {
+        target_alias == caller_alias
+            || self
+                .ctx
+                .config
+                .read()
+                .reachable_delegate_target_configs(caller_alias)
+                .iter()
+                .any(|target| target.agent == target_alias)
+    }
+
+    /// Build a `SessionPromptFn` bound to this dispatcher. The tool
+    /// invokes the returned closure, which routes back through
+    /// `run_agent_injected_session_prompt`.
+    fn session_prompt_runner(&self) -> std::sync::Arc<crate::tools::sessions_prompt::SessionPromptFn> {
+        let caller = std::sync::Arc::new(self.spawn_handle());
+        std::sync::Arc::new(Box::new(move |session_id, message, caller_alias| {
+            let caller = std::sync::Arc::clone(&caller);
+            Box::pin(async move {
+                caller
+                    .run_agent_injected_session_prompt(&session_id, &message, &caller_alias)
+                    .await
+            })
+        }))
+    }
+
+    /// Run a full `session/prompt` turn in a live session on behalf of a
+    /// calling agent (the `sessions_prompt` tool path). Authorization: the
+    /// target session's agent must be the caller itself or one of the
+    /// caller's reachable delegate targets. Busy refusal is immediate —
+    /// never queued. The session owner's pane sees the turn streamed when
+    /// one is live (see turn notification fanout); the caller
+    /// receives the final content and stop reason.
+    pub(crate) async fn run_agent_injected_session_prompt(
+        &self,
+        session_id: &str,
+        message: &str,
+        caller_alias: &str,
+    ) -> Result<crate::tools::sessions_prompt::SessionPromptOutcome, String> {
+        let ctx = &self.ctx;
+        let Some(target_alias) = ctx.sessions.get_agent_alias(session_id).await else {
+            return Err(format!(
+                "session {session_id:?} not found: no live session with that id"
+            ));
+        };
+        let authorized = self.agent_prompt_reaches(caller_alias, &target_alias);
+        if !authorized {
+            return Err(format!(
+                "session {session_id:?} belongs to agent {target_alias:?}, which is \
+                 neither the calling agent ({caller_alias:?}) nor one of its reachable \
+                 delegate targets; add the target to the caller's `delegates` roster \
+                 before prompting it"
+            ));
+        }
+        let busy = ctx.sessions.has_inflight_turn(session_id)
+            || ctx.sessions.session_queue.queue_depth(session_id).await > 0;
+        if busy {
+            return Err(format!(
+                "session {session_id} is busy (turn in flight); retry later"
+            ));
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "caller_alias": caller_alias,
+                    "target_alias": target_alias,
+                    "session_id": session_id,
+                })),
+            "agent-injected session prompt accepted"
+        );
+
+        // Stream to the owner when live; the caller gets only the final result.
+        // Build a dispatcher with a discarded sink — only the owner's stream matters.
+        let dispatcher = self.spawn_handle();
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "prompt": message,
+            "injected_by": caller_alias,
+        });
+        match dispatcher.handle_session_prompt(&params).await {
+            Ok(value) => {
+                let parsed: SessionPromptResult = serde_json::from_value(value)
+                    .map_err(|e| format!("session/prompt returned an unreadable result: {e}"))?;
+                Ok(crate::tools::sessions_prompt::SessionPromptOutcome {
+                    content: parsed.content,
+                    stop_reason: parsed.stop_reason,
+                })
+            }
+            Err(e) => Err(e.message),
+        }
     }
 }
 

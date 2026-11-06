@@ -20,6 +20,7 @@ pub mod schedule;
 pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
+pub mod sessions_prompt;
 pub mod shell;
 pub mod skill_http;
 pub mod skill_manage;
@@ -699,6 +700,7 @@ pub fn all_tools_with_runtime(
             Arc::new(root_config.clone()),
             agent_alias,
         )),
+        Arc::new(sessions_prompt::SessionsPromptTool::new(agent_alias)),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),

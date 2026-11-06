@@ -81,33 +81,40 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
+    // Capture injected_from_session before spawn: task-locals don't cross boundaries.
+    let injected_from = crate::tools::sessions_prompt::current_injected_from_session();
+
     let mut turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
-            use ::zeroclaw_log::Instrument as _;
-            let span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                session_key = %sk.as_deref().unwrap_or(""),
-                agent_alias = %attribution.agent_alias,
-                model_provider = %attribution.model_provider,
-                model = %attribution.model,
-                channel = %attribution.channel,
-            );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            None,
-                        )
-                        .instrument(span),
-                )
-                .await
+        // Re-scope the injected-from origin around the turn body.
+        crate::tools::sessions_prompt::scope_injected_from_session(injected_from, async move {
+            crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+                use ::zeroclaw_log::Instrument as _;
+                let span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    session_key = %sk.as_deref().unwrap_or(""),
+                    agent_alias = %attribution.agent_alias,
+                    model_provider = %attribution.model_provider,
+                    model = %attribution.model,
+                    channel = %attribution.channel,
+                );
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_context,
+                        guard
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                None,
+                            )
+                            .instrument(span),
+                    )
+                    .await
+            })
+            .await
         })
         .await
     });
