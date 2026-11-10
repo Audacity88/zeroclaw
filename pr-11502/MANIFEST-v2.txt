@@ -3,3 +3,4 @@
 11502-03-after-ctrl-s-saved-100x30.png 2026-10-30T11:22:58+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
 11502-04-reopened-after-save-100x30.png 2026-10-30T11:23:11+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
 11502-05-escape-discard-confirm-100x30.png 2026-10-30T11:23:15+0800 commit=40fe196e0f 720x469px capture=screencapture-l-window
+11502-06-help-question-100x30.png 2026-11-10T16:00:05+0800 commit=5e69f19b8d8b capture=screencapture-l-window 720x469px uncropped ? Help on skill_bundles picker (agent default, 100x30 Terminal.app)
